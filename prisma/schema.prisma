@@ -1,0 +1,278 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Project ─────────────────────────────────────────────────────────────────
+
+model Project {
+  id        String   @id @default(uuid())
+  slug      String   @unique
+  name      String
+  settings  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  characters        Character[]
+  scenes            Scene[]
+  shots             Shot[]
+  workflowTemplates WorkflowTemplate[]
+  workflowRoutes    WorkflowRoute[]
+  referenceAssets   ReferenceAsset[]
+
+  @@map("projects")
+}
+
+// ─── Characters ──────────────────────────────────────────────────────────────
+
+model Character {
+  id          String   @id @default(uuid())
+  projectId   String
+  code        String
+  displayName String?
+  createdAt   DateTime @default(now())
+
+  project          Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  profiles         CharacterProfile[]
+  shotParticipants ShotParticipant[]
+
+  @@unique([projectId, code])
+  @@map("characters")
+}
+
+model CharacterProfile {
+  id             String   @id @default(uuid())
+  characterId    String
+  profileCode    String
+  ageLabel       String?
+  targetImages   Int?
+  promptBase     String
+  negative       String?
+  promptAngles   String?
+  promptVariety  String?
+  datasetPath    String?
+  /// "Active" LoRA — the one used by default for scene rendering. Defaults to
+  /// the final epoch from the most recent successful training; user can switch
+  /// to any entry in `loraVariants` via the UI to test intermediate checkpoints.
+  loraPath       String?
+  /// All trained LoRA files for this profile (final + epoch checkpoints from
+  /// every successful training run). Each entry is { filename, fullPath, epoch?, sizeBytes, mtime, label }.
+  /// Latest training overwrites this list to reflect current disk state.
+  loraVariants   Json?
+  triggerToken   String?
+  createdAt      DateTime @default(now())
+
+  character        Character         @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  datasetJobs      DatasetJob[]
+  trainingJobs     TrainingJob[]
+  shotParticipants ShotParticipant[]
+
+  @@unique([characterId, profileCode])
+  @@map("character_profiles")
+}
+
+// ─── Reference Assets ────────────────────────────────────────────────────────
+
+model ReferenceAsset {
+  id          String   @id @default(uuid())
+  projectId   String
+  profileCode String
+  path        String
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId, profileCode])
+  @@map("reference_assets")
+}
+
+// ─── Scenes ──────────────────────────────────────────────────────────────────
+
+model Scene {
+  id                          String   @id @default(uuid())
+  projectId                   String
+  sceneKey                    String
+  title                       String?
+  sortOrder                   Int      @default(0)
+  defaultReferenceProfileCode String?
+  createdAt                   DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  shots   Shot[]
+
+  @@unique([projectId, sceneKey])
+  @@map("scenes")
+}
+
+// ─── Shots ───────────────────────────────────────────────────────────────────
+
+model Shot {
+  id                 String   @id @default(uuid())
+  projectId          String
+  sceneId            String
+  shotCode           String
+  promptFields       Json?
+  workflowRouteKey   String?
+  referenceProfileId String?
+  referenceImagePool Json?
+  /// Accumulated rendered candidates for this shot.
+  /// Shape: [{filename, promptId, seed, strategyId, createdAt}]
+  renderedImages     Json?
+  /// Filename of the candidate chosen as the canonical render for this shot.
+  chosenRender       String?
+  /// Latest in-flight ComfyUI prompt_id for this shot (cleared once result is recorded).
+  activeRenderPromptId String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  project      Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  scene        Scene             @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  participants ShotParticipant[]
+  renderJobs   SceneRenderJob[]
+
+  @@unique([projectId, shotCode])
+  @@index([projectId, sceneId])
+  @@map("shots")
+}
+
+model ShotParticipant {
+  id          String  @id @default(uuid())
+  shotId      String
+  characterId String?
+  /// Which character profile (LoRA + age variant) to use for this participant
+  /// in this specific shot. Null = renderer falls back to the first profile
+  /// of the character that has a trained LoRA.
+  profileId   String?
+  label       String
+
+  shot      Shot              @relation(fields: [shotId], references: [id], onDelete: Cascade)
+  character Character?        @relation(fields: [characterId], references: [id], onDelete: SetNull)
+  profile   CharacterProfile? @relation(fields: [profileId], references: [id], onDelete: SetNull)
+
+  @@map("shot_participants")
+}
+
+// ─── Workflow ─────────────────────────────────────────────────────────────────
+
+model WorkflowTemplate {
+  id          String   @id @default(uuid())
+  projectId   String
+  templateKey String
+  filePath    String
+  description String?
+  createdAt   DateTime @default(now())
+
+  project    Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  routeSteps WorkflowRouteStep[]
+
+  @@unique([projectId, templateKey])
+  @@map("workflow_templates")
+}
+
+model WorkflowRoute {
+  id        String   @id @default(uuid())
+  projectId String
+  routeKey  String
+  createdAt DateTime @default(now())
+
+  project Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  steps   WorkflowRouteStep[]
+
+  @@unique([projectId, routeKey])
+  @@map("workflow_routes")
+}
+
+model WorkflowRouteStep {
+  id                 String @id @default(uuid())
+  workflowRouteId    String
+  stepOrder          Int
+  workflowTemplateId String
+
+  workflowRoute    WorkflowRoute    @relation(fields: [workflowRouteId], references: [id], onDelete: Cascade)
+  workflowTemplate WorkflowTemplate @relation(fields: [workflowTemplateId], references: [id], onDelete: Restrict)
+
+  @@unique([workflowRouteId, stepOrder])
+  @@map("workflow_route_steps")
+}
+
+// ─── Training ─────────────────────────────────────────────────────────────────
+
+model DatasetJob {
+  id                  String    @id @default(uuid())
+  profileId           String
+  status              String    // pending | blocked | running | completed | failed | cancelled
+  /// If set, this job waits until the named profile's dataset has at least one image.
+  dependsOnProfileId  String?
+  /// If set, the reference image used by ComfyUI is picked from this profile's
+  /// dataset folder (chaining: HERO_TEEN_15 → HERO_OVERLOAD_16/17).
+  referenceProfileId  String?
+  /// Specific filename inside referenceProfileId's COMFY_OUTPUT to use as the
+  /// reference. If not set, a deterministic middle image is auto-picked.
+  referenceImageFilename String?
+  comfyPromptId       String?
+  errorMessage        String?
+  queuedAt            DateTime  @default(now())
+  startedAt           DateTime?
+  completedAt         DateTime?
+
+  profile CharacterProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId, status])
+  @@index([status])
+  @@map("dataset_jobs")
+}
+
+model SceneRenderJob {
+  id            String    @id @default(uuid())
+  shotId        String
+  status        String    // pending | running | completed | failed | cancelled
+  /// ComfyUI prompt_id once dispatched; used to poll history for outputs.
+  comfyPromptId String?
+  /// Render parameters at enqueue time (seed, batchSize, scenePrompt override, …).
+  /// Stored so the queue worker can rebuild the call after a backend restart.
+  params        Json?
+  errorMessage  String?
+  queuedAt      DateTime  @default(now())
+  startedAt     DateTime?
+  completedAt   DateTime?
+
+  shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
+
+  @@index([shotId])
+  @@index([status, queuedAt])
+  @@map("scene_render_jobs")
+}
+
+model TrainingJob {
+  id             String    @id @default(uuid())
+  profileId      String
+  status         String    // pending | preparing | captioning | training | completed | failed
+  baseModel      String
+  triggerToken   String?
+  datasetPath    String?
+  configPath     String?
+  outputLoraPath String?
+  logPath        String?
+  errorMessage   String?
+  progress       Json?     // { phase, current, total, ... }
+  /// Effective queue ordering timestamp. Mirrors DatasetJob.queuedAt so the
+  /// pipeline queue can order both job types by one field. Defaults to now()
+  /// at row creation; gets swapped when the user reorders the queue in UI.
+  queuedAt       DateTime  @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  profile CharacterProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId, status])
+  @@index([status, queuedAt])
+  @@map("training_jobs")
+}
