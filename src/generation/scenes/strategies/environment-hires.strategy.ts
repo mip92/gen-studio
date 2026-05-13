@@ -54,9 +54,11 @@ export class EnvironmentHiresSceneStrategy implements SceneStrategy {
     if (params.steps !== undefined) this.set(wf, '6', 'steps', params.steps);
     if (params.cfg   !== undefined) this.set(wf, '6', 'cfg',   params.cfg);
 
-    // Upscale target = params.width × params.height (default 1920×1080 from caller)
-    this.set(wf, '20', 'width',  params.width);
-    this.set(wf, '20', 'height', params.height);
+    // Upscale target — keep template's FHD default unless caller explicitly
+    // requested a larger size. scene-render service defaults params.width/height
+    // to the SDXL base (1344×768), which would make this upscale a no-op.
+    if (params.width  && params.width  > 1344) this.set(wf, '20', 'width',  params.width);
+    if (params.height && params.height > 768)  this.set(wf, '20', 'height', params.height);
 
     // Refiner — same seed (preserves composition), shorter, partial denoise for detail polish
     this.set(wf, '21', 'seed', params.seed);

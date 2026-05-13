@@ -357,7 +357,8 @@ export class SceneRenderService {
       }
       positive = parts.join(', ');
     }
-    const negative = pf.negative as string | undefined;
+    const rawNegative = pf.negative as string | undefined;
+    const negative    = sanitizeNegative(rawNegative, this.logger, shot.shotCode);
 
     const params: SceneJobParams = {
       participants,
@@ -472,4 +473,57 @@ function framingPromptFor(framing: string | undefined | null): string {
 function toComfyLoraName(absolutePath: string): string {
   const rel = path.relative(COMFY_LORA_ROOT, absolutePath);
   return rel.split(/[/\\]/).join(path.sep);
+}
+
+// ─── Negative prompt sanitizer ──────────────────────────────────────────────
+//
+// Past incident: a user/UI saved a 30-token negative full of weighted phrases
+// like `(red towel:2.0), (towel:1.8), (motion blur), (out of focus), (smudged)`
+// to every shot. Result: SDXL output had plastic skin, HDR oversaturation,
+// hyper-sharp grain — a "grubo" look. Weights >= 1.5 are destructive in SDXL
+// (normal range 1.0-1.3); over-sharp tokens push the model into anti-blur
+// overshoot. This guard caps weights and strips known-toxic sharpening tokens
+// before the negative reaches the strategy / KSampler.
+const MAX_NEGATIVE_WEIGHT = 1.3;
+// Tokens that, on the negative side, paradoxically push toward over-sharpening
+// and plastic skin in SDXL. Keep this list narrow — only add tokens with
+// confirmed visible damage.
+const TOXIC_NEGATIVE_TOKENS = [
+  'motion blur', 'camera shake', 'out of focus subject', 'out of focus',
+  'hazy', 'smudged', 'double exposure', 'ghosting', 'plastic skin',
+];
+
+function sanitizeNegative(
+  raw: string | undefined,
+  logger: Logger,
+  shotCode: string,
+): string | undefined {
+  if (!raw || !raw.trim()) return raw;
+  let cleaned = raw;
+  const warnings: string[] = [];
+
+  // 1. Cap weights: replace (token:1.8) with (token:1.3) when weight > MAX.
+  cleaned = cleaned.replace(/\(([^():]+):([0-9]+(?:\.[0-9]+)?)\)/g, (_, token, w) => {
+    const weight = parseFloat(w);
+    if (weight > MAX_NEGATIVE_WEIGHT) {
+      warnings.push(`weight ${weight} on "${token.trim()}" capped to ${MAX_NEGATIVE_WEIGHT}`);
+      return `(${token}:${MAX_NEGATIVE_WEIGHT})`;
+    }
+    return `(${token}:${weight})`;
+  });
+
+  // 2. Strip toxic over-sharpening tokens (whole-word, comma-separated chunks).
+  const chunks = cleaned.split(/,\s*/);
+  const kept   = chunks.filter((chunk) => {
+    const bare = chunk.replace(/^\(/, '').replace(/(:[0-9.]+)?\)$/, '').trim().toLowerCase();
+    const toxic = TOXIC_NEGATIVE_TOKENS.some((t) => bare === t);
+    if (toxic) warnings.push(`removed toxic over-sharp token "${bare}"`);
+    return !toxic;
+  });
+  cleaned = kept.join(', ');
+
+  if (warnings.length > 0) {
+    logger.warn(`[${shotCode}] negative sanitized: ${warnings.join('; ')}`);
+  }
+  return cleaned;
 }

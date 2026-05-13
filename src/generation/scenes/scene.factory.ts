@@ -20,7 +20,11 @@ export class SceneFactory {
   constructor() {
     // Default for 0-participant (no-LoRA) shots: Flux UltraReal v4 hires →
     // photoreal 1920×1080. Picked first by pickByParticipantCount(0).
-    // SDXL env strategies remain available via explicit get(id).
+    // For 1+ participants, NON-hires single-pass picks first — the SDXL hires
+    // refiner pass re-applies LoRA on FHD latent and over-bakes facial
+    // features ("plastic AI skin"). Single-pass + Lanczos resample to FHD
+    // gives the natural cinematic look. Hires variants stay registered for
+    // explicit picking via get(id).
     this.register(new EnvironmentFluxHiresSceneStrategy());
     this.register(new EnvironmentFluxSceneStrategy());
     this.register(new SingleCharacterSceneStrategy());

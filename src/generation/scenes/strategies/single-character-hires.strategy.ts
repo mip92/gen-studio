@@ -58,9 +58,12 @@ export class SingleCharacterHiresSceneStrategy implements SceneStrategy {
     if (params.steps !== undefined) this.set(wf, '6', 'steps', params.steps);
     if (params.cfg   !== undefined) this.set(wf, '6', 'cfg',   params.cfg);
 
-    // Upscale target
-    this.set(wf, '20', 'width',  params.width);
-    this.set(wf, '20', 'height', params.height);
+    // Upscale target — keep template's FHD default (1920×1088) unless caller
+    // explicitly requested a larger size. The scene-render service defaults
+    // params.width/height to the SDXL base (1344×768), which would make this
+    // upscale a no-op and defeat the whole point of the hires strategy.
+    if (params.width  && params.width  > 1344) this.set(wf, '20', 'width',  params.width);
+    if (params.height && params.height > 768)  this.set(wf, '20', 'height', params.height);
 
     // Refiner — same seed
     this.set(wf, '21', 'seed', params.seed);
