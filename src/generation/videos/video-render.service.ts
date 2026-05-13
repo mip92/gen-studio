@@ -147,6 +147,44 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
    * model load takes ~30 sec per call (no caching) so this is a one-shot,
    * intended for the "Auto from Florence-2" UI link.
    */
+  /**
+   * Fire-and-forget Florence-2 captioning of the just-approved render. Writes
+   * the result into `shot.promptFields.motionPromptDraft` so the next time the
+   * user opens the video section the textarea is prefilled.
+   *
+   * Sets `motionPromptDraftStatus = 'generating' | 'ready' | 'failed'` so the
+   * UI can show a spinner instead of an empty box while Florence-2 loads.
+   * Errors here never propagate — this is best-effort UX polish, not a render.
+   */
+  async generateMotionPromptDraft(shotId: string): Promise<void> {
+    try {
+      await this.updatePromptDraft(shotId, { motionPromptDraftStatus: 'generating' });
+      const { motionPrompt } = await this.autoMotionPrompt(shotId);
+      await this.updatePromptDraft(shotId, {
+        motionPromptDraft:       motionPrompt,
+        motionPromptDraftStatus: 'ready',
+        motionPromptDraftError:  null,
+      });
+    } catch (e: any) {
+      this.logger.warn(`generateMotionPromptDraft(${shotId}): ${e?.message}`);
+      await this.updatePromptDraft(shotId, {
+        motionPromptDraftStatus: 'failed',
+        motionPromptDraftError:  String(e?.message ?? e),
+      }).catch(() => { /* best-effort */ });
+    }
+  }
+
+  private async updatePromptDraft(shotId: string, patch: Record<string, unknown>): Promise<void> {
+    const shot = await this.prisma.shot.findUnique({ where: { id: shotId } });
+    if (!shot) return;
+    const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
+    const next = { ...pf, ...patch } as object;
+    await this.prisma.shot.update({
+      where: { id: shotId },
+      data:  { promptFields: next },
+    });
+  }
+
   async autoMotionPrompt(shotId: string): Promise<{ caption: string; motionPrompt: string }> {
     const shot = await this.prisma.shot.findUnique({
       where:   { id: shotId },

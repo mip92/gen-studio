@@ -1,7 +1,8 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Inject, Injectable, NotFoundException, BadRequestException, forwardRef } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateShotDto } from './dto/create-shot.dto';
 import { UpdateShotDto } from './dto/update-shot.dto';
+import { VideoRenderService } from '../generation/videos/video-render.service';
 
 interface ParticipantInput {
   label:        string;
@@ -22,7 +23,11 @@ const SHOT_FULL_INCLUDE = {
 
 @Injectable()
 export class ShotsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject(forwardRef(() => VideoRenderService))
+    private readonly videoRenderService: VideoRenderService,
+  ) {}
 
   findAll(projectIdOrSlug: string, sceneId?: string) {
     return this.prisma.shot.findMany({
@@ -201,11 +206,18 @@ export class ShotsService {
         throw new BadRequestException(`Filename "${filename}" is not among rendered candidates`);
       }
     }
-    return this.prisma.shot.update({
+    const updated = await this.prisma.shot.update({
       where: { id: shotId },
       data:  { chosenRender: filename },
       include: SHOT_FULL_INCLUDE,
     });
+    // Fire-and-forget Florence-2 captioning when the user picks a new render —
+    // the result lands in promptFields.motionPromptDraft so the video section's
+    // textarea is prefilled by the time the user gets there.
+    if (filename && filename !== shot.chosenRender) {
+      this.videoRenderService.generateMotionPromptDraft(shotId).catch(() => {});
+    }
+    return updated;
   }
 
   async findParticipants(projectIdOrSlug: string, shotId: string) {
