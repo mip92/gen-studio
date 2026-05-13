@@ -14,6 +14,7 @@ import {
   renameSync,
   unlinkSync,
 } from 'fs';
+import { spawn } from 'child_process';
 import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService } from '../../comfy/comfy.service';
@@ -22,6 +23,9 @@ import { StartVideoInput, VideoRenderParams } from './video-job.types';
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
+const KOHYA_DIR    = process.env.KOHYA_DIR    ?? 'E:\\kohya_ss';
+const PYTHON_BIN   = process.env.PYTHON_BIN   ?? path.join(KOHYA_DIR, 'venv', 'Scripts', 'python.exe');
+const FLORENCE_SCRIPT = path.join(APP_ROOT, 'scripts', 'florence2_caption_one.py');
 const POLL_MS      = 4000;
 const WORKFLOW_FILENAME = 'video_wan22_i2v_api.json';
 
@@ -131,6 +135,60 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return this.prisma.videoRender.findMany({
       where:   { shotId },
       orderBy: { queuedAt: 'desc' },
+    });
+  }
+
+  /**
+   * Generate a suggested motion prompt by Florence-2-captioning the shot's
+   * chosen render and appending motion language. Doesn't queue anything —
+   * caller can edit the returned text and submit via POST /shots/:id/videos.
+   *
+   * Spawns scripts/florence2_caption_one.py with the kohya venv Python; the
+   * model load takes ~30 sec per call (no caching) so this is a one-shot,
+   * intended for the "Auto from Florence-2" UI link.
+   */
+  async autoMotionPrompt(shotId: string): Promise<{ caption: string; motionPrompt: string }> {
+    const shot = await this.prisma.shot.findUnique({
+      where:   { id: shotId },
+      include: { project: true },
+    });
+    if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);
+    if (!shot.chosenRender) {
+      throw new BadRequestException(`Shot ${shot.shotCode} has no chosen render`);
+    }
+    const srcPath = path.join(
+      APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, shot.chosenRender,
+    );
+    if (!existsSync(srcPath)) {
+      throw new BadRequestException(`Source image missing on disk: ${srcPath}`);
+    }
+    const caption = await this.runFlorence(srcPath);
+    // Motion template — pairs Wan i2v's idea of subtle camera + natural body
+    // movement with whatever Florence saw. The user can edit before queueing.
+    const motionPrompt =
+      `${caption}, subtle camera push-in, natural breathing motion, gentle micro-movements, ambient natural lighting shifts`;
+    return { caption, motionPrompt };
+  }
+
+  private runFlorence(imagePath: string): Promise<string> {
+    if (!existsSync(FLORENCE_SCRIPT)) {
+      throw new Error(`Florence-2 script not found: ${FLORENCE_SCRIPT}`);
+    }
+    return new Promise<string>((resolve, reject) => {
+      const proc = spawn(PYTHON_BIN, [FLORENCE_SCRIPT, '--image', imagePath, '--task', 'DETAILED_CAPTION']);
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
+      proc.stderr.on('data', (c: Buffer) => {
+        const line = c.toString().trimEnd();
+        stderr += line + '\n';
+        this.logger.log(`florence: ${line}`);
+      });
+      proc.on('error', (e) => reject(e));
+      proc.on('exit', (code) => {
+        if (code === 0) resolve(stdout.trim());
+        else            reject(new Error(`florence2_caption_one.py exited ${code}: ${stderr.slice(-500)}`));
+      });
     });
   }
 

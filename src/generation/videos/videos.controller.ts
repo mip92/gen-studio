@@ -19,6 +19,15 @@ export class VideosController {
     return this.videos.start({ shotId, ...body });
   }
 
+  @Post('shots/:shotId/videos/auto-prompt')
+  @ApiOperation({
+    summary: 'Suggest a motion prompt by Florence-2-captioning the chosen render',
+    description: 'Slow (~30 s — loads Florence-2 once per call). Returns { caption, motionPrompt } — caller can edit before POSTing /videos.',
+  })
+  autoPrompt(@Param('shotId') shotId: string) {
+    return this.videos.autoMotionPrompt(shotId);
+  }
+
   @Get('shots/:shotId/videos')
   @ApiOperation({ summary: 'List all video renders for a shot' })
   list(@Param('shotId') shotId: string) {
