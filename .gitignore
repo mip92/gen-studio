@@ -7,5 +7,13 @@ node_modules
 # Build output
 dist
 
-# Local data / datasets (too large for git)
-data
+# Local data — exclude heavy subdirs (datasets, generated shots, reference assets)
+# but keep ComfyUI workflow templates which are tiny JSON and shared across the team.
+data/*/character_pipeline/
+data/*/characters/
+data/*/datasets/
+data/*/reference/
+data/*/shots/
+
+# Manual backups of comfy templates
+data/*/comfy/*.bak

@@ -7,6 +7,8 @@ import { SceneRenderService } from './scenes/scene-render.service';
 import { SceneFactory } from './scenes/scene.factory';
 import { DatasetQueueController } from './dataset-queue.controller';
 import { DatasetQueueService } from './dataset-queue.service';
+import { VideosController } from './videos/videos.controller';
+import { VideoRenderService } from './videos/video-render.service';
 import { TrainingModule } from '../training/training.module';
 
 @Module({
@@ -15,6 +17,7 @@ import { TrainingModule } from '../training/training.module';
     GenerationController,
     ScenesController,
     DatasetQueueController,
+    VideosController,
   ],
   providers: [
     GenerationService,
@@ -22,7 +25,8 @@ import { TrainingModule } from '../training/training.module';
     SceneRenderService,
     SceneFactory,
     DatasetQueueService,
+    VideoRenderService,
   ],
-  exports: [DatasetQueueService, SceneRenderService],
+  exports: [DatasetQueueService, SceneRenderService, VideoRenderService],
 })
 export class GenerationModule {}

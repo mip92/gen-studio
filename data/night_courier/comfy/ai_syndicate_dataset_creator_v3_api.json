@@ -1,0 +1,719 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-fp8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "2": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    }
+  },
+  "37": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_8b_fp8mixed.safetensors",
+      "type": "flux2",
+      "device": "default"
+    }
+  },
+  "72": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": 832,
+      "height": 1216,
+      "batch_size": 1
+    }
+  },
+  "152": {
+    "class_type": "CR Prompt List",
+    "inputs": {
+      "prepend_text": "",
+      "multiline_text": "Extreme close-up portrait looking directly into the lens, neutral expression, highly detailed skin texture, sharp focus on eyes, soft studio lighting, positioned against a solid white wall.\nMedium shot from the chest up, sharp side profile looking to the left, clear jawline and ear detail, set against a clean white wall.\nMedium shot from the chest up, sharp side profile looking to the right, high-contrast lighting, clean silhouette, positioned against a solid white wall.\nWaist-up portrait at a 45-degree angle, eyes tracking the camera, natural lighting, set against a plain white wall.\nDramatic low-angle medium shot looking up at the head and shoulders, cinematic shadows emphasizing facial structure, against a solid white wall.\nHigh-angle medium shot looking down at the head and torso, soft overhead lighting, clear view of the crown and shoulders, set against a white wall.\nClose-up from the collarbone up with eyes closed, peaceful expression, detailed eyelashes, soft diffused light, positioned against a solid white wall.\nWaist-up frontal shot standing in a relaxed neutral pose, facing forward, flat lighting to show outfit textures and body build, set against a plain white wall.\nWaist-up view from behind, showing hair length and the back of the outfit, shoulders slightly turned, standing directly against a solid white wall.\nWaist-up side-profile shot standing straight, showing torso depth and posture, positioned against a clean white wall.\nMedium shot from the waist up, arms folded, capturing natural clothing folds and torso silhouette against a solid white wall.\nSitting on a stool, waist-up view, hands resting on a lap (out of frame), three-quarter body angle, positioned against a plain white wall.\nMedium shot from the chest up, leaning slightly forward toward the lens, showing compressed proportions and facial detail, set against a solid white wall.\nStandard medium shot from the waist up, arms at sides, clear view of torso and clothing details, positioned against a clean white wall.\nCinematic over-the-shoulder medium shot, focus on the face as it turns back toward the camera, set against a solid white wall.\nLeaning against a solid white wall, waist-up view, one shoulder forward, relaxed expression, minimalist composition.\nCentered waist-up shot, capturing the head and torso silhouette with high clarity against an expansive white wall.\nWaist-up shot in bright midday lighting, sharp shadows on the face and torso to test model depth, positioned against a solid white wall.\nWaist-up shot in warm, directional golden hour lighting, highlighting hair edges and skin glow, set against a plain white wall.\nA tilted Dutch angle medium shot from the chest up, stylized perspective, adding dynamic aesthetic variety to the character's upper body, positioned against a solid white wall.",
+      "append_text": "",
+      "start_index": 0,
+      "max_rows": 20
+    }
+  },
+  "154": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 135189696319160,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "denoise": 1,
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "335",
+        0
+      ],
+      "negative": [
+        "157",
+        0
+      ],
+      "latent_image": [
+        "165",
+        0
+      ]
+    }
+  },
+  "157": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": [
+        "37",
+        0
+      ]
+    }
+  },
+  "164": {
+    "class_type": "GetImageSize",
+    "inputs": {
+      "image": [
+        "410",
+        0
+      ]
+    }
+  },
+  "165": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": [
+        "164",
+        0
+      ],
+      "height": [
+        "164",
+        1
+      ],
+      "batch_size": 1
+    }
+  },
+  "166": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "170",
+        0
+      ]
+    }
+  },
+  "170": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "154",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "249": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": [
+        "307",
+        0
+      ],
+      "height": [
+        "307",
+        1
+      ],
+      "batch_size": 1
+    }
+  },
+  "253": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "404",
+        0
+      ]
+    }
+  },
+  "254": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "264",
+        0
+      ]
+    }
+  },
+  "264": {
+    "class_type": "ImageStitch",
+    "inputs": {
+      "direction": "right",
+      "match_image_size": true,
+      "spacing_width": 0,
+      "spacing_color": "white",
+      "image1": [
+        "410",
+        0
+      ],
+      "image2": [
+        "404",
+        0
+      ]
+    }
+  },
+  "307": {
+    "class_type": "GetImageSize",
+    "inputs": {
+      "image": [
+        "410",
+        0
+      ]
+    }
+  },
+  "328": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": [
+        "152",
+        0
+      ],
+      "clip": [
+        "37",
+        0
+      ]
+    }
+  },
+  "331": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "410",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "332": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "333",
+        0
+      ],
+      "latent": [
+        "331",
+        0
+      ]
+    }
+  },
+  "333": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "full body shot of a teen male courier, 16 years old, slim teenage proportions not adult bodybuilder, Slavic Eastern European face, grey-blue eyes, dark brown medium-length hair slightly damp\nmatte dark bicycle helmet, dark windbreaker and courier gloves no logos, slim dark jeans, sneakers, very large bright yellow rectangular backpack signature prop, no delivery brand marks or readable logos\nwet urban sidewalk at dusk, overcast light, puddle reflections, documentary photoreal, sharp focus on eyes",
+      "clip": [
+        "37",
+        0
+      ]
+    }
+  },
+  "334": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "woman, female, breasts, cleavage, bikini, dress, skirt, makeup glamour, mature adult man, heavy beard, bodybuilder, wax skin, airbrushed, Uber Eats, DoorDash, Glovo, Wolt, readable logo, watermark text, deformed hands, extra fingers",
+      "clip": [
+        "37",
+        0
+      ]
+    }
+  },
+  "335": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "349",
+        0
+      ],
+      "latent": [
+        "336",
+        0
+      ]
+    }
+  },
+  "336": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "404",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "349": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "328",
+        0
+      ],
+      "latent": [
+        "350",
+        0
+      ]
+    }
+  },
+  "350": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "410",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "367": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "z-image-turbo-fp8-e4m3fn.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "368": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ultrafluxVAEImproved_v10.safetensors"
+    }
+  },
+  "369": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "lumina2",
+      "device": "default"
+    }
+  },
+  "372": {
+    "class_type": "KSampler (Efficient)",
+    "inputs": {
+      "seed": 1018163207796869,
+      "steps": 6,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "denoise": 0.2,
+      "preview_method": "auto",
+      "vae_decode": "true",
+      "model": [
+        "367",
+        0
+      ],
+      "positive": [
+        "373",
+        0
+      ],
+      "negative": [
+        "374",
+        0
+      ],
+      "latent_image": [
+        "375",
+        0
+      ],
+      "optional_vae": [
+        "368",
+        0
+      ]
+    }
+  },
+  "373": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "detail",
+      "clip": [
+        "369",
+        0
+      ]
+    }
+  },
+  "374": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": [
+        "369",
+        0
+      ]
+    }
+  },
+  "375": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "170",
+        0
+      ],
+      "vae": [
+        "368",
+        0
+      ]
+    }
+  },
+  "380": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "372",
+        5
+      ]
+    }
+  },
+  "381": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "386",
+        0
+      ]
+    }
+  },
+  "382": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "383",
+        0
+      ],
+      "latent": [
+        "389",
+        0
+      ]
+    }
+  },
+  "383": {
+    "class_type": "ReferenceLatent",
+    "inputs": {
+      "conditioning": [
+        "393",
+        0
+      ],
+      "latent": [
+        "388",
+        0
+      ]
+    }
+  },
+  "385": {
+    "class_type": "CR Prompt List",
+    "inputs": {
+      "prepend_text": "",
+      "multiline_text": "Front close-up, teen male courier, light rain, helmet on, grey-blue eyes, dark windbreaker, yellow backpack straps, neutral tired, apartment wall blur.\nThree-quarter left chest-up, heavier rain, glove near chin, yellow pack, bus shelter blur.\nSide profile shoulders-up, hood half up, thoughtful, bedroom window blur.\nLow-angle medium, tightening backpack strap, wet asphalt, rooftop blur far.\nHigh-angle waist-up, sitting steps, helmet in lap, yellow bag upright, no logos.\nFront chest-up, annoyed micro-expression, crossed arms over jacket, courtyard blur.\nThree-quarter right, faint tired half-smile, golden rim light, balcony blur.\nFront medium, adjusting helmet buckle, gloves, garage mouth blur.\nSide waist-up, phone glow on face, yellow bag on ground, no readable UI.\nTilted close-up, skeptical brow, drizzle on lashes, brick blur.\nFront shoulders-up, mild surprise, teen face, curtain blur.\nThree-quarter left waist-up, calm, arms folded, underpass concrete blur.\nFront full-body teen proportions, windbreaker, yellow backpack, courtyard puddle.\nThree-quarter right medium, distant stare, cafe window blur no text.\nSide close-up, rain on cheek, catchlight in grey-blue eyes, dark wall blur.\nFront waist-up, tired playful smirk, one strap slipped, tree bokeh.\nHigh-angle close-up, vulnerable tired eyes, curb sit, yellow corner in frame.\nLow-angle chest-up, defiant tired stare, hand on pack handle, stairwell blur.\nThree-quarter left medium, glance over shoulder, abstract graffiti no words.\nFront chest-up, composed neutral, hands clasped, pale hallway blur far.\nSide close-up, flushed cheeks natural teen, soft equipment blur no logos.\nFront shoulders-up, open tired laugh, doorway warm light.\nThree-quarter right waist-up, reserved, table sit, office blur.\nFront medium, windbreaker over plain dark tee, slim teen build, river fog.\nTilted chest-up, guarded eyes, narrow alley soft depth.\nSide medium, hands behind back, full yellow silhouette, wet path.\nFront close-up, shy downward eyes, stairwell lamp, pores visible.\nThree-quarter left full-body, walking stride, crosswalk stripes, gloves.\nFront waist-up, concentrated frown, thermos silhouette no logo, kitchen window.\nHigh-angle chest-up, sleepy morning, windbreaker half open over tee, bed edge blur far.\nSide close-up, thin crew neck under jacket, cool street light, no lace.\nFront medium, simple shirt under jacket, chair sit, moody single light.\nThree-quarter right chest-up, uncertain, fingers at collar, cafe window.\nLow-angle full-body, bold stance, night street practical lights no neon brands.\nFront close-up, glassy tired eyes, dim tile blur far.\nSide waist-up, peaceful exhale, mug silhouette no logo, bench.\nThree-quarter left medium, tired amused smirk, yellow bag one shoulder.\nFront chest-up, cold detached stare, seamless pale backdrop.\nHigh-angle medium, stretching arms, windbreaker, early park mist.\nFront waist-up, dark tee under jacket, half face shadow, bar bokeh no labels.",
+      "append_text": "",
+      "start_index": 0,
+      "max_rows": 40
+    }
+  },
+  "386": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "390",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "387": {
+    "class_type": "EmptyLatentImage",
+    "inputs": {
+      "width": [
+        "391",
+        0
+      ],
+      "height": [
+        "391",
+        1
+      ],
+      "batch_size": 1
+    }
+  },
+  "388": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "410",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "389": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "404",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "390": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 135189696319160,
+      "steps": 6,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "denoise": 1,
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "382",
+        0
+      ],
+      "negative": [
+        "392",
+        0
+      ],
+      "latent_image": [
+        "387",
+        0
+      ]
+    }
+  },
+  "391": {
+    "class_type": "GetImageSize",
+    "inputs": {
+      "image": [
+        "410",
+        0
+      ]
+    }
+  },
+  "392": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": [
+        "37",
+        0
+      ]
+    }
+  },
+  "393": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": [
+        "385",
+        0
+      ],
+      "clip": [
+        "37",
+        0
+      ]
+    }
+  },
+  "394": {
+    "class_type": "PreviewImage",
+    "inputs": {
+      "images": [
+        "395",
+        5
+      ]
+    }
+  },
+  "395": {
+    "class_type": "KSampler (Efficient)",
+    "inputs": {
+      "seed": 1018163207796869,
+      "steps": 6,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "denoise": 0.2,
+      "preview_method": "auto",
+      "vae_decode": "true",
+      "model": [
+        "367",
+        0
+      ],
+      "positive": [
+        "398",
+        0
+      ],
+      "negative": [
+        "396",
+        0
+      ],
+      "latent_image": [
+        "397",
+        0
+      ]
+    }
+  },
+  "396": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "",
+      "clip": [
+        "369",
+        0
+      ]
+    }
+  },
+  "397": {
+    "class_type": "VAEEncode",
+    "inputs": {
+      "pixels": [
+        "386",
+        0
+      ],
+      "vae": [
+        "368",
+        0
+      ]
+    }
+  },
+  "398": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "detail",
+      "clip": [
+        "369",
+        0
+      ]
+    }
+  },
+  "399": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "395",
+        5
+      ]
+    }
+  },
+  "400": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "372",
+        5
+      ]
+    }
+  },
+  "403": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 275273070112099,
+      "steps": 8,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "beta",
+      "denoise": 1,
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "332",
+        0
+      ],
+      "negative": [
+        "334",
+        0
+      ],
+      "latent_image": [
+        "249",
+        0
+      ]
+    }
+  },
+  "404": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "403",
+        0
+      ],
+      "vae": [
+        "2",
+        0
+      ]
+    }
+  },
+  "407": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "386",
+        0
+      ]
+    }
+  },
+  "408": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "170",
+        0
+      ]
+    }
+  },
+  "409": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "Create_a_single_202603202244.png"
+    }
+  },
+  "410": {
+    "class_type": "ImageResizeKJv2",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "upscale_method": "nearest-exact",
+      "keep_proportion": "resize",
+      "pad_color": "0, 0, 0",
+      "crop_position": "center",
+      "divisible_by": 2,
+      "device": "cpu",
+      "image": [
+        "409",
+        0
+      ]
+    }
+  }
+}

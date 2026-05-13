@@ -135,6 +135,7 @@ model Shot {
   scene        Scene             @relation(fields: [sceneId], references: [id], onDelete: Cascade)
   participants ShotParticipant[]
   renderJobs   SceneRenderJob[]
+  videoRenders VideoRender[]
 
   @@unique([projectId, shotCode])
   @@index([projectId, sceneId])
@@ -247,6 +248,43 @@ model SceneRenderJob {
   @@index([shotId])
   @@index([status, queuedAt])
   @@map("scene_render_jobs")
+}
+
+// ─── Video renders ───────────────────────────────────────────────────────────
+//
+// Image-to-video renders driven by Wan2.2 i2v. One row per submitted job; the
+// row holds the source image (the shot's approved render), the motion prompt,
+// and the resulting mp4 filename once ComfyUI finishes.
+
+model VideoRender {
+  id                  String    @id @default(uuid())
+  shotId              String
+  /// Which image was used as the i2v starting frame. Stored as the basename
+  /// inside `data/<project>/shots/<shotCode>/`.
+  sourceImageFilename String
+  /// Motion prompt — what should the animated frame do (camera move, subject
+  /// movement, etc.). Concatenated into the Wan2.2 positive prompt.
+  motionPrompt        String
+  /// Lifecycle: pending → running → completed | failed | cancelled.
+  status              String
+  /// ComfyUI prompt_id once dispatched; used to poll history.
+  comfyPromptId       String?
+  /// Render parameters at enqueue time (seed, length, fps, width, height, etc.)
+  params              Json?
+  /// Basename of the output mp4 in `data/<project>/shots/<shotCode>/videos/`.
+  outputFilename      String?
+  /// Workflow filename used (e.g. "video_wan22_i2v_api.json").
+  workflowFilename    String
+  errorMessage        String?
+  queuedAt            DateTime  @default(now())
+  startedAt           DateTime?
+  completedAt         DateTime?
+
+  shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
+
+  @@index([shotId])
+  @@index([status, queuedAt])
+  @@map("video_renders")
 }
 
 model TrainingJob {
