@@ -19,15 +19,6 @@ export class VideosController {
     return this.videos.start({ shotId, ...body });
   }
 
-  @Post('shots/:shotId/videos/auto-prompt')
-  @ApiOperation({
-    summary: 'Suggest a motion prompt by Florence-2-captioning the chosen render',
-    description: 'Slow (~30 s — loads Florence-2 once per call). Returns { caption, motionPrompt } — caller can edit before POSTing /videos.',
-  })
-  autoPrompt(@Param('shotId') shotId: string) {
-    return this.videos.autoMotionPrompt(shotId);
-  }
-
   @Get('shots/:shotId/videos')
   @ApiOperation({ summary: 'List all video renders for a shot' })
   list(@Param('shotId') shotId: string) {
@@ -44,6 +35,23 @@ export class VideosController {
   @ApiOperation({ summary: 'Stream the rendered mp4' })
   async file(@Param('videoId') videoId: string, @Res({ passthrough: true }) res: Response) {
     const filePath = await this.videos.filePath(videoId);
+    res.set({ 'Content-Type': 'video/mp4' });
+    return new StreamableFile(createReadStream(filePath));
+  }
+
+  @Post('videos/:videoId/upscale')
+  @ApiOperation({
+    summary: 'Queue a 4x-UltraSharp upscale → 1920×1080 of a completed video',
+    description: 'Idempotent. The original 832×480 preview stays in place; the FHD output lands at /videos/:id/file-fhd once done.',
+  })
+  upscale(@Param('videoId') videoId: string) {
+    return this.videos.upscale(videoId);
+  }
+
+  @Get('videos/:videoId/file-fhd')
+  @ApiOperation({ summary: 'Stream the upscaled FHD mp4 (only available once upscaleStatus = completed)' })
+  async fileFhd(@Param('videoId') videoId: string, @Res({ passthrough: true }) res: Response) {
+    const filePath = await this.videos.upscaledFilePath(videoId);
     res.set({ 'Content-Type': 'video/mp4' });
     return new StreamableFile(createReadStream(filePath));
   }

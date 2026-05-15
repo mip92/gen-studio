@@ -14,7 +14,6 @@ import {
   renameSync,
   unlinkSync,
 } from 'fs';
-import { spawn } from 'child_process';
 import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService } from '../../comfy/comfy.service';
@@ -23,16 +22,16 @@ import { StartVideoInput, VideoRenderParams } from './video-job.types';
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
-const KOHYA_DIR    = process.env.KOHYA_DIR    ?? 'E:\\kohya_ss';
-const PYTHON_BIN   = process.env.PYTHON_BIN   ?? path.join(KOHYA_DIR, 'venv', 'Scripts', 'python.exe');
-const FLORENCE_SCRIPT = path.join(APP_ROOT, 'scripts', 'florence2_caption_one.py');
 const POLL_MS      = 4000;
 const WORKFLOW_FILENAME = 'video_wan22_i2v_api.json';
+const UPSCALE_WORKFLOW_FILENAME = 'video_upscale_4x_api.json';
 
-// Wan2.2 i2v defaults — the 4-step lightx2v setup runs at 640×640 / 81 frames /
-// 16 fps. Override via StartVideoInput when the shot needs different framing.
-const DEFAULT_WIDTH  = 640;
-const DEFAULT_HEIGHT = 640;
+// Wan2.2 i2v defaults — 768×432 = exact 16:9, both dims divisible by 16.
+// Chosen over 832×480 because 832/480 = 1.733 ≠ 1920/1080 = 1.778, which would
+// force crop or stretch on FHD upscale. 768×432 upscales to FHD with uniform
+// scale factor 0.625, no distortion. Preview-quality; FHD via /upscale endpoint.
+const DEFAULT_WIDTH  = 768;
+const DEFAULT_HEIGHT = 432;
 const DEFAULT_LENGTH = 81;
 const DEFAULT_FPS    = 16;
 
@@ -74,60 +73,95 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException(`Source image missing on disk: ${sourcePath}`);
     }
 
-    // Copy the source image into COMFY_INPUT under a unique name so ComfyUI's
-    // LoadImage can pick it up. We use the eventual VideoRender id as the
-    // basename so concurrent renders never collide.
-    const videoRender = await this.prisma.videoRender.create({
-      data: {
-        shotId:              shot.id,
-        sourceImageFilename: shot.chosenRender,
-        motionPrompt:        input.motionPrompt?.trim() || '',
-        status:              'pending',
-        workflowFilename:    WORKFLOW_FILENAME,
-        params:              {
-          seed:   input.seed   ?? Math.floor(Math.random() * 2 ** 32),
-          width:  input.width  ?? DEFAULT_WIDTH,
-          height: input.height ?? DEFAULT_HEIGHT,
-          length: input.length ?? DEFAULT_LENGTH,
-          fps:    input.fps    ?? DEFAULT_FPS,
-        },
-      },
-    });
+    const count = Math.max(1, Math.min(8, input.count ?? 1));
 
-    const ext             = path.extname(shot.chosenRender) || '.png';
-    const inputBasename   = `video_${videoRender.id}${ext}`;
-    const inputDest       = path.join(COMFY_INPUT, inputBasename);
+    // Create N pending rows. Actual ComfyUI dispatch happens in PipelineQueueService.tick()
+    // which serializes video renders against scene renders, training and dataset jobs.
+    const results = [];
+    for (let i = 0; i < count; i++) {
+      const seed = (i === 0 && input.seed !== undefined)
+        ? input.seed
+        : Math.floor(Math.random() * 2 ** 32);
+      const row = await this.prisma.videoRender.create({
+        data: {
+          shotId:              shot.id,
+          sourceImageFilename: shot.chosenRender!,
+          motionPrompt:        input.motionPrompt?.trim() || '',
+          status:              'pending',
+          workflowFilename:    WORKFLOW_FILENAME,
+          params: {
+            seed,
+            width:  input.width  ?? DEFAULT_WIDTH,
+            height: input.height ?? DEFAULT_HEIGHT,
+            length: input.length ?? DEFAULT_LENGTH,
+            fps:    input.fps    ?? DEFAULT_FPS,
+          },
+        },
+      });
+      results.push(row);
+    }
+    return results;
+  }
+
+  /** Find the oldest pending video render — used by PipelineQueueService for arbitration. */
+  findNextPending() {
+    return this.prisma.videoRender.findFirst({
+      where:   { status: 'pending' },
+      orderBy: { queuedAt: 'asc' },
+    });
+  }
+
+  /** Dispatch a pending video render to ComfyUI. Called by the pipeline tick. */
+  async dispatchPending(videoId: string): Promise<void> {
+    const v = await this.prisma.videoRender.findUnique({
+      where:   { id: videoId },
+      include: { shot: { include: { project: true } } },
+    });
+    if (!v) throw new Error(`VideoRender ${videoId} not found`);
+    if (v.status !== 'pending') return;
+
+    const sourcePath = path.join(
+      APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, v.sourceImageFilename,
+    );
+    if (!existsSync(sourcePath)) {
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  { status: 'failed', errorMessage: `Source image missing: ${sourcePath}`, completedAt: new Date() },
+      });
+      return;
+    }
+
+    const ext           = path.extname(v.sourceImageFilename) || '.png';
+    const inputBasename = `video_${v.id}${ext}`;
+    const inputDest     = path.join(COMFY_INPUT, inputBasename);
     mkdirSync(COMFY_INPUT, { recursive: true });
     copyFileSync(sourcePath, inputDest);
 
     try {
-      const template = this.loadTemplate(shot.project.slug);
-      const params   = videoRender.params as unknown as VideoRenderParams;
+      const params = v.params as { seed: number; width: number; height: number; length: number; fps: number };
+      const template = this.loadTemplate(v.shot.project.slug);
       const workflow = this.patch(template, {
-        sourceImage:  inputBasename,
-        motionPrompt: this.composeMotionPrompt(videoRender.motionPrompt, shot),
-        seed:         params.seed,
-        width:        params.width,
-        height:       params.height,
-        length:       params.length,
-        fps:          params.fps,
-        filenamePrefix: `video/${shot.shotCode}/${videoRender.id}`,
+        sourceImage:    inputBasename,
+        motionPrompt:   this.composeMotionPrompt(v.motionPrompt, v.shot),
+        seed:           params.seed,
+        width:          params.width,
+        height:         params.height,
+        length:         params.length,
+        fps:            params.fps,
+        filenamePrefix: `video/${v.shot.shotCode}/${v.id}`,
       });
-
       const { promptId } = await this.comfy.queuePrompt(workflow);
       await this.prisma.videoRender.update({
-        where: { id: videoRender.id },
+        where: { id: v.id },
         data:  { status: 'running', comfyPromptId: promptId, startedAt: new Date() },
       });
-      return { ...videoRender, status: 'running', comfyPromptId: promptId };
     } catch (e: any) {
+      this.logger.error(`dispatchPending video ${v.id}: ${e?.message}`);
       await this.prisma.videoRender.update({
-        where: { id: videoRender.id },
-        data:  { status: 'failed', errorMessage: e.message, completedAt: new Date() },
+        where: { id: v.id },
+        data:  { status: 'failed', errorMessage: e?.message ?? String(e), completedAt: new Date() },
       });
-      // Clean up the input copy on failure to avoid clutter.
       try { unlinkSync(inputDest); } catch { /* best-effort */ }
-      throw e;
     }
   }
 
@@ -135,98 +169,6 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return this.prisma.videoRender.findMany({
       where:   { shotId },
       orderBy: { queuedAt: 'desc' },
-    });
-  }
-
-  /**
-   * Generate a suggested motion prompt by Florence-2-captioning the shot's
-   * chosen render and appending motion language. Doesn't queue anything —
-   * caller can edit the returned text and submit via POST /shots/:id/videos.
-   *
-   * Spawns scripts/florence2_caption_one.py with the kohya venv Python; the
-   * model load takes ~30 sec per call (no caching) so this is a one-shot,
-   * intended for the "Auto from Florence-2" UI link.
-   */
-  /**
-   * Fire-and-forget Florence-2 captioning of the just-approved render. Writes
-   * the result into `shot.promptFields.motionPromptDraft` so the next time the
-   * user opens the video section the textarea is prefilled.
-   *
-   * Sets `motionPromptDraftStatus = 'generating' | 'ready' | 'failed'` so the
-   * UI can show a spinner instead of an empty box while Florence-2 loads.
-   * Errors here never propagate — this is best-effort UX polish, not a render.
-   */
-  async generateMotionPromptDraft(shotId: string): Promise<void> {
-    try {
-      await this.updatePromptDraft(shotId, { motionPromptDraftStatus: 'generating' });
-      const { motionPrompt } = await this.autoMotionPrompt(shotId);
-      await this.updatePromptDraft(shotId, {
-        motionPromptDraft:       motionPrompt,
-        motionPromptDraftStatus: 'ready',
-        motionPromptDraftError:  null,
-      });
-    } catch (e: any) {
-      this.logger.warn(`generateMotionPromptDraft(${shotId}): ${e?.message}`);
-      await this.updatePromptDraft(shotId, {
-        motionPromptDraftStatus: 'failed',
-        motionPromptDraftError:  String(e?.message ?? e),
-      }).catch(() => { /* best-effort */ });
-    }
-  }
-
-  private async updatePromptDraft(shotId: string, patch: Record<string, unknown>): Promise<void> {
-    const shot = await this.prisma.shot.findUnique({ where: { id: shotId } });
-    if (!shot) return;
-    const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
-    const next = { ...pf, ...patch } as object;
-    await this.prisma.shot.update({
-      where: { id: shotId },
-      data:  { promptFields: next },
-    });
-  }
-
-  async autoMotionPrompt(shotId: string): Promise<{ caption: string; motionPrompt: string }> {
-    const shot = await this.prisma.shot.findUnique({
-      where:   { id: shotId },
-      include: { project: true },
-    });
-    if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);
-    if (!shot.chosenRender) {
-      throw new BadRequestException(`Shot ${shot.shotCode} has no chosen render`);
-    }
-    const srcPath = path.join(
-      APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, shot.chosenRender,
-    );
-    if (!existsSync(srcPath)) {
-      throw new BadRequestException(`Source image missing on disk: ${srcPath}`);
-    }
-    const caption = await this.runFlorence(srcPath);
-    // Motion template — pairs Wan i2v's idea of subtle camera + natural body
-    // movement with whatever Florence saw. The user can edit before queueing.
-    const motionPrompt =
-      `${caption}, subtle camera push-in, natural breathing motion, gentle micro-movements, ambient natural lighting shifts`;
-    return { caption, motionPrompt };
-  }
-
-  private runFlorence(imagePath: string): Promise<string> {
-    if (!existsSync(FLORENCE_SCRIPT)) {
-      throw new Error(`Florence-2 script not found: ${FLORENCE_SCRIPT}`);
-    }
-    return new Promise<string>((resolve, reject) => {
-      const proc = spawn(PYTHON_BIN, [FLORENCE_SCRIPT, '--image', imagePath, '--task', 'DETAILED_CAPTION']);
-      let stdout = '';
-      let stderr = '';
-      proc.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
-      proc.stderr.on('data', (c: Buffer) => {
-        const line = c.toString().trimEnd();
-        stderr += line + '\n';
-        this.logger.log(`florence: ${line}`);
-      });
-      proc.on('error', (e) => reject(e));
-      proc.on('exit', (code) => {
-        if (code === 0) resolve(stdout.trim());
-        else            reject(new Error(`florence2_caption_one.py exited ${code}: ${stderr.slice(-500)}`));
-      });
     });
   }
 
@@ -246,6 +188,18 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     });
     if (!shot) throw new NotFoundException(`Shot for video ${videoId} not found`);
     return path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, 'videos', v.outputFilename);
+  }
+
+  /** Absolute path to the upscaled FHD mp4 once `upscaleStatus=completed`. */
+  async upscaledFilePath(videoId: string): Promise<string> {
+    const v = await this.get(videoId);
+    if (!v.upscaledFilename) throw new BadRequestException(`Video ${videoId} has no upscaled version yet`);
+    const shot = await this.prisma.shot.findUnique({
+      where:   { id: v.shotId },
+      include: { project: true },
+    });
+    if (!shot) throw new NotFoundException(`Shot for video ${videoId} not found`);
+    return path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, 'videos_fhd', v.upscaledFilename);
   }
 
   // ── Workflow loading + patching ────────────────────────────────────────────
@@ -307,9 +261,140 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return parts.join(', ');
   }
 
+  // ── Upscale on demand ──────────────────────────────────────────────────────
+
+  /**
+   * Queue a 4x-UltraSharp upscale → 1920×1080 pass on a completed video. The
+   * original `outputFilename` (832×480 preview) stays in place; the FHD output
+   * lands in `upscaledFilename`. Idempotent: re-calling on a video that already
+   * has `upscaleStatus = running` or `completed` is a no-op + returns the row.
+   */
+  async upscale(videoId: string) {
+    const v = await this.prisma.videoRender.findUnique({
+      where:   { id: videoId },
+      include: { shot: { include: { project: true } } },
+    });
+    if (!v) throw new NotFoundException(`Video ${videoId} not found`);
+    if (v.status !== 'completed' || !v.outputFilename) {
+      throw new BadRequestException(`Video ${videoId} is not completed yet`);
+    }
+    if (v.upscaleStatus === 'running' || v.upscaleStatus === 'pending') return v;
+    if (v.upscaleStatus === 'completed' && v.upscaledFilename) return v;
+
+    const srcMp4 = path.join(
+      APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, 'videos', v.outputFilename,
+    );
+    if (!existsSync(srcMp4)) {
+      throw new BadRequestException(`Source mp4 missing on disk: ${srcMp4}`);
+    }
+
+    // Copy mp4 into COMFY_INPUT immediately so the source is preserved even if
+    // the user deletes the original before the pipeline tick dispatches.
+    const inputBasename = `upscale_${v.id}.mp4`;
+    const inputDest     = path.join(COMFY_INPUT, inputBasename);
+    mkdirSync(COMFY_INPUT, { recursive: true });
+    copyFileSync(srcMp4, inputDest);
+
+    // Mark pending — PipelineQueueService.tick() will pick this up and dispatch.
+    return this.prisma.videoRender.update({
+      where: { id: v.id },
+      data:  {
+        upscaleStatus:       'pending',
+        upscaleErrorMessage: null,
+        upscaleCompletedAt:  null,
+        upscaleStartedAt:    null,
+        upscalePromptId:     null,
+      },
+    });
+  }
+
+  /** Oldest video render with upscaleStatus='pending' — for pipeline arbitration. */
+  findNextPendingUpscale() {
+    return this.prisma.videoRender.findFirst({
+      where:   { upscaleStatus: 'pending' },
+      orderBy: { queuedAt: 'asc' },
+    });
+  }
+
+  /** Dispatch a pending upscale to ComfyUI. Called by the pipeline tick. */
+  async dispatchPendingUpscale(videoId: string): Promise<void> {
+    const v = await this.prisma.videoRender.findUnique({
+      where:   { id: videoId },
+      include: { shot: { include: { project: true } } },
+    });
+    if (!v) throw new Error(`VideoRender ${videoId} not found`);
+    if (v.upscaleStatus !== 'pending') return;
+
+    const inputBasename = `upscale_${v.id}.mp4`;
+    const inputDest     = path.join(COMFY_INPUT, inputBasename);
+    if (!existsSync(inputDest)) {
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  {
+          upscaleStatus:       'failed',
+          upscaleErrorMessage: `Pre-staged mp4 vanished from COMFY_INPUT: ${inputDest}`,
+          upscaleCompletedAt:  new Date(),
+        },
+      });
+      return;
+    }
+
+    try {
+      const template = this.loadUpscaleTemplate(v.shot.project.slug);
+      const workflow = this.patchUpscale(template, {
+        sourceVideo:    inputBasename,
+        filenamePrefix: `video_fhd/${v.shot.shotCode}/${v.id}`,
+      });
+      const { promptId } = await this.comfy.queuePrompt(workflow);
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  {
+          upscaleStatus:       'running',
+          upscalePromptId:     promptId,
+          upscaleStartedAt:    new Date(),
+          upscaleErrorMessage: null,
+        },
+      });
+    } catch (e: any) {
+      this.logger.error(`dispatchPendingUpscale ${v.id}: ${e?.message}`);
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  {
+          upscaleStatus:       'failed',
+          upscaleErrorMessage: e?.message ?? String(e),
+          upscaleCompletedAt:  new Date(),
+        },
+      });
+      try { unlinkSync(inputDest); } catch { /* best-effort */ }
+    }
+  }
+
+  private loadUpscaleTemplate(projectSlug: string): Record<string, any> {
+    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', UPSCALE_WORKFLOW_FILENAME);
+    if (!existsSync(filePath)) {
+      throw new NotFoundException(`Upscale workflow not found: ${filePath}`);
+    }
+    return JSON.parse(readFileSync(filePath, 'utf-8'));
+  }
+
+  private patchUpscale(template: Record<string, any>, p: {
+    sourceVideo:    string;
+    filenamePrefix: string;
+  }): Record<string, any> {
+    const wf = structuredClone(template);
+    if (wf['1']) wf['1'].inputs.file            = p.sourceVideo;
+    if (wf['7']) wf['7'].inputs.filename_prefix = p.filenamePrefix;
+    return wf;
+  }
+
   // ── Polling ────────────────────────────────────────────────────────────────
 
   private async poll(): Promise<void> {
+    await this.pollMainRenders();
+    await this.pollUpscales();
+  }
+
+  private async pollMainRenders(): Promise<void> {
     const running = await this.prisma.videoRender.findMany({ where: { status: 'running' } });
     for (const v of running) {
       if (!v.comfyPromptId) continue;
@@ -320,15 +405,24 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       if (success) {
         const outputFile = this.firstVideoOutput(h.outputs);
         if (outputFile) {
-          const moved = await this.moveOutputToShotDir(v.shotId, outputFile).catch((e) => {
+          let moved: string | null = null;
+          try {
+            moved = await this.moveOutputToShotDir(v.shotId, outputFile, 'videos');
+          } catch (e: any) {
             this.logger.warn(`move video ${v.id}: ${e?.message}`);
-            return null;
-          });
+          }
+          if (!moved) {
+            // File not at expected src path yet (Comfy reports completion before
+            // flushing mp4 in some builds). Leave row as `running` so the next
+            // tick retries the move.
+            this.logger.warn(`video ${v.id}: completion seen but file not yet at COMFY_OUTPUT — will retry next tick`);
+            continue;
+          }
           await this.prisma.videoRender.update({
             where: { id: v.id },
             data: {
               status:         'completed',
-              outputFilename: moved ?? path.basename(outputFile.filename),
+              outputFilename: moved,
               completedAt:    new Date(),
             },
           });
@@ -344,9 +438,66 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
           data:  { status: 'failed', errorMessage: 'ComfyUI reported non-success status', completedAt: new Date() },
         });
       }
-      // Clean up the source-image copy in COMFY_INPUT regardless of outcome.
       this.cleanupInputCopy(v.id, v.sourceImageFilename);
     }
+  }
+
+  private async pollUpscales(): Promise<void> {
+    const running = await this.prisma.videoRender.findMany({ where: { upscaleStatus: 'running' } });
+    for (const v of running) {
+      if (!v.upscalePromptId) continue;
+      const h = await this.comfy.getHistory(v.upscalePromptId).catch(() => null);
+      if (!h?.status?.completed) continue;
+
+      const success = h.status.status_str === 'success';
+      if (success) {
+        const outputFile = this.firstVideoOutput(h.outputs);
+        if (outputFile) {
+          let moved: string | null = null;
+          try {
+            moved = await this.moveOutputToShotDir(v.shotId, outputFile, 'videos_fhd');
+          } catch (e: any) {
+            this.logger.warn(`move upscaled video ${v.id}: ${e?.message}`);
+          }
+          if (!moved) {
+            this.logger.warn(`upscale ${v.id}: completion seen but file not yet at COMFY_OUTPUT — will retry next tick`);
+            continue;
+          }
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data: {
+              upscaleStatus:      'completed',
+              upscaledFilename:   moved,
+              upscaleCompletedAt: new Date(),
+            },
+          });
+        } else {
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data:  {
+              upscaleStatus:       'failed',
+              upscaleErrorMessage: 'ComfyUI history had no video output',
+              upscaleCompletedAt:  new Date(),
+            },
+          });
+        }
+      } else {
+        await this.prisma.videoRender.update({
+          where: { id: v.id },
+          data:  {
+            upscaleStatus:       'failed',
+            upscaleErrorMessage: 'ComfyUI reported non-success status',
+            upscaleCompletedAt:  new Date(),
+          },
+        });
+      }
+      this.cleanupUpscaleInputCopy(v.id);
+    }
+  }
+
+  private cleanupUpscaleInputCopy(videoId: string): void {
+    const file = path.join(COMFY_INPUT, `upscale_${videoId}.mp4`);
+    try { unlinkSync(file); } catch { /* best-effort */ }
   }
 
   /**
@@ -370,13 +521,14 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   private async moveOutputToShotDir(
     shotId: string,
     out: { filename: string; subfolder?: string },
+    destSubdir: 'videos' | 'videos_fhd' = 'videos',
   ): Promise<string | null> {
     const shot = await this.prisma.shot.findUnique({
       where:   { id: shotId },
       include: { project: true },
     });
     if (!shot) return null;
-    const destDir = path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, 'videos');
+    const destDir = path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, destSubdir);
     mkdirSync(destDir, { recursive: true });
 
     const src = path.join(COMFY_OUTPUT, out.subfolder ?? '', path.basename(out.filename));
