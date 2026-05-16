@@ -78,8 +78,8 @@
     "inputs": {
       "image": ["11", 0],
       "upscale_method": "lanczos",
-      "width": 640,
-      "height": 640,
+      "width": 768,
+      "height": 432,
       "crop": "center"
     }
   },
@@ -90,8 +90,8 @@
       "positive":   ["9", 0],
       "negative":   ["10", 0],
       "vae":        ["8", 0],
-      "width":      640,
-      "height":     640,
+      "width":      768,
+      "height":     432,
       "length":     81,
       "batch_size": 1,
       "start_image": ["12", 0]

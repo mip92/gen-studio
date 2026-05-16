@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Res, StreamableFile } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Res, StreamableFile } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { createReadStream } from 'fs';
 import type { Response } from 'express';
@@ -37,6 +37,15 @@ export class VideosController {
     const filePath = await this.videos.filePath(videoId);
     res.set({ 'Content-Type': 'video/mp4' });
     return new StreamableFile(createReadStream(filePath));
+  }
+
+  @Delete('videos/:videoId')
+  @ApiOperation({
+    summary: 'Hard-delete a video render (DB row + preview mp4 + FHD mp4 + stale COMFY_INPUT copies)',
+    description: 'Also clears shot.chosenVideoId if it pointed at this video.',
+  })
+  remove(@Param('videoId') videoId: string) {
+    return this.videos.delete(videoId);
   }
 
   @Post('videos/:videoId/upscale')

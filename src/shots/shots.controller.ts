@@ -120,6 +120,15 @@ export class ShotsStandaloneController {
     return this.shotsService.setChosenRender(shotId, body.filename);
   }
 
+  @Patch(':shotId/chosen-video')
+  @ApiOperation({ summary: 'Approve a completed video render as canonical (null to clear)' })
+  setChosenVideo(
+    @Param('shotId') shotId: string,
+    @Body() body: { videoId: string | null },
+  ) {
+    return this.shotsService.setChosenVideo(shotId, body.videoId);
+  }
+
   @Get(':shotId/renders/:filename/raw')
   @ApiOperation({
     summary: 'Stream a rendered image from disk (project-tree first, COMFY_OUTPUT fallback)',

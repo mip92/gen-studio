@@ -101,10 +101,21 @@ model Scene {
   title                       String?
   sortOrder                   Int      @default(0)
   defaultReferenceProfileCode String?
+  /// Closed-caption / voiceover text for the scene. Plain Russian narrator
+  /// script — Silero V5 ru synthesises this to data/<slug>/scenes/<sceneKey>/narration.wav.
+  /// Edits don't retroactively change rendered TTSJob outputs — each job
+  /// snapshots `text` at enqueue time.
+  narrationText               String?
+  /// Reference to the project narration script: which lines in
+  /// <slug>_script.md this scene covers (inclusive). Lets the UI link back
+  /// "scene → source paragraphs" without duplicating ranges in code.
+  scriptStartLine             Int?
+  scriptEndLine               Int?
   createdAt                   DateTime @default(now())
 
-  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  shots   Shot[]
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  shots     Shot[]
+  ttsJobs   TTSJob[]
 
   @@unique([projectId, sceneKey])
   @@map("scenes")
@@ -126,6 +137,12 @@ model Shot {
   renderedImages     Json?
   /// Filename of the candidate chosen as the canonical render for this shot.
   chosenRender       String?
+  /// VideoRender.id chosen as the final/approved animation for this shot.
+  /// Mirrors `chosenRender` for videos: once set, the scenes UI offers an upscale
+  /// instead of another render, and downstream packaging treats this as the
+  /// canonical motion clip. No FK so the row stays self-consistent if the video
+  /// is hard-deleted; the setChosenVideo service validates membership.
+  chosenVideoId      String?
   /// Latest in-flight ComfyUI prompt_id for this shot (cleared once result is recorded).
   activeRenderPromptId String?
   createdAt          DateTime @default(now())
@@ -280,10 +297,20 @@ model VideoRender {
   startedAt           DateTime?
   completedAt         DateTime?
 
+  /// Upscale-on-demand (4x-UltraSharp → 1920×1080). Null until user clicks
+  /// "upscale" on a completed video. Lifecycle mirrors the main status field.
+  upscaleStatus        String?
+  upscaledFilename     String?
+  upscalePromptId      String?
+  upscaleStartedAt     DateTime?
+  upscaleCompletedAt   DateTime?
+  upscaleErrorMessage  String?
+
   shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
 
   @@index([shotId])
   @@index([status, queuedAt])
+  @@index([upscaleStatus])
   @@map("video_renders")
 }
 
@@ -313,4 +340,36 @@ model TrainingJob {
   @@index([profileId, status])
   @@index([status, queuedAt])
   @@map("training_jobs")
+}
+
+// ─── TTS (Silero V5 ru) ──────────────────────────────────────────────────────
+//
+// One row per "synthesise this scene's narration" request. Runs on CPU via a
+// Python subprocess (scripts/tts_silero.py) and is independent of ComfyUI /
+// GPU jobs, so the pipeline tick dispatches it in parallel with everything
+// else (still one TTS at a time though).
+
+model TTSJob {
+  id             String    @id @default(uuid())
+  sceneId        String
+  /// Text snapshot at enqueue time. Editing Scene.narrationText later does NOT
+  /// retroactively change rendered audio — re-queue to regenerate.
+  text           String
+  /// Silero V5 ru speaker id: aidar | baya | kseniya | xenia | eugene | random.
+  voice          String
+  /// Output sample rate: 8000 | 24000 | 48000 (Silero supports these three).
+  sampleRate     Int
+  status         String    // pending | running | completed | failed | cancelled
+  /// Basename of the wav inside data/<slug>/scenes/<sceneKey>/.
+  outputFilename String?
+  errorMessage   String?
+  queuedAt       DateTime  @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  scene Scene @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+
+  @@index([sceneId])
+  @@index([status, queuedAt])
+  @@map("tts_jobs")
 }

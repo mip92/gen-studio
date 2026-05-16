@@ -10,6 +10,7 @@ import { ReferenceAssetsModule } from './reference-assets/reference-assets.modul
 import { ComfyModule } from './comfy/comfy.module';
 import { GenerationModule } from './generation/generation.module';
 import { TrainingModule } from './training/training.module';
+import { TTSModule } from './tts/tts.module';
 import { PipelineModule } from './pipeline/pipeline.module';
 
 @Module({
@@ -25,6 +26,7 @@ import { PipelineModule } from './pipeline/pipeline.module';
     ComfyModule,
     GenerationModule,
     TrainingModule,
+    TTSModule,
     PipelineModule,
   ],
 })

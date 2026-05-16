@@ -1,8 +1,11 @@
 import { Controller, Get, NotFoundException, Param } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { existsSync, statSync } from 'fs';
+import { existsSync, readFileSync, statSync } from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { DatasetService } from '../training/dataset.service';
+
+const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 
 @ApiTags('Projects')
 @Controller('projects/:idOrSlug')
@@ -92,6 +95,38 @@ export class ProjectsDashboardController {
   }
 
   /**
+   * Returns the project's full narration script (Markdown) for the TTS modal's
+   * reference panel. Script lives inside the gen-studio server tree:
+   *   data/<slug>/script.md
+   * Optionally overridable via env `SCRIPT_PATH_<SLUG_UPPER>` for local testing.
+   * Returns { text, path } on success, or { text: null, path: null } if the
+   * script is not yet authored (UI gracefully hides the reference panel).
+   */
+  @Get(':idOrSlug/script')
+  @ApiOperation({ summary: 'Read the project narration script (Markdown), if any' })
+  async script(@Param('idOrSlug') idOrSlug: string) {
+    const project = await this.prisma.project.findFirst({
+      where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+    });
+    if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
+
+    const slug   = project.slug;
+    const envKey = `SCRIPT_PATH_${slug.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+    const candidates = [
+      process.env[envKey],
+      path.join(APP_ROOT, 'data', slug, 'script.md'),
+    ].filter((p): p is string => !!p);
+
+    for (const p of candidates) {
+      if (existsSync(p)) {
+        const text = readFileSync(p, 'utf-8');
+        return { text, path: p };
+      }
+    }
+    return { text: null, path: null };
+  }
+
+  /**
    * Lightweight scenes + shots list for the project overview/scenes pages.
    * Returns scene order, beat summaries from shot.promptFields.narrativeBeat,
    * and which characters appear in each shot.
@@ -122,6 +157,11 @@ export class ProjectsDashboardController {
                   orderBy: { queuedAt: 'desc' },
                   take:    1,
                 },
+                // All videos for the shot — used to count, find the chosen one,
+                // and badge in-flight video renders / upscales in the scenes UI.
+                videoRenders: {
+                  orderBy: { queuedAt: 'desc' },
+                },
               },
             },
           },
@@ -133,10 +173,13 @@ export class ProjectsDashboardController {
     return {
       project: { id: project.id, slug: project.slug, name: project.name },
       scenes: project.scenes.map((s) => ({
-        id:        s.id,
-        sceneKey:  s.sceneKey,
-        title:     s.title,
-        sortOrder: s.sortOrder,
+        id:              s.id,
+        sceneKey:        s.sceneKey,
+        title:           s.title,
+        sortOrder:       s.sortOrder,
+        narrationText:   s.narrationText   ?? null,
+        scriptStartLine: s.scriptStartLine ?? null,
+        scriptEndLine:   s.scriptEndLine   ?? null,
         shots: s.shots.map((sh) => {
           const pf = (sh.promptFields ?? {}) as {
             narrativeBeat?: string;
@@ -167,6 +210,27 @@ export class ProjectsDashboardController {
 
           const job = (sh as any).renderJobs?.[0] ?? null;
           const cameraFraming = (pf as any).camera?.framing ?? null;
+
+          // Video state — mirrors chosenRender semantics for the animation pass.
+          const videos = ((sh as any).videoRenders ?? []) as Array<{
+            id: string; status: string; outputFilename: string | null;
+            upscaleStatus: string | null; upscaledFilename: string | null;
+            queuedAt: Date;
+          }>;
+          const chosenVideo = sh.chosenVideoId
+            ? videos.find((v) => v.id === sh.chosenVideoId) ?? null
+            : null;
+          // Oldest pending|running video render — for "⚙ видео рендерится" badge.
+          const inflightVideo = [...videos]
+            .reverse()
+            .find((v) => v.status === 'pending' || v.status === 'running') ?? null;
+          // Pending|running upscale (limited to the chosen video — that's the
+          // only one the UI surfaces an upscale button for).
+          const inflightUpscale = chosenVideo
+            && (chosenVideo.upscaleStatus === 'pending' || chosenVideo.upscaleStatus === 'running')
+            ? chosenVideo
+            : null;
+
           return {
             cameraFraming,
             id:                   sh.id,
@@ -184,6 +248,23 @@ export class ProjectsDashboardController {
              */
             pipelineRender: job
               ? { id: job.id as string, status: job.status as string, queuedAt: job.queuedAt as Date }
+              : null,
+            // ── Video state (mirrors photo flow) ────────────────────────────
+            videosCount:   videos.length,
+            chosenVideoId: sh.chosenVideoId ?? null,
+            chosenVideo: chosenVideo
+              ? {
+                  id:               chosenVideo.id,
+                  outputFilename:   chosenVideo.outputFilename,
+                  upscaleStatus:    chosenVideo.upscaleStatus,
+                  upscaledFilename: chosenVideo.upscaledFilename,
+                }
+              : null,
+            pipelineVideo: inflightVideo
+              ? { id: inflightVideo.id, status: inflightVideo.status, queuedAt: inflightVideo.queuedAt }
+              : null,
+            pipelineUpscale: inflightUpscale
+              ? { id: inflightUpscale.id, status: inflightUpscale.upscaleStatus as string }
               : null,
           };
         }),

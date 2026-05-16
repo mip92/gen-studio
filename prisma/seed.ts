@@ -1,14 +1,13 @@
 /**
  * Entry point for `npx prisma db seed`.
  *
- * Each project has its own folder under seeds/.
- * Add new project seeds below in the desired run order.
+ * The original night_courier seed was removed once the database had been
+ * populated and the source-JSON dependency on the external folder was cut.
+ * Add new project seeds below in the desired run order when needed.
  */
-import { seedNightCourier } from './seeds/night_courier';
-
 async function main() {
-  await seedNightCourier();
-  // await seedAnotherProject();
+  // Intentionally empty — no projects are seeded automatically.
+  // Add `await seedYourProject()` here when you need bootstrap data.
 }
 
 main().catch((e) => {

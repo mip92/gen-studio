@@ -4,7 +4,9 @@ import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { DatasetQueueService } from '../generation/dataset-queue.service';
 import { SceneRenderService } from '../generation/scenes/scene-render.service';
+import { VideoRenderService } from '../generation/videos/video-render.service';
 import { TrainingService } from '../training/training.service';
+import { TTSService } from '../tts/tts.service';
 import { EngineService } from './engine.service';
 
 const POLL_MS = 5_000;
@@ -36,7 +38,9 @@ export class PipelineQueueService {
     private readonly prisma:   PrismaService,
     private readonly datasets: DatasetQueueService,
     private readonly scenes:   SceneRenderService,
+    private readonly videos:   VideoRenderService,
     private readonly training: TrainingService,
+    private readonly tts:      TTSService,
     private readonly engine:   EngineService,
   ) {}
 
@@ -66,6 +70,13 @@ export class PipelineQueueService {
     await this.scenes.pollRunning();
     await this.detectHungJobs();
 
+    // ── 1b. TTS lane (parallel to GPU lane) ────────────────────────────────
+    // Silero runs on CPU only — it doesn't fight ComfyUI or kohya for the GPU,
+    // so it dispatches independently of the GPU-serialisation gate below. We
+    // still keep "one TTS at a time" so two python processes don't race over
+    // the torch.hub cache directory.
+    await this.dispatchTTSIfFree();
+
     // ── 2. Anything still running? ─────────────────────────────────────────
     const trainingActive = await this.prisma.trainingJob.count({
       where: { status: { in: ['preparing', 'captioning', 'training'] } },
@@ -76,28 +87,66 @@ export class PipelineQueueService {
     const sceneActive = await this.prisma.sceneRenderJob.count({
       where: { status: 'running' },
     });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0) return;
+    const videoActive = await this.prisma.videoRender.count({
+      where: { OR: [{ status: 'running' }, { upscaleStatus: 'running' }] },
+    });
+    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0) return;
 
-    // ── 3. Pick oldest pending across all three queues ─────────────────────
-    const [nextTraining, nextDataset, nextScene] = await Promise.all([
+    // ── 3. Pick oldest pending across all queues ───────────────────────────
+    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale] = await Promise.all([
       this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
       this.datasets.findNextPending(),
       this.scenes.findNextPending(),
+      this.videos.findNextPending(),
+      this.videos.findNextPendingUpscale(),
     ]);
 
-    type Pick = { type: 'training' | 'dataset' | 'scene'; id: string; ts: number };
+    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale'; id: string; ts: number };
     const candidates: Pick[] = [];
     if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
     if (nextScene)    candidates.push({ type: 'scene',    id: nextScene.id,    ts: nextScene.queuedAt.getTime() });
+    if (nextVideo)    candidates.push({ type: 'video',    id: nextVideo.id,    ts: nextVideo.queuedAt.getTime() });
+    if (nextUpscale)  candidates.push({ type: 'video_upscale', id: nextUpscale.id, ts: nextUpscale.queuedAt.getTime() });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
     const winner = candidates[0];
 
-    if (winner.type === 'training') await this.dispatchTraining(winner.id);
-    else if (winner.type === 'dataset') await this.dispatchDataset(winner.id);
-    else                                await this.dispatchScene(winner.id);
+    if (winner.type === 'training')           await this.dispatchTraining(winner.id);
+    else if (winner.type === 'dataset')       await this.dispatchDataset(winner.id);
+    else if (winner.type === 'scene')         await this.dispatchScene(winner.id);
+    else if (winner.type === 'video')         await this.dispatchVideo(winner.id);
+    else                                       await this.dispatchVideoUpscale(winner.id);
+  }
+
+  /**
+   * Pick up one pending TTS job and run it. Fire-and-forget — the python
+   * subprocess can take 5-60 s and we don't want to block GPU dispatch behind
+   * it. Concurrency is guarded by `status='running'` rows: if one is already
+   * running, the findFirst({status:'pending'}) returns null until it's done.
+   */
+  private async dispatchTTSIfFree(): Promise<void> {
+    const running = await this.prisma.tTSJob.count({ where: { status: 'running' } });
+    if (running > 0) return;
+    const next = await this.tts.findNextPending();
+    if (!next) return;
+    this.logger.log(`Dispatching TTS job ${next.id} (CPU, parallel)`);
+    void this.tts.dispatchPending(next.id).catch((e) => {
+      this.logger.error(`tts dispatchPending ${next.id} threw: ${e?.message ?? e}`);
+    });
+  }
+
+  private async dispatchVideo(videoId: string): Promise<void> {
+    if (!(await this.ensureComfyAlive('video', videoId))) return;
+    this.logger.log(`Dispatching video render ${videoId} via ComfyUI`);
+    await this.videos.dispatchPending(videoId);
+  }
+
+  private async dispatchVideoUpscale(videoId: string): Promise<void> {
+    if (!(await this.ensureComfyAlive('video_upscale', videoId))) return;
+    this.logger.log(`Dispatching video upscale ${videoId} via ComfyUI`);
+    await this.videos.dispatchPendingUpscale(videoId);
   }
 
   // ── Engine arbitration + dispatch ────────────────────────────────────────
@@ -135,7 +184,10 @@ export class PipelineQueueService {
    * startup fails, mark the calling job as `failed` and return false so the
    * caller skips dispatch — the next pending pickup happens on the next tick.
    */
-  private async ensureComfyAlive(jobType: 'dataset' | 'scene', jobId: string): Promise<boolean> {
+  private async ensureComfyAlive(
+    jobType: 'dataset' | 'scene' | 'video' | 'video_upscale',
+    jobId: string,
+  ): Promise<boolean> {
     if (await this.engine.isComfyAlive()) return true;
     this.logger.log(`${jobType} job ${jobId} needs ComfyUI — auto-starting…`);
     try {
@@ -143,15 +195,28 @@ export class PipelineQueueService {
       return true;
     } catch (e: any) {
       this.logger.error(`startComfy failed for ${jobType} ${jobId}: ${e.message}`);
-      const data = {
-        status:       'failed',
-        errorMessage: `ComfyUI auto-start failed: ${e.message}`,
-        completedAt:  new Date(),
-      };
+      const errMsg = `ComfyUI auto-start failed: ${e.message}`;
+      const ts     = new Date();
       if (jobType === 'dataset') {
-        await this.prisma.datasetJob.update({ where: { id: jobId }, data });
+        await this.prisma.datasetJob.update({
+          where: { id: jobId },
+          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
+        });
+      } else if (jobType === 'scene') {
+        await this.prisma.sceneRenderJob.update({
+          where: { id: jobId },
+          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
+        });
+      } else if (jobType === 'video') {
+        await this.prisma.videoRender.update({
+          where: { id: jobId },
+          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
+        });
       } else {
-        await this.prisma.sceneRenderJob.update({ where: { id: jobId }, data });
+        await this.prisma.videoRender.update({
+          where: { id: jobId },
+          data:  { upscaleStatus: 'failed', upscaleErrorMessage: errMsg, upscaleCompletedAt: ts },
+        });
       }
       return false;
     }

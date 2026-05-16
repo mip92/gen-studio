@@ -47,6 +47,9 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
 
   onModuleInit() {
     this.poller = setInterval(() => this.poll().catch((e) => this.logger.warn(`poll: ${e?.message}`)), POLL_MS);
+    // One-shot sweep of old failed rows from before the auto-delete policy
+    // was added. Best-effort — don't crash the module if the DB is busy.
+    this.sweepFailedRows().catch((e) => this.logger.warn(`sweepFailedRows: ${e?.message}`));
   }
   onModuleDestroy() {
     if (this.poller) clearInterval(this.poller);
@@ -124,10 +127,11 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, v.sourceImageFilename,
     );
     if (!existsSync(sourcePath)) {
-      await this.prisma.videoRender.update({
-        where: { id: v.id },
-        data:  { status: 'failed', errorMessage: `Source image missing: ${sourcePath}`, completedAt: new Date() },
-      });
+      // Source image vanished — no point keeping a doomed row around. The user
+      // asked us to drop failed-video records on the floor instead of leaving
+      // them in the gallery as error stubs.
+      this.logger.warn(`dispatchPending video ${v.id}: source image missing (${sourcePath}) — discarding row`);
+      await this.delete(v.id).catch((e) => this.logger.warn(`auto-delete ${v.id}: ${e?.message}`));
       return;
     }
 
@@ -156,12 +160,9 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         data:  { status: 'running', comfyPromptId: promptId, startedAt: new Date() },
       });
     } catch (e: any) {
-      this.logger.error(`dispatchPending video ${v.id}: ${e?.message}`);
-      await this.prisma.videoRender.update({
-        where: { id: v.id },
-        data:  { status: 'failed', errorMessage: e?.message ?? String(e), completedAt: new Date() },
-      });
+      this.logger.error(`dispatchPending video ${v.id} failed — discarding row: ${e?.message}`);
       try { unlinkSync(inputDest); } catch { /* best-effort */ }
+      await this.delete(v.id).catch((err) => this.logger.warn(`auto-delete ${v.id}: ${err?.message}`));
     }
   }
 
@@ -188,6 +189,47 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     });
     if (!shot) throw new NotFoundException(`Shot for video ${videoId} not found`);
     return path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, 'videos', v.outputFilename);
+  }
+
+  /**
+   * Hard-delete a VideoRender: removes the DB row, both mp4s on disk (preview
+   * + FHD), any pre-staged COMFY_INPUT copies, and clears shot.chosenVideoId
+   * if it pointed at this video. Idempotent on disk side (best-effort unlinks).
+   */
+  async delete(videoId: string): Promise<{ deleted: true; id: string }> {
+    const v = await this.prisma.videoRender.findUnique({
+      where:   { id: videoId },
+      include: { shot: { include: { project: true } } },
+    });
+    if (!v) throw new NotFoundException(`Video ${videoId} not found`);
+
+    const shotDir = path.join(APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode);
+    const toRemove = [
+      v.outputFilename   ? path.join(shotDir, 'videos',     v.outputFilename)   : null,
+      v.upscaledFilename ? path.join(shotDir, 'videos_fhd', v.upscaledFilename) : null,
+      // Pre-staged copies in COMFY_INPUT — these are short-lived but cleanupInputCopy
+      // is best-effort too, so re-try here in case the row dies before completion.
+      path.join(COMFY_INPUT, `video_${v.id}${path.extname(v.sourceImageFilename) || '.png'}`),
+      path.join(COMFY_INPUT, `upscale_${v.id}.mp4`),
+    ].filter((p): p is string => !!p);
+
+    for (const p of toRemove) {
+      if (!existsSync(p)) continue;
+      try { unlinkSync(p); }
+      catch (e: any) { this.logger.warn(`delete video ${v.id}: failed to unlink ${p}: ${e?.message}`); }
+    }
+
+    await this.prisma.$transaction([
+      // Clear chosenVideoId if it pointed here, so the row delete doesn't leave
+      // the shot with a dangling reference.
+      this.prisma.shot.updateMany({
+        where: { id: v.shotId, chosenVideoId: v.id },
+        data:  { chosenVideoId: null },
+      }),
+      this.prisma.videoRender.delete({ where: { id: v.id } }),
+    ]);
+
+    return { deleted: true, id: v.id };
   }
 
   /** Absolute path to the upscaled FHD mp4 once `upscaleStatus=completed`. */
@@ -356,16 +398,12 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         },
       });
     } catch (e: any) {
-      this.logger.error(`dispatchPendingUpscale ${v.id}: ${e?.message}`);
+      this.logger.error(`dispatchPendingUpscale ${v.id} failed — resetting upscale state: ${e?.message}`);
+      try { unlinkSync(inputDest); } catch { /* best-effort */ }
       await this.prisma.videoRender.update({
         where: { id: v.id },
-        data:  {
-          upscaleStatus:       'failed',
-          upscaleErrorMessage: e?.message ?? String(e),
-          upscaleCompletedAt:  new Date(),
-        },
+        data:  this.clearedUpscaleFields(),
       });
-      try { unlinkSync(inputDest); } catch { /* best-effort */ }
     }
   }
 
@@ -427,16 +465,16 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
             },
           });
         } else {
-          await this.prisma.videoRender.update({
-            where: { id: v.id },
-            data:  { status: 'failed', errorMessage: 'ComfyUI history had no video output', completedAt: new Date() },
-          });
+          this.logger.warn(`video ${v.id}: ComfyUI history had no video output — discarding row`);
+          this.cleanupInputCopy(v.id, v.sourceImageFilename);
+          await this.delete(v.id).catch((e) => this.logger.warn(`auto-delete ${v.id}: ${e?.message}`));
+          continue;
         }
       } else {
-        await this.prisma.videoRender.update({
-          where: { id: v.id },
-          data:  { status: 'failed', errorMessage: 'ComfyUI reported non-success status', completedAt: new Date() },
-        });
+        this.logger.warn(`video ${v.id}: ComfyUI reported non-success status — discarding row`);
+        this.cleanupInputCopy(v.id, v.sourceImageFilename);
+        await this.delete(v.id).catch((e) => this.logger.warn(`auto-delete ${v.id}: ${e?.message}`));
+        continue;
       }
       this.cleanupInputCopy(v.id, v.sourceImageFilename);
     }
@@ -472,27 +510,55 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
             },
           });
         } else {
+          // Upscale failed — but the underlying video is fine. Clear all upscale
+          // fields so the row looks "never upscaled" and the UI re-offers the
+          // button. We don't keep failed-upscale stubs around (same policy as
+          // failed video renders).
+          this.logger.warn(`upscale ${v.id}: ComfyUI history had no video output — resetting upscale state`);
           await this.prisma.videoRender.update({
             where: { id: v.id },
-            data:  {
-              upscaleStatus:       'failed',
-              upscaleErrorMessage: 'ComfyUI history had no video output',
-              upscaleCompletedAt:  new Date(),
-            },
+            data:  this.clearedUpscaleFields(),
           });
         }
       } else {
+        this.logger.warn(`upscale ${v.id}: ComfyUI reported non-success status — resetting upscale state`);
         await this.prisma.videoRender.update({
           where: { id: v.id },
-          data:  {
-            upscaleStatus:       'failed',
-            upscaleErrorMessage: 'ComfyUI reported non-success status',
-            upscaleCompletedAt:  new Date(),
-          },
+          data:  this.clearedUpscaleFields(),
         });
       }
       this.cleanupUpscaleInputCopy(v.id);
     }
+  }
+
+  /**
+   * One-shot startup sweep: drop any leftover `status=failed` rows (from before
+   * the auto-delete policy) and reset `upscaleStatus=failed` back to null so
+   * the UI re-offers the upscale button.
+   */
+  private async sweepFailedRows(): Promise<void> {
+    const failed = await this.prisma.videoRender.findMany({ where: { status: 'failed' } });
+    for (const v of failed) {
+      await this.delete(v.id).catch((e) => this.logger.warn(`sweep delete ${v.id}: ${e?.message}`));
+    }
+    if (failed.length > 0) this.logger.log(`sweepFailedRows: deleted ${failed.length} failed video row(s)`);
+
+    const failedUpscales = await this.prisma.videoRender.updateMany({
+      where: { upscaleStatus: 'failed' },
+      data:  this.clearedUpscaleFields(),
+    });
+    if (failedUpscales.count > 0) this.logger.log(`sweepFailedRows: reset ${failedUpscales.count} failed upscale state(s)`);
+  }
+
+  private clearedUpscaleFields() {
+    return {
+      upscaleStatus:       null,
+      upscaledFilename:    null,
+      upscalePromptId:     null,
+      upscaleStartedAt:    null,
+      upscaleCompletedAt:  null,
+      upscaleErrorMessage: null,
+    };
   }
 
   private cleanupUpscaleInputCopy(videoId: string): void {

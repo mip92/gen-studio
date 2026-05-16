@@ -1,7 +1,11 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { existsSync, unlinkSync } from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateShotDto } from './dto/create-shot.dto';
 import { UpdateShotDto } from './dto/update-shot.dto';
+
+const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 
 interface ParticipantInput {
   label:        string;
@@ -22,6 +26,8 @@ const SHOT_FULL_INCLUDE = {
 
 @Injectable()
 export class ShotsService {
+  private readonly logger = new Logger(ShotsService.name);
+
   constructor(private readonly prisma: PrismaService) {}
 
   findAll(projectIdOrSlug: string, sceneId?: string) {
@@ -183,6 +189,19 @@ export class ShotsService {
     const list = (shot.renderedImages as Array<Record<string, unknown>> | null) ?? [];
     const next = list.filter((r) => r.filename !== filename);
     const chosenStays = shot.chosenRender !== filename;
+
+    // Best-effort delete from disk. The image lives at
+    //   data/<slug>/shots/<shotCode>/<filename>
+    // Failure to unlink (already gone, permission) must not block the DB delete —
+    // the row is the source of truth, and orphan files are recoverable manually.
+    const filePath = path.join(
+      APP_ROOT, 'data', shot.project!.slug, 'shots', shot.shotCode, filename,
+    );
+    if (existsSync(filePath)) {
+      try { unlinkSync(filePath); }
+      catch (e: any) { this.logger.warn(`removeRender: failed to unlink ${filePath}: ${e?.message}`); }
+    }
+
     return this.prisma.shot.update({
       where: { id: shotId },
       data:  {
@@ -204,6 +223,24 @@ export class ShotsService {
     return this.prisma.shot.update({
       where: { id: shotId },
       data:  { chosenRender: filename },
+      include: SHOT_FULL_INCLUDE,
+    });
+  }
+
+  async setChosenVideo(shotId: string, videoId: string | null) {
+    await this.findById(shotId);
+    if (videoId) {
+      const v = await this.prisma.videoRender.findUnique({ where: { id: videoId } });
+      if (!v || v.shotId !== shotId) {
+        throw new BadRequestException(`Video "${videoId}" does not belong to shot ${shotId}`);
+      }
+      if (v.status !== 'completed' || !v.outputFilename) {
+        throw new BadRequestException(`Video "${videoId}" is not completed yet`);
+      }
+    }
+    return this.prisma.shot.update({
+      where: { id: shotId },
+      data:  { chosenVideoId: videoId },
       include: SHOT_FULL_INCLUDE,
     });
   }
