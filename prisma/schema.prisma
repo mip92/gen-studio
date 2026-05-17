@@ -15,6 +15,10 @@ model Project {
   slug      String   @unique
   name      String
   settings  Json?
+  /// Full narration script for the project (Markdown). Source of truth lives
+  /// in the database so the API can serve it without depending on filesystem
+  /// state. Scenes hold their own snippet of this in Scene.narrationText.
+  scriptText String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -302,6 +306,11 @@ model VideoRender {
   upscaleStatus        String?
   upscaledFilename     String?
   upscalePromptId      String?
+  /// When this row's upscale lifecycle entered `pending`. Distinct from the
+  /// main render's `queuedAt` because an upscale is requested some time after
+  /// the underlying video finishes — sorting upscales by `queuedAt` would
+  /// place every new upscale ahead of newly-queued renders.
+  upscaleQueuedAt      DateTime?
   upscaleStartedAt     DateTime?
   upscaleCompletedAt   DateTime?
   upscaleErrorMessage  String?
@@ -310,7 +319,7 @@ model VideoRender {
 
   @@index([shotId])
   @@index([status, queuedAt])
-  @@index([upscaleStatus])
+  @@index([upscaleStatus, upscaleQueuedAt])
   @@map("video_renders")
 }
 
@@ -359,6 +368,9 @@ model TTSJob {
   voice          String
   /// Output sample rate: 8000 | 24000 | 48000 (Silero supports these three).
   sampleRate     Int
+  /// Playback rate (1.0 = normal, <1 slower, >1 faster). Implemented via SSML
+  /// `<prosody rate="X%">…</prosody>` wrapping in the Python worker.
+  rate           Float     @default(1.0)
   status         String    // pending | running | completed | failed | cancelled
   /// Basename of the wav inside data/<slug>/scenes/<sceneKey>/.
   outputFilename String?

@@ -1,11 +1,8 @@
 import { Controller, Get, NotFoundException, Param } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { existsSync, readFileSync, statSync } from 'fs';
-import * as path from 'path';
+import { existsSync, statSync } from 'fs';
 import { PrismaService } from '../prisma/prisma.service';
 import { DatasetService } from '../training/dataset.service';
-
-const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 
 @ApiTags('Projects')
 @Controller('projects/:idOrSlug')
@@ -96,34 +93,22 @@ export class ProjectsDashboardController {
 
   /**
    * Returns the project's full narration script (Markdown) for the TTS modal's
-   * reference panel. Script lives inside the gen-studio server tree:
-   *   data/<slug>/script.md
-   * Optionally overridable via env `SCRIPT_PATH_<SLUG_UPPER>` for local testing.
-   * Returns { text, path } on success, or { text: null, path: null } if the
-   * script is not yet authored (UI gracefully hides the reference panel).
+   * reference panel. Source of truth: Project.scriptText column in the DB.
+   * Returns { text } (or { text: null } if not authored yet).
+   *
+   * Route note: this class is mounted at `@Controller('projects/:idOrSlug')`,
+   * so the @Get path must NOT repeat `:idOrSlug` — just `script` resolves to
+   * `/projects/:idOrSlug/script`.
    */
-  @Get(':idOrSlug/script')
-  @ApiOperation({ summary: 'Read the project narration script (Markdown), if any' })
+  @Get('script')
+  @ApiOperation({ summary: 'Read the project narration script from the DB' })
   async script(@Param('idOrSlug') idOrSlug: string) {
     const project = await this.prisma.project.findFirst({
-      where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+      where:  { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+      select: { scriptText: true, slug: true },
     });
     if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
-
-    const slug   = project.slug;
-    const envKey = `SCRIPT_PATH_${slug.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
-    const candidates = [
-      process.env[envKey],
-      path.join(APP_ROOT, 'data', slug, 'script.md'),
-    ].filter((p): p is string => !!p);
-
-    for (const p of candidates) {
-      if (existsSync(p)) {
-        const text = readFileSync(p, 'utf-8');
-        return { text, path: p };
-      }
-    }
-    return { text: null, path: null };
+    return { text: project.scriptText ?? null };
   }
 
   /**

@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "tts_jobs" ADD COLUMN "rate" DOUBLE PRECISION NOT NULL DEFAULT 1.0;

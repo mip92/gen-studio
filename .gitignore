@@ -14,6 +14,12 @@ data/*/characters/
 data/*/datasets/
 data/*/reference/
 data/*/shots/
+# Generated TTS narration audio (large wavs, regenerated on demand).
+data/*/scenes/
 
 # Manual backups of comfy templates
 data/*/comfy/*.bak
+
+# Locally-downloaded Silero TTS model checkpoint (~140MB, user drops manually
+# per scripts/tts_silero.py instructions; way over GitHub's per-file limit).
+.silero_cache/

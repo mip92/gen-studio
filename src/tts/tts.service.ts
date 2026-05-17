@@ -19,6 +19,9 @@ type SampleRate = (typeof ALLOWED_SAMPLE_RATES)[number];
 
 const DEFAULT_VOICE: Voice           = 'eugene';
 const DEFAULT_SAMPLE_RATE: SampleRate = 48000;
+const DEFAULT_RATE                    = 1.0;
+const MIN_RATE                        = 0.5;
+const MAX_RATE                        = 2.0;
 
 export interface StartTTSInput {
   sceneId:      string;
@@ -26,6 +29,8 @@ export interface StartTTSInput {
   text?:        string;
   voice?:       Voice;
   sampleRate?:  SampleRate;
+  /** Playback rate. 1.0 = normal, 0.8 = 20% slower, 1.2 = 20% faster. Range [0.5, 2.0]. */
+  rate?:        number;
 }
 
 @Injectable()
@@ -51,11 +56,15 @@ export class TTSService {
 
     const voice      = input.voice      ?? DEFAULT_VOICE;
     const sampleRate = input.sampleRate ?? DEFAULT_SAMPLE_RATE;
+    const rate       = input.rate       ?? DEFAULT_RATE;
     if (!ALLOWED_VOICES.includes(voice)) {
       throw new BadRequestException(`voice must be one of: ${ALLOWED_VOICES.join(', ')}`);
     }
     if (!ALLOWED_SAMPLE_RATES.includes(sampleRate)) {
       throw new BadRequestException(`sampleRate must be one of: ${ALLOWED_SAMPLE_RATES.join(', ')}`);
+    }
+    if (rate < MIN_RATE || rate > MAX_RATE) {
+      throw new BadRequestException(`rate must be in [${MIN_RATE}, ${MAX_RATE}]`);
     }
 
     return this.prisma.tTSJob.create({
@@ -64,6 +73,7 @@ export class TTSService {
         text,
         voice,
         sampleRate,
+        rate,
         status:  'pending',
       },
     });
@@ -154,6 +164,7 @@ export class TTSService {
       '--out',         outPath,
       '--voice',       job.voice,
       '--sample-rate', String(job.sampleRate),
+      '--rate',        String(job.rate ?? 1.0),
     ];
     this.logger.log(`Launching silero TTS: ${PYTHON_BIN} ${argv.join(' ')}`);
 

@@ -338,10 +338,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     copyFileSync(srcMp4, inputDest);
 
     // Mark pending — PipelineQueueService.tick() will pick this up and dispatch.
+    // upscaleQueuedAt is the FIFO key for the upscale lifecycle; the row's main
+    // `queuedAt` belongs to the original render and is usually stale by now.
     return this.prisma.videoRender.update({
       where: { id: v.id },
       data:  {
         upscaleStatus:       'pending',
+        upscaleQueuedAt:     new Date(),
         upscaleErrorMessage: null,
         upscaleCompletedAt:  null,
         upscaleStartedAt:    null,
@@ -354,7 +357,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   findNextPendingUpscale() {
     return this.prisma.videoRender.findFirst({
       where:   { upscaleStatus: 'pending' },
-      orderBy: { queuedAt: 'asc' },
+      orderBy: { upscaleQueuedAt: 'asc' },
     });
   }
 
@@ -555,6 +558,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       upscaleStatus:       null,
       upscaledFilename:    null,
       upscalePromptId:     null,
+      upscaleQueuedAt:     null,
       upscaleStartedAt:    null,
       upscaleCompletedAt:  null,
       upscaleErrorMessage: null,

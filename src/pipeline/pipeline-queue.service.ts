@@ -107,7 +107,14 @@ export class PipelineQueueService {
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
     if (nextScene)    candidates.push({ type: 'scene',    id: nextScene.id,    ts: nextScene.queuedAt.getTime() });
     if (nextVideo)    candidates.push({ type: 'video',    id: nextVideo.id,    ts: nextVideo.queuedAt.getTime() });
-    if (nextUpscale)  candidates.push({ type: 'video_upscale', id: nextUpscale.id, ts: nextUpscale.queuedAt.getTime() });
+    if (nextUpscale)  candidates.push({
+      type: 'video_upscale',
+      id:   nextUpscale.id,
+      // Upscale FIFO uses upscaleQueuedAt — the row's main `queuedAt` is from
+      // the original render and would let stale upscales win every arbitration.
+      // Legacy rows (before the upscaleQueuedAt migration) fall back to it.
+      ts:   (nextUpscale.upscaleQueuedAt ?? nextUpscale.queuedAt).getTime(),
+    });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
