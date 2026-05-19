@@ -55,17 +55,27 @@ from typing import Dict, Any, List
 import pyJianYingDraft as draft
 
 
+# Safety margin shaved off every probed wav length (microseconds). pyJianYingDraft's
+# internal material-duration calc floors differently than our wave.getnframes()
+# read — observed up to a 500µs over-report on Silero 48kHz output. We trim 5ms
+# (inaudible) so the AudioSegment timerange is always strictly within bounds.
+_WAV_TRIM_MARGIN_US = 5_000
+
+
 def _wav_duration_us(path: str) -> int:
-    """Return wav duration in microseconds via stdlib `wave`. Returns 0 if the
-    file isn't a readable PCM wav (in which case the caller falls back to the
-    duration hint from the manifest)."""
+    """Return wav duration in microseconds via stdlib `wave`, minus a small
+    safety margin so the value is always strictly less than what
+    pyJianYingDraft computes internally. Returns 0 if the file isn't a
+    readable PCM wav."""
     try:
         with wave.open(path, 'rb') as w:
             frames = w.getnframes()
             rate   = w.getframerate()
             if rate <= 0 or frames <= 0:
                 return 0
-            return int(round(frames * 1_000_000 / rate))
+            # Floor (not round) — pyJianYingDraft floors too on its side.
+            raw_us = (frames * 1_000_000) // rate
+            return max(0, raw_us - _WAV_TRIM_MARGIN_US)
     except Exception as e:  # noqa: BLE001
         _log(f'wav probe failed for {path}: {e!r}')
         return 0
