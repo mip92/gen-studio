@@ -48,10 +48,27 @@ import shutil
 import sys
 import time
 import uuid
+import wave
 from pathlib import Path
 from typing import Dict, Any, List
 
 import pyJianYingDraft as draft
+
+
+def _wav_duration_us(path: str) -> int:
+    """Return wav duration in microseconds via stdlib `wave`. Returns 0 if the
+    file isn't a readable PCM wav (in which case the caller falls back to the
+    duration hint from the manifest)."""
+    try:
+        with wave.open(path, 'rb') as w:
+            frames = w.getnframes()
+            rate   = w.getframerate()
+            if rate <= 0 or frames <= 0:
+                return 0
+            return int(round(frames * 1_000_000 / rate))
+    except Exception as e:  # noqa: BLE001
+        _log(f'wav probe failed for {path}: {e!r}')
+        return 0
 
 
 def _log(msg: str) -> None:
@@ -107,14 +124,24 @@ def build_draft(manifest: dict) -> Path:
             script.add_segment(segment, track_name="main_video")
 
             # Per-shot narration: lay the wav at this shot's exact timeline
-            # position. Duration is clipped to the video duration upstream,
-            # so the audio can't overlap the next shot.
+            # position. The Node-side duration_us is a text-length estimate; we
+            # probe the real wav here so pyJianYingDraft doesn't complain that
+            # our timerange exceeds the material length ("超出了素材时长").
             shot_narr = sh.get("narration")
             if shot_narr and shot_narr.get("path"):
-                tts_dur = int(shot_narr["duration_us"])
+                wav_path = shot_narr["path"].replace("\\", "/")
+                actual_us = _wav_duration_us(wav_path)
+                guess_us  = int(shot_narr.get("duration_us") or 0)
+                # Pick the SHORTER of: actual wav duration, the Node-side guess,
+                # and the shot's video duration. Never clip beyond what really
+                # exists in the wav file, and never overflow the video slot.
+                tts_dur = actual_us if actual_us > 0 else guess_us
+                if guess_us > 0:
+                    tts_dur = min(tts_dur, guess_us)
+                tts_dur = min(tts_dur, dur)
                 if tts_dur > 0:
                     a_mat = draft.AudioMaterial(
-                        shot_narr["path"].replace("\\", "/"),
+                        wav_path,
                         material_name=f'{sh["shotCode"]}_narration',
                     )
                     a_seg = draft.AudioSegment(
@@ -137,10 +164,15 @@ def build_draft(manifest: dict) -> Path:
         if not any_shot_narration:
             narr = scene.get("narration")
             if narr and narr.get("path"):
-                tts_dur = int(narr["duration_us"])
+                wav_path  = narr["path"].replace("\\", "/")
+                actual_us = _wav_duration_us(wav_path)
+                guess_us  = int(narr.get("duration_us") or 0)
+                tts_dur   = actual_us if actual_us > 0 else guess_us
+                if guess_us > 0:
+                    tts_dur = min(tts_dur, guess_us)
                 if tts_dur > 0:
                     a_mat = draft.AudioMaterial(
-                        narr["path"].replace("\\", "/"),
+                        wav_path,
                         material_name=f'{scene["sceneKey"]}_narration',
                     )
                     a_seg = draft.AudioSegment(
