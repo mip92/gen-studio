@@ -37,10 +37,21 @@ export interface ExportReadiness {
   missingScenes: SceneReadinessIssue[];
 }
 
-interface ManifestShot  { shotCode: string; path: string; duration_us: number }
+interface ManifestShot  {
+  shotCode:    string;
+  path:        string;
+  duration_us: number;
+  /** Per-shot narration wav (shot-level TTS). When set, the python exporter
+   *  lays the wav on the audio track at this shot's video timeline position
+   *  instead of the legacy scene-level narration block. */
+  narration?:  { path: string; duration_us: number } | null;
+}
 interface ManifestScene {
   sceneKey:  string;
   title:     string | null;
+  /** Legacy whole-scene voiceover. Used only when per-shot narrations are not
+   *  set on any shot of the scene — the python exporter prefers per-shot wavs
+   *  when they exist. */
   narration: { path: string; duration_us: number } | null;
   shots:     ManifestShot[];
 }
@@ -209,7 +220,11 @@ export class ExportsService {
       where:   { projectId },
       include: {
         shots: {
-          include: { videoRenders: true },
+          include: {
+            videoRenders: true,
+            // Pull approved shot-level TTS rows so we can attach per-shot wavs.
+            ttsJobs:      true,
+          },
         },
       },
       orderBy: { sortOrder: 'asc' },
@@ -237,10 +252,32 @@ export class ExportsService {
         const fpsP    = params.fps    ?? 16;
         const lengthP = params.length ?? 81;
         const duration_us = Math.round((lengthP / fpsP) * 1_000_000);
+
+        // Per-shot narration: if the shot has an approved TTSJob with a
+        // rendered wav on disk, attach it. The python exporter clips audio
+        // to the shot's video duration so it never bleeds into the next shot.
+        let shotNarration: ManifestShot['narration'] = null;
+        const approvedId  = (shot as { approvedTTSJobId?: string | null }).approvedTTSJobId ?? null;
+        const ttsJobs     = (shot as { ttsJobs?: Array<{ id: string; outputFilename: string | null; text: string }> }).ttsJobs ?? [];
+        const approvedTts = approvedId ? ttsJobs.find((t) => t.id === approvedId) : null;
+        if (approvedTts?.outputFilename) {
+          const wavPath = path.join(dataRoot, 'shots', shot.shotCode, approvedTts.outputFilename);
+          if (existsSync(wavPath)) {
+            // Estimate duration from text length (≈15 chars/sec at our default
+            // rate). Capped at the shot's video duration so the wav can't
+            // overlap the next shot on the audio track.
+            const guessUs = Math.max(800_000, Math.round((approvedTts.text.length / 15) * 1_000_000));
+            shotNarration = { path: wavPath, duration_us: Math.min(guessUs, duration_us) };
+          } else {
+            this.logger.warn(`shot ${shot.shotCode}: approved TTS wav missing on disk (${wavPath}) — skipping audio`);
+          }
+        }
+
         shotEntries.push({
           shotCode:    shot.shotCode,
           path:        fp,
           duration_us,
+          narration:   shotNarration,
         });
       }
 

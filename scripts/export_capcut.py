@@ -85,6 +85,8 @@ def build_draft(manifest: dict) -> Path:
     for scene in manifest["scenes"]:
         scene_start_us = cursor_video_us
 
+        any_shot_narration = False
+
         # ── Video shots (sequential) ───────────────────────────────────────
         for sh in scene["shots"]:
             # CapCut requires forward slashes in material paths — backslash
@@ -103,25 +105,52 @@ def build_draft(manifest: dict) -> Path:
                 target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
             )
             script.add_segment(segment, track_name="main_video")
+
+            # Per-shot narration: lay the wav at this shot's exact timeline
+            # position. Duration is clipped to the video duration upstream,
+            # so the audio can't overlap the next shot.
+            shot_narr = sh.get("narration")
+            if shot_narr and shot_narr.get("path"):
+                tts_dur = int(shot_narr["duration_us"])
+                if tts_dur > 0:
+                    a_mat = draft.AudioMaterial(
+                        shot_narr["path"].replace("\\", "/"),
+                        material_name=f'{sh["shotCode"]}_narration',
+                    )
+                    a_seg = draft.AudioSegment(
+                        material=a_mat,
+                        target_timerange=draft.Timerange(start=cursor_video_us, duration=tts_dur),
+                    )
+                    script.add_segment(a_seg, track_name="narration")
+                    total_tts += 1
+                    any_shot_narration = True
+
             cursor_video_us += dur
             total_clips += 1
 
-        # ── Narration (parallel to the scene's shots) ──────────────────────
-        narr = scene.get("narration")
-        if narr and narr.get("path"):
-            tts_dur = int(narr["duration_us"])
-            if tts_dur > 0:
-                # Forward-slash path for CapCut, see comment on video path above.
-                a_mat = draft.AudioMaterial(narr["path"].replace("\\", "/"),
-                                            material_name=f'{scene["sceneKey"]}_narration')
-                a_seg = draft.AudioSegment(
-                    material=a_mat,
-                    target_timerange=draft.Timerange(start=scene_start_us, duration=tts_dur),
-                )
-                script.add_segment(a_seg, track_name="narration")
-                total_tts += 1
-            else:
-                _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
+        # ── Legacy scene-level narration ───────────────────────────────────
+        # Only used if no shot in this scene had its own per-shot wav — that
+        # means we're exporting a project still on the old whole-scene flow.
+        # Once at least one shot brings its own audio, we trust the per-shot
+        # layout to be the intended source of truth and skip the scene-level
+        # block to avoid double-narration.
+        if not any_shot_narration:
+            narr = scene.get("narration")
+            if narr and narr.get("path"):
+                tts_dur = int(narr["duration_us"])
+                if tts_dur > 0:
+                    a_mat = draft.AudioMaterial(
+                        narr["path"].replace("\\", "/"),
+                        material_name=f'{scene["sceneKey"]}_narration',
+                    )
+                    a_seg = draft.AudioSegment(
+                        material=a_mat,
+                        target_timerange=draft.Timerange(start=scene_start_us, duration=tts_dur),
+                    )
+                    script.add_segment(a_seg, track_name="narration")
+                    total_tts += 1
+                else:
+                    _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
 
     draft_dir.mkdir(parents=True, exist_ok=True)
     # pyJianYingDraft writes draft_content.json directly to the given path.
