@@ -27,7 +27,7 @@ interface SceneReadinessIssue {
   sceneKey:  string;
   sceneId:   string;
   title:     string | null;
-  reason:    'no_approved_tts' | 'no_shots';
+  reason:    'no_shots';
 }
 
 export interface ExportReadiness {
@@ -107,15 +107,13 @@ export class ExportsService {
     let totalShots = 0;
 
     for (const scene of scenes) {
+      // Scene-level "no_approved_tts" gate was removed: per-shot TTS replaces
+      // whole-scene narration. A shot with no approved wav simply plays silent
+      // video on its timeline slot — that's fine, not a blocker.
       if (scene.shots.length === 0) {
         missingScenes.push({
           sceneKey: scene.sceneKey, sceneId: scene.id, title: scene.title,
           reason: 'no_shots',
-        });
-      } else if (!scene.approvedTTSJobId) {
-        missingScenes.push({
-          sceneKey: scene.sceneKey, sceneId: scene.id, title: scene.title,
-          reason: 'no_approved_tts',
         });
       }
       for (const shot of scene.shots) {
