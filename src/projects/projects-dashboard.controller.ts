@@ -252,6 +252,9 @@ export class ProjectsDashboardController {
             pipelineUpscale: inflightUpscale
               ? { id: inflightUpscale.id, status: inflightUpscale.upscaleStatus as string }
               : null,
+            // ── Per-shot narration (shot-level TTS) ─────────────────────────
+            narrationText:    (sh as any).narrationText    ?? null,
+            approvedTTSJobId: (sh as any).approvedTTSJobId ?? null,
           };
         }),
       })),
