@@ -184,10 +184,22 @@ export class TTSController {
   @Get('scenes/:sceneId/shots/summary')
   @ApiOperation({
     summary: 'Per-scene aggregate of shot-level TTS state',
-    description: 'Counts: total / withText / approved / pending / running / failed. '
-              + 'Used by the scenes-list page to render a live progress badge.',
+    description: 'Shot-bucketed counts so the breakdown adds up: approved + '
+              + 'waitingApprove + inFlight + needsQueueing ≤ total. Plus '
+              + 'job-level pendingJobs / runningJobs / failedJobs.',
   })
   shotsSummary(@Param('sceneId') sceneId: string) {
     return this.tts.sceneShotTtsSummary(sceneId);
+  }
+
+  @Post('scenes/:sceneId/shots/approve-all-completed')
+  @ApiOperation({
+    summary: 'Bulk-approve the most recent completed wav for every shot in the scene',
+    description: 'Picks the latest completed TTSJob per shot and writes its id '
+              + 'into shot.approvedTTSJobId. Skips shots that are already approved '
+              + 'or have no completed wav. Returns {approved, skipped, total}.',
+  })
+  approveAllCompleted(@Param('sceneId') sceneId: string) {
+    return this.tts.approveAllCompletedForScene(sceneId);
   }
 }

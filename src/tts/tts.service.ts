@@ -626,33 +626,100 @@ export class TTSService {
   /**
    * Lightweight per-scene summary of shot-level TTS state. Used by the
    * scenes-list page to show live progress without round-tripping every shot.
+   *
+   * Counts are shot-bucketed (not job-bucketed) so they add up cleanly:
+   *   - approved          : shot has approvedTTSJobId pointing at a completed job
+   *   - waitingApprove    : ≥1 completed unapproved job AND no approval AND no in-flight
+   *   - inFlight          : ≥1 pending|running job (shot is currently being voiced)
+   *   - needsQueueing     : narrationText is set AND no completed/pending/running jobs
+   *   approved + waitingApprove + inFlight + needsQueueing ≤ total.
+   * Plus job-level pending/running counts for the scene-header "⚙/⏳" badges.
    */
   async sceneShotTtsSummary(sceneId: string): Promise<{
-    total:     number;
-    withText:  number;
-    approved:  number;
-    pending:   number;
-    running:   number;
-    failed:    number;
+    total:           number;
+    withText:        number;
+    approved:        number;
+    waitingApprove:  number;
+    inFlight:        number;
+    needsQueueing:   number;
+    pendingJobs:     number;
+    runningJobs:     number;
+    failedJobs:      number;
   }> {
     const shots = await this.prisma.shot.findMany({
       where:   { sceneId },
       include: { ttsJobs: true },
     });
-    let withText = 0, approved = 0, pending = 0, running = 0, failed = 0;
+    let withText = 0, approved = 0, waitingApprove = 0, inFlight = 0, needsQueueing = 0;
+    let pendingJobs = 0, runningJobs = 0, failedJobs = 0;
     for (const s of shots) {
-      if ((s.narrationText ?? '').trim()) withText++;
-      if (s.approvedTTSJobId) {
-        const j = s.ttsJobs.find((t) => t.id === s.approvedTTSJobId);
-        if (j?.status === 'completed') approved++;
-      }
+      const hasText = (s.narrationText ?? '').trim().length > 0;
+      if (hasText) withText++;
+
+      let shotInFlight    = false;
+      let shotHasCompleted = false;
       for (const j of s.ttsJobs) {
-        if (j.status === 'pending') pending++;
-        else if (j.status === 'running') running++;
-        else if (j.status === 'failed')  failed++;
+        if (j.status === 'pending')   { pendingJobs++;   shotInFlight = true; }
+        else if (j.status === 'running'){ runningJobs++; shotInFlight = true; }
+        else if (j.status === 'failed') { failedJobs++; }
+        else if (j.status === 'completed') { shotHasCompleted = true; }
+      }
+
+      const approvedJob = s.approvedTTSJobId
+        ? s.ttsJobs.find((t) => t.id === s.approvedTTSJobId && t.status === 'completed')
+        : null;
+
+      if (approvedJob) {
+        approved++;
+      } else if (shotInFlight) {
+        inFlight++;
+      } else if (shotHasCompleted) {
+        waitingApprove++;
+      } else if (hasText) {
+        needsQueueing++;
       }
     }
-    return { total: shots.length, withText, approved, pending, running, failed };
+    return {
+      total: shots.length,
+      withText,
+      approved,
+      waitingApprove,
+      inFlight,
+      needsQueueing,
+      pendingJobs,
+      runningJobs,
+      failedJobs,
+    };
+  }
+
+  /**
+   * Bulk-approve every shot in a scene that has at least one completed but
+   * unapproved TTSJob — picks the most recent completed wav per shot. Skips
+   * shots that are already approved or have no completed wav. Returns the
+   * count of newly-approved shots.
+   */
+  async approveAllCompletedForScene(sceneId: string): Promise<{ approved: number; skipped: number; total: number }> {
+    const shots = await this.prisma.shot.findMany({
+      where:   { sceneId },
+      include: { ttsJobs: { orderBy: { queuedAt: 'desc' } } },
+    });
+    let approved = 0;
+    let skipped  = 0;
+    for (const s of shots) {
+      // Already approved → skip.
+      if (s.approvedTTSJobId) {
+        const cur = s.ttsJobs.find((j) => j.id === s.approvedTTSJobId);
+        if (cur?.status === 'completed') { skipped++; continue; }
+      }
+      const latestCompleted = s.ttsJobs.find((j) => j.status === 'completed');
+      if (!latestCompleted) { skipped++; continue; }
+      await this.prisma.shot.update({
+        where: { id: s.id },
+        data:  { approvedTTSJobId: latestCompleted.id },
+      });
+      approved++;
+    }
+    return { approved, skipped, total: shots.length };
   }
 
   /** Update per-shot narration text. Parallel of `setNarrationText` for shots. */
