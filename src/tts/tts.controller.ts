@@ -164,4 +164,30 @@ export class TTSController {
   clearShotApproval(@Param('shotId') shotId: string) {
     return this.tts.approveForShot(null, shotId);
   }
+
+  // ── Scene-level bulk actions on shot TTS ─────────────────────────────────
+
+  @Post('scenes/:sceneId/shots/queue-all')
+  @ApiOperation({
+    summary: 'Queue TTS for every shot in a scene',
+    description: 'mode=missing (default): skip shots that already have an approved '
+              + 'completed wav. mode=all: re-render everything. Returns counts so '
+              + 'the UI can show "queued N, skipped M".',
+  })
+  queueAllShots(
+    @Param('sceneId') sceneId: string,
+    @Body() body: { mode?: 'missing' | 'all'; voice?: string } = {},
+  ) {
+    return this.tts.queueAllForScene(sceneId, body as { mode?: 'missing' | 'all'; voice?: any });
+  }
+
+  @Get('scenes/:sceneId/shots/summary')
+  @ApiOperation({
+    summary: 'Per-scene aggregate of shot-level TTS state',
+    description: 'Counts: total / withText / approved / pending / running / failed. '
+              + 'Used by the scenes-list page to render a live progress badge.',
+  })
+  shotsSummary(@Param('sceneId') sceneId: string) {
+    return this.tts.sceneShotTtsSummary(sceneId);
+  }
 }

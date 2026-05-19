@@ -576,6 +576,85 @@ export class TTSService {
     });
   }
 
+  /**
+   * Queue TTS for every shot in a scene that has narrationText and either
+   * (mode='missing') no approved completed job, or (mode='all') any state.
+   * Used by the scenes-page "🎙 в очередь" button — one HTTP call per scene
+   * instead of N HTTP calls per shot.
+   */
+  async queueAllForScene(
+    sceneId: string,
+    opts: { mode?: 'missing' | 'all'; voice?: Voice } = {},
+  ): Promise<{ queued: number; skipped: number; total: number }> {
+    const mode  = opts.mode  ?? 'missing';
+    const voice = opts.voice ?? DEFAULT_VOICE;
+    const scene = await this.prisma.scene.findUnique({
+      where:   { id: sceneId },
+      include: { shots: { orderBy: { shotCode: 'asc' } } },
+    });
+    if (!scene) throw new NotFoundException(`Scene ${sceneId} not found`);
+
+    let queued  = 0;
+    let skipped = 0;
+    for (const shot of scene.shots) {
+      const text = (shot.narrationText ?? '').trim();
+      if (!text) { skipped++; continue; }
+
+      if (mode === 'missing' && shot.approvedTTSJobId) {
+        // Confirm the approval still points at a completed job before skipping.
+        const job = await this.prisma.tTSJob.findUnique({ where: { id: shot.approvedTTSJobId } });
+        if (job?.status === 'completed') { skipped++; continue; }
+      }
+
+      await this.prisma.tTSJob.create({
+        data: {
+          shotId:           shot.id,
+          text,
+          voice,
+          sampleRate:       DEFAULT_SAMPLE_RATE,
+          rate:             DEFAULT_RATE,
+          sentencePauseSec: 0,
+          modelFilename:    null,
+          status:           'pending',
+        },
+      });
+      queued++;
+    }
+    return { queued, skipped, total: scene.shots.length };
+  }
+
+  /**
+   * Lightweight per-scene summary of shot-level TTS state. Used by the
+   * scenes-list page to show live progress without round-tripping every shot.
+   */
+  async sceneShotTtsSummary(sceneId: string): Promise<{
+    total:     number;
+    withText:  number;
+    approved:  number;
+    pending:   number;
+    running:   number;
+    failed:    number;
+  }> {
+    const shots = await this.prisma.shot.findMany({
+      where:   { sceneId },
+      include: { ttsJobs: true },
+    });
+    let withText = 0, approved = 0, pending = 0, running = 0, failed = 0;
+    for (const s of shots) {
+      if ((s.narrationText ?? '').trim()) withText++;
+      if (s.approvedTTSJobId) {
+        const j = s.ttsJobs.find((t) => t.id === s.approvedTTSJobId);
+        if (j?.status === 'completed') approved++;
+      }
+      for (const j of s.ttsJobs) {
+        if (j.status === 'pending') pending++;
+        else if (j.status === 'running') running++;
+        else if (j.status === 'failed')  failed++;
+      }
+    }
+    return { total: shots.length, withText, approved, pending, running, failed };
+  }
+
   /** Update per-shot narration text. Parallel of `setNarrationText` for shots. */
   async setShotNarrationText(shotId: string, body: { text?: string }) {
     const shot = await this.prisma.shot.findUnique({ where: { id: shotId } });
