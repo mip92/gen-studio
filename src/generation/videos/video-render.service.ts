@@ -294,12 +294,29 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
    * with the shot's scene prompt fields (so Wan has both "what's happening"
    * and "how it should move"). Falls back to a generic motion line if the
    * user left motionPrompt empty.
+   *
+   * Static-shot escape hatch: if `promptFields.camera.movement` begins with
+   * `static` (e.g. `static_locked_off`), the empty-prompt fallback flips to an
+   * explicit no-motion line and `narrativeBeat` is NOT appended — abstract
+   * beats like "a wheel in a skid is an abstraction" leak motion verbs into
+   * Wan2.2 and force the model to add skidding/push-in even on a locked-off shot.
    */
   private composeMotionPrompt(motion: string, shot: { promptFields: any }): string {
     const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
+    const cam = (pf.camera as Record<string, unknown> | undefined) ?? {};
+    const movement = typeof cam.movement === 'string' ? cam.movement : '';
+    const isStatic = /^static/i.test(movement.trim());
+
+    const userMotion = motion?.trim() ?? '';
+    const motionLine = userMotion
+      || (isStatic
+            ? 'completely static shot, frozen frame, locked-off tripod camera, no camera motion, no parallax, no zoom, no pan, no dolly, no handheld shake. Every object in frame remains completely stationary. All vehicles in frame are parked and frozen in place — no wheels turning, no cars rolling, no cars driving, no skidding in progress, no headlights moving, no exhaust, no smoke trail, no tire smoke. No people walking, no figures moving, no environmental motion, no wind, no leaves moving, no flickering lights. The entire scene is a still photograph come to life with zero motion, freeze frame.'
+            : 'subtle camera push-in, gentle breathing motion, natural micro-movements');
+
     const beat = typeof pf.narrativeBeat === 'string' ? pf.narrativeBeat : '';
-    const motionLine = motion?.trim() || 'subtle camera push-in, gentle breathing motion, natural micro-movements';
-    const parts = [motionLine, beat].filter((s) => s && s.trim().length > 0);
+    const parts = isStatic
+      ? [motionLine]
+      : [motionLine, beat].filter((s) => s && s.trim().length > 0);
     return parts.join(', ');
   }
 

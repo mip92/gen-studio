@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "tts_jobs" ADD COLUMN "sentencePauseSec" DOUBLE PRECISION NOT NULL DEFAULT 0;

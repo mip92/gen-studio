@@ -70,14 +70,10 @@ export class PipelineQueueService {
     await this.scenes.pollRunning();
     await this.detectHungJobs();
 
-    // ── 1b. TTS lane (parallel to GPU lane) ────────────────────────────────
-    // Silero runs on CPU only — it doesn't fight ComfyUI or kohya for the GPU,
-    // so it dispatches independently of the GPU-serialisation gate below. We
-    // still keep "one TTS at a time" so two python processes don't race over
-    // the torch.hub cache directory.
-    await this.dispatchTTSIfFree();
-
     // ── 2. Anything still running? ─────────────────────────────────────────
+    // TTS is included in the activity check so it participates in the same
+    // single-slot serialisation as GPU work — the user's invariant is "all
+    // jobs enter and leave the queue through one path, in FIFO order".
     const trainingActive = await this.prisma.trainingJob.count({
       where: { status: { in: ['preparing', 'captioning', 'training'] } },
     });
@@ -90,18 +86,22 @@ export class PipelineQueueService {
     const videoActive = await this.prisma.videoRender.count({
       where: { OR: [{ status: 'running' }, { upscaleStatus: 'running' }] },
     });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0) return;
+    const ttsActive = await this.prisma.tTSJob.count({
+      where: { status: 'running' },
+    });
+    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0) return;
 
     // ── 3. Pick oldest pending across all queues ───────────────────────────
-    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale] = await Promise.all([
+    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextTTS] = await Promise.all([
       this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
       this.datasets.findNextPending(),
       this.scenes.findNextPending(),
       this.videos.findNextPending(),
       this.videos.findNextPendingUpscale(),
+      this.tts.findNextPending(),
     ]);
 
-    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale'; id: string; ts: number };
+    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts'; id: string; ts: number };
     const candidates: Pick[] = [];
     if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
@@ -115,6 +115,7 @@ export class PipelineQueueService {
       // Legacy rows (before the upscaleQueuedAt migration) fall back to it.
       ts:   (nextUpscale.upscaleQueuedAt ?? nextUpscale.queuedAt).getTime(),
     });
+    if (nextTTS)      candidates.push({ type: 'tts',      id: nextTTS.id,      ts: nextTTS.queuedAt.getTime() });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
@@ -124,23 +125,19 @@ export class PipelineQueueService {
     else if (winner.type === 'dataset')       await this.dispatchDataset(winner.id);
     else if (winner.type === 'scene')         await this.dispatchScene(winner.id);
     else if (winner.type === 'video')         await this.dispatchVideo(winner.id);
-    else                                       await this.dispatchVideoUpscale(winner.id);
+    else if (winner.type === 'video_upscale') await this.dispatchVideoUpscale(winner.id);
+    else                                       await this.dispatchTTS(winner.id);
   }
 
   /**
-   * Pick up one pending TTS job and run it. Fire-and-forget — the python
-   * subprocess can take 5-60 s and we don't want to block GPU dispatch behind
-   * it. Concurrency is guarded by `status='running'` rows: if one is already
-   * running, the findFirst({status:'pending'}) returns null until it's done.
+   * Dispatch a pending TTS job. Fire-and-forget like training — the python
+   * subprocess updates the row's status, and the next tick observes
+   * `status='running'` to keep the global serialisation slot held.
    */
-  private async dispatchTTSIfFree(): Promise<void> {
-    const running = await this.prisma.tTSJob.count({ where: { status: 'running' } });
-    if (running > 0) return;
-    const next = await this.tts.findNextPending();
-    if (!next) return;
-    this.logger.log(`Dispatching TTS job ${next.id} (CPU, parallel)`);
-    void this.tts.dispatchPending(next.id).catch((e) => {
-      this.logger.error(`tts dispatchPending ${next.id} threw: ${e?.message ?? e}`);
+  private async dispatchTTS(jobId: string): Promise<void> {
+    this.logger.log(`Dispatching TTS job ${jobId}`);
+    void this.tts.dispatchPending(jobId).catch((e) => {
+      this.logger.error(`tts dispatchPending ${jobId} threw: ${e?.message ?? e}`);
     });
   }
 

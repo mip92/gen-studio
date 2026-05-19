@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,13 @@ from pathlib import Path
 import torch
 
 
-VOICES_V5_RU = {'aidar', 'baya', 'kseniya', 'xenia', 'eugene'}
+VOICES_V5_RU    = {'aidar', 'baya', 'kseniya', 'xenia', 'eugene'}
+# V3/V4 add `ruslan` and a special `random` speaker that generates a fresh
+# voice on every call. We accept the union here and let model.apply_tts be
+# the ultimate arbiter — if the loaded .pt doesn't actually have the speaker,
+# it surfaces a clear ValueError which gets piped to the job's errorMessage.
+VOICES_V3_V4_RU = VOICES_V5_RU | {'ruslan', 'random'}
+ALL_KNOWN_VOICES = VOICES_V5_RU | VOICES_V3_V4_RU
 SUPPORTED_SAMPLE_RATES = {8000, 24000, 48000}
 
 # We accept any of these filenames in the cache dir. First match wins.
@@ -80,12 +87,17 @@ def main() -> int:
     p.add_argument('--sample-rate', type=int, default=48000)
     p.add_argument('--rate',        type=float, default=1.0,
                    help='Playback rate (1.0=normal, <1 slower, >1 faster). '
-                        'Triggers SSML <prosody rate="X%%"> wrapping when != 1.0.')
+                        'Applied via post-synthesis waveform resampling '
+                        '(TTSModelMultiAcc_v3 has no apply_ssml method).')
+    p.add_argument('--sentence-pause-sec', type=float, default=0.0,
+                   help='Insert N seconds of silence after every sentence boundary '
+                        '([.!?…]+). 0 = disabled. The text is split, each chunk is '
+                        'synthesised separately, then concatenated with zeros.')
     p.add_argument('--device',      default='cpu', choices=['cpu', 'cuda'])
     args = p.parse_args()
 
-    if args.voice not in VOICES_V5_RU:
-        _log(f'unknown voice {args.voice!r}; allowed: {sorted(VOICES_V5_RU)}')
+    if args.voice not in ALL_KNOWN_VOICES:
+        _log(f'unknown voice {args.voice!r}; allowed across V3/V4/V5: {sorted(ALL_KNOWN_VOICES)}')
         return 2
     if args.sample_rate not in SUPPORTED_SAMPLE_RATES:
         _log(f'sample rate {args.sample_rate} not supported; allowed: {sorted(SUPPORTED_SAMPLE_RATES)}')
@@ -122,10 +134,38 @@ def main() -> int:
     _log(f'model loaded in {time.time() - t0:.1f}s')
 
     t0 = time.time()
-    # Speed control via SSML when rate != 1.0. apply_ssml uses the same prosody
-    # engine internally but supports <prosody rate="X%">. For normal speed we
-    # stay on apply_tts (simpler, no XML escape concerns on raw text).
-    if abs(args.rate - 1.0) < 0.01:
+    if args.sentence_pause_sec > 0:
+        # Split on terminal punctuation and synthesise each chunk separately,
+        # then concatenate with `pause_sec` of silence between. We capture the
+        # punctuation as part of the chunk so prosody stays correct (a chunk
+        # ending in "?" still gets the question intonation from Silero).
+        # The regex tolerates trailing close-quotes/brackets after the period.
+        chunks: list[str] = []
+        for raw in re.split(r'(?<=[.!?…])\s+', text.strip()):
+            stripped = raw.strip()
+            if stripped:
+                chunks.append(stripped)
+        if not chunks:
+            chunks = [text]
+        _log(f'sentence-pause mode: {len(chunks)} chunks × {args.sentence_pause_sec}s silence')
+        silence = torch.zeros(int(round(args.sample_rate * args.sentence_pause_sec)))
+        pieces: list[torch.Tensor] = []
+        for i, chunk in enumerate(chunks):
+            t_chunk = time.time()
+            piece = model.apply_tts(
+                text=chunk,
+                speaker=args.voice,
+                sample_rate=args.sample_rate,
+                put_accent=True,
+                put_yo=True,
+            )
+            _log(f'  chunk {i+1}/{len(chunks)} ({len(chunk)} chars) in {time.time()-t_chunk:.1f}s')
+            pieces.append(piece)
+            # Don't add silence after the last chunk — output already ends cleanly.
+            if i < len(chunks) - 1 and silence.numel() > 0:
+                pieces.append(silence)
+        audio = torch.cat(pieces, dim=0)
+    else:
         audio = model.apply_tts(
             text=text,
             speaker=args.voice,
@@ -133,20 +173,20 @@ def main() -> int:
             put_accent=True,
             put_yo=True,
         )
-    else:
-        # XML-escape user text so any stray <>& don't break the SSML parse.
-        import xml.sax.saxutils as _xml
-        escaped = _xml.escape(text)
+
+    # Speed control via post-synthesis resampling. apply_ssml / SSML prosody is
+    # not available on TTSModelMultiAcc_v3 (v5_x_ru), so we stretch or compress
+    # the waveform instead. rate < 1 → slower (more samples), rate > 1 → faster.
+    if abs(args.rate - 1.0) >= 0.01:
         rate_pct = int(round(args.rate * 100))
-        ssml = f'<speak><prosody rate="{rate_pct}%">{escaped}</prosody></speak>'
-        _log(f'using SSML wrapper at rate={rate_pct}%')
-        audio = model.apply_ssml(
-            ssml_text=ssml,
-            speaker=args.voice,
-            sample_rate=args.sample_rate,
-            put_accent=True,
-            put_yo=True,
-        )
+        _log(f'adjusting speed to {rate_pct}% via waveform resampling')
+        new_length = int(round(audio.shape[0] / args.rate))
+        audio = torch.nn.functional.interpolate(
+            audio.unsqueeze(0).unsqueeze(0).float(),
+            size=new_length,
+            mode='linear',
+            align_corners=False,
+        ).squeeze(0).squeeze(0)
     _log(f'synthesised {audio.shape[0] / args.sample_rate:.1f}s of audio in {time.time() - t0:.1f}s')
 
     import soundfile as sf

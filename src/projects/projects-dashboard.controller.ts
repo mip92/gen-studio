@@ -162,9 +162,10 @@ export class ProjectsDashboardController {
         sceneKey:        s.sceneKey,
         title:           s.title,
         sortOrder:       s.sortOrder,
-        narrationText:   s.narrationText   ?? null,
-        scriptStartLine: s.scriptStartLine ?? null,
-        scriptEndLine:   s.scriptEndLine   ?? null,
+        narrationText:    s.narrationText    ?? null,
+        approvedTTSJobId: s.approvedTTSJobId ?? null,
+        scriptStartLine:  s.scriptStartLine  ?? null,
+        scriptEndLine:    s.scriptEndLine    ?? null,
         shots: s.shots.map((sh) => {
           const pf = (sh.promptFields ?? {}) as {
             narrativeBeat?: string;

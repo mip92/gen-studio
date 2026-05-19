@@ -11,6 +11,7 @@ import { ComfyModule } from './comfy/comfy.module';
 import { GenerationModule } from './generation/generation.module';
 import { TrainingModule } from './training/training.module';
 import { TTSModule } from './tts/tts.module';
+import { ExportsModule } from './exports/exports.module';
 import { PipelineModule } from './pipeline/pipeline.module';
 
 @Module({
@@ -27,6 +28,7 @@ import { PipelineModule } from './pipeline/pipeline.module';
     GenerationModule,
     TrainingModule,
     TTSModule,
+    ExportsModule,
     PipelineModule,
   ],
 })

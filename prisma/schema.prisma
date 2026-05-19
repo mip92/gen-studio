@@ -110,6 +110,11 @@ model Scene {
   /// Edits don't retroactively change rendered TTSJob outputs — each job
   /// snapshots `text` at enqueue time.
   narrationText               String?
+  /// User-approved TTS job for this scene — the "this is the one we ship"
+  /// pick from the rendered history. Null = nothing approved yet. Stored as
+  /// a plain id (no FK) so deleting a TTSJob row doesn't cascade-null the
+  /// scene state; the UI just shows no approval if the id stops resolving.
+  approvedTTSJobId            String?
   /// Reference to the project narration script: which lines in
   /// <slug>_script.md this scene covers (inclusive). Lets the UI link back
   /// "scene → source paragraphs" without duplicating ranges in code.
@@ -354,9 +359,9 @@ model TrainingJob {
 // ─── TTS (Silero V5 ru) ──────────────────────────────────────────────────────
 //
 // One row per "synthesise this scene's narration" request. Runs on CPU via a
-// Python subprocess (scripts/tts_silero.py) and is independent of ComfyUI /
-// GPU jobs, so the pipeline tick dispatches it in parallel with everything
-// else (still one TTS at a time though).
+// Python subprocess (scripts/tts_silero.py). Dispatched through the unified
+// PipelineQueueService FIFO — same single-slot serialisation as GPU work, so
+// rendering a TTS doesn't race with a scene/video render and vice versa.
 
 model TTSJob {
   id             String    @id @default(uuid())
@@ -364,13 +369,24 @@ model TTSJob {
   /// Text snapshot at enqueue time. Editing Scene.narrationText later does NOT
   /// retroactively change rendered audio — re-queue to regenerate.
   text           String
-  /// Silero V5 ru speaker id: aidar | baya | kseniya | xenia | eugene | random.
+  /// Silero speaker id. V5 voices: aidar | baya | kseniya | xenia | eugene.
+  /// V3/V4 additionally support: ruslan | random (random = new voice each call).
   voice          String
+  /// Which .pt model file under .silero_cache/ was used. Null = auto-pick by
+  /// MODEL_FILENAMES precedence (V5_5 wins). Example: "v3_1_ru.pt", "v4_ru.pt".
+  modelFilename  String?
   /// Output sample rate: 8000 | 24000 | 48000 (Silero supports these three).
   sampleRate     Int
-  /// Playback rate (1.0 = normal, <1 slower, >1 faster). Implemented via SSML
-  /// `<prosody rate="X%">…</prosody>` wrapping in the Python worker.
+  /// Playback rate (1.0 = normal, <1 slower, >1 faster). Applied via
+  /// post-synthesis waveform resampling in the Python worker — Silero
+  /// TTSModelMultiAcc_v3 (v5) doesn't expose `apply_ssml`.
   rate           Float     @default(1.0)
+  /// Extra silence to insert after every sentence boundary (in seconds).
+  /// 0 = no extra pause; documentary narration commonly uses 3-5s so the
+  /// editor can drop B-roll between beats. The Python worker splits on
+  /// [.!?…]+, synthesises each chunk separately, then concatenates with
+  /// `silence = zeros(int(sr * pause_sec))` between.
+  sentencePauseSec Float   @default(0)
   status         String    // pending | running | completed | failed | cancelled
   /// Basename of the wav inside data/<slug>/scenes/<sceneKey>/.
   outputFilename String?

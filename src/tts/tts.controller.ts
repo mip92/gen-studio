@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -20,16 +21,28 @@ export class TTSController {
 
   @Post('scenes/:sceneId')
   @ApiOperation({
-    summary: 'Queue a Silero V5 ru TTS render for a scene',
+    summary: 'Queue a Silero TTS render for a scene',
     description:
-      'If `text` is omitted, scene.narrationText is used. The job runs on CPU '
-      + 'via a Python subprocess and writes data/<slug>/scenes/<sceneKey>/narration_<voice>_<sr>.wav.',
+      'If `text` is omitted, scene.narrationText is used. Pass `modelFilename` '
+      + '(e.g. "v3_1_ru.pt") to override the default V5_5 → V5_4 → V5 → V4 → V3 precedence. '
+      + 'The job runs on CPU via a Python subprocess and writes '
+      + 'data/<slug>/scenes/<sceneKey>/narration_<voice>_<sr>[_<model>].wav.',
   })
   start(
     @Param('sceneId') sceneId: string,
     @Body() body: Omit<StartTTSInput, 'sceneId'>,
   ) {
     return this.tts.start({ sceneId, ...body });
+  }
+
+  @Get('models')
+  @ApiOperation({
+    summary: 'List Silero .pt models available in .silero_cache/',
+    description: 'Returns filename, size and known voice list per model. Used '
+              + 'by the narration modal to populate the model+voice dropdowns.',
+  })
+  listModels() {
+    return this.tts.listModels();
   }
 
   @Get('scenes/:sceneId/jobs')
@@ -55,6 +68,44 @@ export class TTSController {
   @ApiOperation({ summary: 'Get a single TTS job (status, output filename, error)' })
   get(@Param('jobId') jobId: string) {
     return this.tts.get(jobId);
+  }
+
+  @Post('jobs/:jobId/approve')
+  @ApiOperation({
+    summary: 'Mark this TTS job as the approved narration for its scene',
+    description: 'Stores jobId in scene.approvedTTSJobId. Only completed jobs '
+              + 'can be approved. Approving a new job silently replaces any '
+              + 'previously approved one.',
+  })
+  async approve(@Param('jobId') jobId: string) {
+    const j = await this.tts.get(jobId);
+    return this.tts.approve(j.id, j.sceneId);
+  }
+
+  @Post('scenes/:sceneId/approve/clear')
+  @ApiOperation({ summary: 'Clear the scene\'s TTS approval (rare — usually you re-approve a different take)' })
+  clearApproval(@Param('sceneId') sceneId: string) {
+    return this.tts.approve(null, sceneId);
+  }
+
+  @Delete('jobs/:jobId')
+  @ApiOperation({
+    summary: 'Hard-delete a TTS job (DB row + .wav on disk)',
+    description: 'Refuses to delete a running job. Clears scene.approvedTTSJobId '
+              + 'if it pointed at this job. Idempotent on disk side (best-effort unlink).',
+  })
+  remove(@Param('jobId') jobId: string) {
+    return this.tts.delete(jobId);
+  }
+
+  @Delete('scenes/:sceneId/jobs')
+  @ApiOperation({
+    summary: 'Bulk-purge failed/cancelled TTS jobs for a scene',
+    description: 'Default deletes failed + cancelled. Pass ?statuses=failed,completed '
+              + 'to widen the scope. Never deletes running jobs even if requested.',
+  })
+  purge(@Param('sceneId') sceneId: string) {
+    return this.tts.purgeForScene(sceneId);
   }
 
   @Get('jobs/:jobId/file')

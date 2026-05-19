@@ -33,7 +33,7 @@ const TERMINAL        = ['completed', 'failed', 'cancelled'];
 const FINISHED   = TERMINAL;
 const UNFINISHED = ACTIVE_STATUSES;
 
-const SORTABLE_FIELDS = ['queuedAt', 'startedAt', 'completedAt', 'status', 'type'] as const;
+const SORTABLE_FIELDS = ['queuedAt', 'startedAt', 'completedAt', 'status', 'type', 'project'] as const;
 type SortField = (typeof SORTABLE_FIELDS)[number];
 
 @ApiTags('pipeline')
@@ -62,6 +62,7 @@ export class PipelineController {
     @Query('id')       id?:       string,
     @Query('status')   statusQ?:  string,
     @Query('type')     typeQ?:    string,
+    @Query('project')  projectQ?: string,
     @Query('finished') finished?: string,
     @Query('sort')     sortQ?:    string,
     @Query('order')    orderQ?:   string,
@@ -158,6 +159,11 @@ export class PipelineController {
     if (typeQ) {
       const wanted = new Set(typeQ.split(',').map((s) => s.trim()).filter(Boolean));
       if (wanted.size > 0) rows = rows.filter((r) => wanted.has(r.type));
+    }
+
+    if (projectQ) {
+      const wanted = new Set(projectQ.split(',').map((s) => s.trim()).filter(Boolean));
+      if (wanted.size > 0) rows = rows.filter((r) => wanted.has(r.projectSlug));
     }
 
     if (finished === 'true') {
@@ -359,6 +365,7 @@ function fieldValue(r: QueueRow, field: SortField): number | string | null {
   if (field === 'startedAt')   return r.startedAt   ? r.startedAt.getTime()   : null;
   if (field === 'completedAt') return r.completedAt ? r.completedAt.getTime() : null;
   if (field === 'status')      return r.status;
+  if (field === 'project')     return r.projectSlug;
   return r.type;
 }
 
