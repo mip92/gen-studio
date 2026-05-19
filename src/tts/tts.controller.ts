@@ -12,7 +12,7 @@ import {
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { createReadStream } from 'fs';
 import type { Response } from 'express';
-import { TTSService, StartTTSInput } from './tts.service';
+import { TTSService, StartTTSInput, StartShotTTSInput } from './tts.service';
 
 @ApiTags('TTS')
 @Controller('tts')
@@ -72,14 +72,17 @@ export class TTSController {
 
   @Post('jobs/:jobId/approve')
   @ApiOperation({
-    summary: 'Mark this TTS job as the approved narration for its scene',
-    description: 'Stores jobId in scene.approvedTTSJobId. Only completed jobs '
+    summary: 'Mark this TTS job as the approved narration for its owner (scene or shot)',
+    description: 'Stores jobId in scene.approvedTTSJobId (legacy whole-scene jobs) '
+              + 'or shot.approvedTTSJobId (per-shot jobs). Only completed jobs '
               + 'can be approved. Approving a new job silently replaces any '
               + 'previously approved one.',
   })
   async approve(@Param('jobId') jobId: string) {
     const j = await this.tts.get(jobId);
-    return this.tts.approve(j.id, j.sceneId);
+    if (j.shotId) return this.tts.approveForShot(j.id, j.shotId);
+    if (j.sceneId) return this.tts.approve(j.id, j.sceneId);
+    throw new Error(`TTS job ${jobId} has no owner — corrupt row`);
   }
 
   @Post('scenes/:sceneId/approve/clear')
@@ -120,5 +123,45 @@ export class TTSController {
     }
     res.set({ 'Content-Type': 'audio/wav' });
     return new StreamableFile(createReadStream(filePath));
+  }
+
+  // ── Shot-level TTS (per-shot ~5s voiceover) ──────────────────────────────
+
+  @Post('shots/:shotId')
+  @ApiOperation({
+    summary: 'Queue a Silero TTS render for a single Shot',
+    description: 'If `text` is omitted, shot.narrationText is used. Wav lands at '
+              + 'data/<slug>/shots/<shotCode>/narration_<jobId>_<voice>_<sr>.wav.',
+  })
+  startShot(
+    @Param('shotId') shotId: string,
+    @Body() body: Omit<StartShotTTSInput, 'shotId'>,
+  ) {
+    return this.tts.startForShot({ shotId, ...body });
+  }
+
+  @Get('shots/:shotId/jobs')
+  @ApiOperation({ summary: 'List TTS jobs for a shot (most recent first)' })
+  listShotJobs(@Param('shotId') shotId: string) {
+    return this.tts.listForShot(shotId);
+  }
+
+  @Patch('shots/:shotId/narration')
+  @ApiOperation({
+    summary: 'Update a Shot\'s narrationText',
+    description: '{text: "..."} to set, {text: ""} to clear. Existing TTS jobs '
+              + 'are NOT regenerated automatically — re-queue to re-render.',
+  })
+  setShotNarration(
+    @Param('shotId') shotId: string,
+    @Body() body: { text?: string },
+  ) {
+    return this.tts.setShotNarrationText(shotId, body);
+  }
+
+  @Post('shots/:shotId/approve/clear')
+  @ApiOperation({ summary: 'Clear the shot\'s TTS approval (un-pick the chosen take)' })
+  clearShotApproval(@Param('shotId') shotId: string) {
+    return this.tts.approveForShot(null, shotId);
   }
 }

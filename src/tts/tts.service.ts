@@ -49,6 +49,17 @@ export interface StartTTSInput {
   sentencePauseSec?: number;
 }
 
+export interface StartShotTTSInput {
+  shotId:       string;
+  /** If omitted, shot.narrationText is used. */
+  text?:        string;
+  voice?:       Voice;
+  sampleRate?:  SampleRate;
+  rate?:        number;
+  modelFilename?: string;
+  sentencePauseSec?: number;
+}
+
 /** Static map of which voices each known Silero version supports. The Python
  *  worker is the source of truth at runtime — this map exists so the UI can
  *  filter the voice dropdown without spawning python just to ask. */
@@ -150,6 +161,69 @@ export class TTSService {
     });
   }
 
+  /**
+   * Queue a TTS job for a single Shot. Mirrors `start()` for scenes — same
+   * voice/sr/rate/model/pause knobs, just owned by a Shot instead. The wav
+   * lands at data/<slug>/shots/<shotCode>/ on success.
+   */
+  async startForShot(input: StartShotTTSInput) {
+    const shot = await this.prisma.shot.findUnique({
+      where:   { id: input.shotId },
+      include: { project: true, scene: true },
+    });
+    if (!shot) throw new NotFoundException(`Shot ${input.shotId} not found`);
+
+    const text = (input.text ?? shot.narrationText ?? '').trim();
+    if (!text) {
+      throw new BadRequestException(
+        `Shot ${shot.shotCode} has no narration text. Pass {text} or set Shot.narrationText first.`,
+      );
+    }
+
+    const voice      = input.voice      ?? DEFAULT_VOICE;
+    const sampleRate = input.sampleRate ?? DEFAULT_SAMPLE_RATE;
+    const rate       = input.rate       ?? DEFAULT_RATE;
+    if (!ALLOWED_VOICES.includes(voice)) {
+      throw new BadRequestException(`voice must be one of: ${ALLOWED_VOICES.join(', ')}`);
+    }
+    if (!ALLOWED_SAMPLE_RATES.includes(sampleRate)) {
+      throw new BadRequestException(`sampleRate must be one of: ${ALLOWED_SAMPLE_RATES.join(', ')}`);
+    }
+    if (rate < MIN_RATE || rate > MAX_RATE) {
+      throw new BadRequestException(`rate must be in [${MIN_RATE}, ${MAX_RATE}]`);
+    }
+    const sentencePauseSec = input.sentencePauseSec ?? 0;
+    if (sentencePauseSec < MIN_SENTENCE_PAUSE || sentencePauseSec > MAX_SENTENCE_PAUSE) {
+      throw new BadRequestException(`sentencePauseSec must be in [${MIN_SENTENCE_PAUSE}, ${MAX_SENTENCE_PAUSE}]`);
+    }
+
+    let modelFilename: string | null = null;
+    if (input.modelFilename) {
+      const cleaned = input.modelFilename.trim();
+      if (cleaned !== path.basename(cleaned) || !cleaned.toLowerCase().endsWith('.pt')) {
+        throw new BadRequestException(`modelFilename must be a bare .pt basename (got: ${cleaned})`);
+      }
+      const fp = path.join(SILERO_CACHE, cleaned);
+      if (!existsSync(fp)) {
+        throw new BadRequestException(`Silero model not found in cache: ${cleaned}`);
+      }
+      modelFilename = cleaned;
+    }
+
+    return this.prisma.tTSJob.create({
+      data: {
+        shotId:  shot.id,
+        text,
+        voice,
+        sampleRate,
+        rate,
+        sentencePauseSec,
+        modelFilename,
+        status:  'pending',
+      },
+    });
+  }
+
   findNextPending() {
     return this.prisma.tTSJob.findFirst({
       where:   { status: 'pending' },
@@ -160,6 +234,13 @@ export class TTSService {
   list(sceneId: string) {
     return this.prisma.tTSJob.findMany({
       where:   { sceneId },
+      orderBy: { queuedAt: 'desc' },
+    });
+  }
+
+  listForShot(shotId: string) {
+    return this.prisma.tTSJob.findMany({
+      where:   { shotId },
       orderBy: { queuedAt: 'desc' },
     });
   }
@@ -179,19 +260,39 @@ export class TTSService {
   async filePath(jobId: string): Promise<string | null> {
     const j = await this.get(jobId);
     if (!j.outputFilename || j.status !== 'completed') return null;
-    const scene = await this.prisma.scene.findUnique({
-      where:   { id: j.sceneId },
-      include: { project: true },
-    });
-    if (!scene) return null;
-    const fp = path.join(
-      APP_ROOT, 'data', scene.project.slug, 'scenes', scene.sceneKey, j.outputFilename,
-    );
-    if (!existsSync(fp)) {
-      this.logger.warn(`TTS job ${jobId}: outputFilename=${j.outputFilename} but file missing on disk`);
-      return null;
+    // Resolve owner — exactly one of sceneId/shotId is set per row.
+    if (j.shotId) {
+      const shot = await this.prisma.shot.findUnique({
+        where:   { id: j.shotId },
+        include: { project: true },
+      });
+      if (!shot) return null;
+      const fp = path.join(
+        APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, j.outputFilename,
+      );
+      if (!existsSync(fp)) {
+        this.logger.warn(`TTS job ${jobId}: shot wav missing on disk (${fp})`);
+        return null;
+      }
+      return fp;
     }
-    return fp;
+    if (j.sceneId) {
+      const scene = await this.prisma.scene.findUnique({
+        where:   { id: j.sceneId },
+        include: { project: true },
+      });
+      if (!scene) return null;
+      const fp = path.join(
+        APP_ROOT, 'data', scene.project.slug, 'scenes', scene.sceneKey, j.outputFilename,
+      );
+      if (!existsSync(fp)) {
+        this.logger.warn(`TTS job ${jobId}: scene wav missing on disk (${fp})`);
+        return null;
+      }
+      return fp;
+    }
+    this.logger.error(`TTS job ${jobId}: neither sceneId nor shotId set — corrupt row`);
+    return null;
   }
 
   /**
@@ -202,7 +303,10 @@ export class TTSService {
   async dispatchPending(jobId: string): Promise<void> {
     const job = await this.prisma.tTSJob.findUnique({
       where:   { id: jobId },
-      include: { scene: { include: { project: true } } },
+      include: {
+        scene: { include: { project: true } },
+        shot:  { include: { project: true } },
+      },
     });
     if (!job)                       throw new Error(`TTS job ${jobId} not found`);
     if (job.status !== 'pending')   return;
@@ -216,15 +320,23 @@ export class TTSService {
       return;
     }
 
-    const sceneDir = path.join(
-      APP_ROOT, 'data', job.scene.project.slug, 'scenes', job.scene.sceneKey,
-    );
-    mkdirSync(sceneDir, { recursive: true });
+    // Resolve output dir — scene-level jobs write under data/<slug>/scenes/<sceneKey>/,
+    // shot-level jobs under data/<slug>/shots/<shotCode>/.
+    let outDir: string;
+    if (job.shotId && job.shot) {
+      outDir = path.join(APP_ROOT, 'data', job.shot.project.slug, 'shots', job.shot.shotCode);
+    } else if (job.sceneId && job.scene) {
+      outDir = path.join(APP_ROOT, 'data', job.scene.project.slug, 'scenes', job.scene.sceneKey);
+    } else {
+      await this.fail(job.id, `TTS job ${job.id} has neither shotId nor sceneId resolved`);
+      return;
+    }
+    mkdirSync(outDir, { recursive: true });
 
     // Stage the narration text as a tmp file so Windows argv length / encoding
     // limits don't bite us on long scripts (paragraph-level scenes can hit
     // 1-2k chars easily).
-    const textPath = path.join(sceneDir, `.tts_${job.id}.txt`);
+    const textPath = path.join(outDir, `.tts_${job.id}.txt`);
     writeFileSync(textPath, job.text, { encoding: 'utf-8' });
 
     // Output filename is keyed by job id so each row owns a distinct wav on
@@ -236,7 +348,7 @@ export class TTSService {
       ? '_' + path.basename(job.modelFilename).replace(/\.pt$/i, '')
       : '';
     const outFilename = `narration_${job.id}_${job.voice}_${job.sampleRate}${modelTag}.wav`;
-    const outPath     = path.join(sceneDir, outFilename);
+    const outPath     = path.join(outDir, outFilename);
 
     await this.prisma.tTSJob.update({
       where: { id: job.id },
@@ -323,7 +435,10 @@ export class TTSService {
   async delete(jobId: string): Promise<{ deleted: true; id: string }> {
     const job = await this.prisma.tTSJob.findUnique({
       where:   { id: jobId },
-      include: { scene: { include: { project: true } } },
+      include: {
+        scene: { include: { project: true } },
+        shot:  { include: { project: true } },
+      },
     });
     if (!job) throw new NotFoundException(`TTS job ${jobId} not found`);
     if (job.status === 'running') {
@@ -333,37 +448,44 @@ export class TTSService {
     }
 
     if (job.outputFilename) {
-      // Legacy rows (pre-job-id-in-filename) could share a wav with another
-      // completed job for the same voice+sr. Skip the unlink if any other
-      // row still references this exact basename in the same scene — losing
-      // the file would orphan the other row and break its <audio> player.
-      const sharers = await this.prisma.tTSJob.count({
-        where: {
-          id:             { not: job.id },
-          sceneId:        job.sceneId,
-          outputFilename: job.outputFilename,
-        },
-      });
-      if (sharers === 0) {
-        const filePath = path.join(
-          APP_ROOT, 'data', job.scene.project.slug, 'scenes', job.scene.sceneKey, job.outputFilename,
-        );
-        if (existsSync(filePath)) {
-          try { unlinkSync(filePath); }
-          catch (e: any) { this.logger.warn(`delete tts ${jobId}: failed to unlink ${filePath}: ${e?.message}`); }
-        }
-      } else {
+      // Owner-scoped wav lookup. Skip unlink if another row in the same owner
+      // shares the basename (legacy rows pre-job-id-in-filename could collide).
+      let sharers = 0;
+      let filePath: string | null = null;
+      if (job.shotId && job.shot) {
+        sharers = await this.prisma.tTSJob.count({
+          where: { id: { not: job.id }, shotId: job.shotId, outputFilename: job.outputFilename },
+        });
+        filePath = path.join(APP_ROOT, 'data', job.shot.project.slug, 'shots', job.shot.shotCode, job.outputFilename);
+      } else if (job.sceneId && job.scene) {
+        sharers = await this.prisma.tTSJob.count({
+          where: { id: { not: job.id }, sceneId: job.sceneId, outputFilename: job.outputFilename },
+        });
+        filePath = path.join(APP_ROOT, 'data', job.scene.project.slug, 'scenes', job.scene.sceneKey, job.outputFilename);
+      }
+      if (filePath && sharers === 0 && existsSync(filePath)) {
+        try { unlinkSync(filePath); }
+        catch (e: any) { this.logger.warn(`delete tts ${jobId}: failed to unlink ${filePath}: ${e?.message}`); }
+      } else if (sharers > 0) {
         this.logger.log(`delete tts ${jobId}: keeping ${job.outputFilename} (shared with ${sharers} other row(s))`);
       }
     }
 
-    await this.prisma.$transaction([
-      this.prisma.scene.updateMany({
+    // Clear owner's approvedTTSJobId if it pointed at this row.
+    const ops: any[] = [this.prisma.tTSJob.delete({ where: { id: job.id } })];
+    if (job.sceneId) {
+      ops.unshift(this.prisma.scene.updateMany({
         where: { id: job.sceneId, approvedTTSJobId: job.id },
         data:  { approvedTTSJobId: null },
-      }),
-      this.prisma.tTSJob.delete({ where: { id: job.id } }),
-    ]);
+      }));
+    }
+    if (job.shotId) {
+      ops.unshift(this.prisma.shot.updateMany({
+        where: { id: job.shotId, approvedTTSJobId: job.id },
+        data:  { approvedTTSJobId: null },
+      }));
+    }
+    await this.prisma.$transaction(ops);
 
     return { deleted: true, id: job.id };
   }
@@ -451,6 +573,41 @@ export class TTSService {
         ...(body.scriptStartLine !== undefined ? { scriptStartLine: body.scriptStartLine } : {}),
         ...(body.scriptEndLine   !== undefined ? { scriptEndLine:   body.scriptEndLine }   : {}),
       },
+    });
+  }
+
+  /** Update per-shot narration text. Parallel of `setNarrationText` for shots. */
+  async setShotNarrationText(shotId: string, body: { text?: string }) {
+    const shot = await this.prisma.shot.findUnique({ where: { id: shotId } });
+    if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);
+    return this.prisma.shot.update({
+      where: { id: shotId },
+      data:  body.text !== undefined ? { narrationText: body.text } : {},
+    });
+  }
+
+  /**
+   * Approve a TTSJob as the chosen narration for its Shot. Mirrors `approve()`
+   * for scenes. Null clears approval.
+   */
+  async approveForShot(jobId: string | null, shotId: string) {
+    if (jobId === null) {
+      return this.prisma.shot.update({
+        where: { id: shotId },
+        data:  { approvedTTSJobId: null },
+      });
+    }
+    const job = await this.prisma.tTSJob.findUnique({ where: { id: jobId } });
+    if (!job) throw new NotFoundException(`TTS job ${jobId} not found`);
+    if (job.shotId !== shotId) {
+      throw new BadRequestException(`TTS job ${jobId} belongs to a different shot`);
+    }
+    if (job.status !== 'completed') {
+      throw new BadRequestException(`Only completed jobs can be approved (got: ${job.status})`);
+    }
+    return this.prisma.shot.update({
+      where: { id: shotId },
+      data:  { approvedTTSJobId: jobId },
     });
   }
 }

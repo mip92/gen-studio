@@ -154,6 +154,16 @@ model Shot {
   chosenVideoId      String?
   /// Latest in-flight ComfyUI prompt_id for this shot (cleared once result is recorded).
   activeRenderPromptId String?
+  /// Per-shot narration text (Russian, ~5s of voiceover per shot). When set,
+  /// the shot gets its own TTSJob → wav, and CapCut export lays each wav at
+  /// the shot's video timeline position. Independent of Scene.narrationText
+  /// (which is the legacy whole-scene voiceover and is kept for backward
+  /// compatibility with other projects that still use scene-level narration).
+  narrationText      String?
+  /// User-approved TTSJob for this shot. Plain id (no FK) so deleting the
+  /// TTSJob row doesn't cascade-null the shot state — UI just shows nothing
+  /// approved if the id stops resolving. Mirrors Scene.approvedTTSJobId.
+  approvedTTSJobId   String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
@@ -162,6 +172,7 @@ model Shot {
   participants ShotParticipant[]
   renderJobs   SceneRenderJob[]
   videoRenders VideoRender[]
+  ttsJobs      TTSJob[]
 
   @@unique([projectId, shotCode])
   @@index([projectId, sceneId])
@@ -365,8 +376,14 @@ model TrainingJob {
 
 model TTSJob {
   id             String    @id @default(uuid())
-  sceneId        String
-  /// Text snapshot at enqueue time. Editing Scene.narrationText later does NOT
+  /// Owner: either a Scene or a Shot, never both. Scene-level (legacy) =
+  /// single long voiceover per scene saved to data/<slug>/scenes/<sceneKey>/.
+  /// Shot-level (current default for night_courier-style projects) = one ~5s
+  /// voiceover per shot saved to data/<slug>/shots/<shotCode>/. A row with
+  /// both null is a bug; service code enforces exactly-one-of.
+  sceneId        String?
+  shotId         String?
+  /// Text snapshot at enqueue time. Editing narration text later does NOT
   /// retroactively change rendered audio — re-queue to regenerate.
   text           String
   /// Silero speaker id. V5 voices: aidar | baya | kseniya | xenia | eugene.
@@ -388,16 +405,20 @@ model TTSJob {
   /// `silence = zeros(int(sr * pause_sec))` between.
   sentencePauseSec Float   @default(0)
   status         String    // pending | running | completed | failed | cancelled
-  /// Basename of the wav inside data/<slug>/scenes/<sceneKey>/.
+  /// Basename of the wav. Scene-level jobs live in
+  /// data/<slug>/scenes/<sceneKey>/, shot-level jobs in
+  /// data/<slug>/shots/<shotCode>/.
   outputFilename String?
   errorMessage   String?
   queuedAt       DateTime  @default(now())
   startedAt      DateTime?
   completedAt    DateTime?
 
-  scene Scene @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  scene Scene? @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  shot  Shot?  @relation(fields: [shotId],  references: [id], onDelete: Cascade)
 
   @@index([sceneId])
+  @@index([shotId])
   @@index([status, queuedAt])
   @@map("tts_jobs")
 }
