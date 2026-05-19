@@ -147,6 +147,11 @@ export class ProjectsDashboardController {
                 videoRenders: {
                   orderBy: { queuedAt: 'desc' },
                 },
+                // Per-shot TTS jobs — used to surface "N ready to approve"
+                // counts and the latest in-flight status on the scenes list.
+                ttsJobs: {
+                  orderBy: { queuedAt: 'desc' },
+                },
               },
             },
           },
@@ -255,6 +260,24 @@ export class ProjectsDashboardController {
             // ── Per-shot narration (shot-level TTS) ─────────────────────────
             narrationText:    (sh as any).narrationText    ?? null,
             approvedTTSJobId: (sh as any).approvedTTSJobId ?? null,
+            ...(() => {
+              const jobs = ((sh as any).ttsJobs ?? []) as Array<{
+                id: string; status: string; queuedAt: Date;
+              }>;
+              const approvedId = (sh as any).approvedTTSJobId as string | null;
+              // Sort by queuedAt desc — latest first.
+              const sorted = [...jobs].sort((a, b) => b.queuedAt.getTime() - a.queuedAt.getTime());
+              const latestNonTerminal = sorted.find((j) => j.status === 'pending' || j.status === 'running');
+              const completedUnapproved = sorted.filter((j) => j.status === 'completed' && j.id !== approvedId);
+              const latestCompletedUnapprovedId = completedUnapproved[0]?.id ?? null;
+              return {
+                ttsLatestStatus:     latestNonTerminal?.status ?? null,
+                ttsCompletedUnapproved: completedUnapproved.length,
+                /** id of the most recent completed-but-not-approved TTSJob — the
+                 *  candidate the "✓ утвердить" quick button approves. */
+                ttsLatestCompletedUnapprovedId: latestCompletedUnapprovedId,
+              };
+            })(),
           };
         }),
       })),
