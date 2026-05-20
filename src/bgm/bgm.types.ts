@@ -70,13 +70,13 @@ export interface AudioRenderParams {
 }
 
 /**
- * Extra seconds appended to every BGM render past the segment's playback
- * target. ACE-Step often ends a take mid-phrase — generating tail headroom
- * gives the CapCut exporter material to fade out over instead of cutting on
- * a half-resolved chord. 10 s is enough for a comfortable 1.5 s fade-out plus
- * a couple of bars of tail.
+ * Render exactly what the caller asks for — no auto-padding. Earlier versions
+ * added a 10s tail so the CapCut export's source_timerange cut landed inside
+ * overgenerated material; the user prefers transparency over that smoothing
+ * and asks 50s manually when they want fade-out tail. The export still
+ * applies a fade-out on the actual segment end, so cuts stay soft.
  */
-export const OVERGEN_SECONDS = 10;
+export const OVERGEN_SECONDS = 0;
 /** Hard ceiling — ACE-Step works up to ~240 s before quality starts to drift. */
 export const RENDER_MAX_SECONDS = 240;
 
