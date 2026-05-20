@@ -53,13 +53,32 @@ export interface StartRenderInput {
 
 export interface AudioRenderParams {
   prompt:      string;
+  /** Playback target in seconds — what the CapCut timeline allots to this
+   *  segment. The flac on disk is longer (see `renderSec`); CapCut trims to
+   *  this length with a fade-out at the cut. */
   durationSec: number;
+  /** Actual seconds the ACE-Step pipeline was asked to render. Equals
+   *  `durationSec + OVERGEN_SECONDS` (capped at 240). Stored separately so
+   *  the export knows how long the flac on disk really is and can place a
+   *  source_timerange that crops to durationSec without hitting "超出了素材时长". */
+  renderSec:   number;
   seed:        number;
   steps:       number;
   cfg:         number;
   samplerName: string;
   scheduler:   string;
 }
+
+/**
+ * Extra seconds appended to every BGM render past the segment's playback
+ * target. ACE-Step often ends a take mid-phrase — generating tail headroom
+ * gives the CapCut exporter material to fade out over instead of cutting on
+ * a half-resolved chord. 10 s is enough for a comfortable 1.5 s fade-out plus
+ * a couple of bars of tail.
+ */
+export const OVERGEN_SECONDS = 10;
+/** Hard ceiling — ACE-Step works up to ~240 s before quality starts to drift. */
+export const RENDER_MAX_SECONDS = 240;
 
 /**
  * Default ACE-Step v1.5 *Turbo* generation params. Critical values:

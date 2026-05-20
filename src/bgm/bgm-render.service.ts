@@ -17,7 +17,13 @@ import {
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { ComfyService } from '../comfy/comfy.service';
-import { StartRenderInput, AudioRenderParams, DEFAULT_RENDER_PARAMS } from './bgm.types';
+import {
+  StartRenderInput,
+  AudioRenderParams,
+  DEFAULT_RENDER_PARAMS,
+  OVERGEN_SECONDS,
+  RENDER_MAX_SECONDS,
+} from './bgm.types';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
@@ -84,6 +90,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     }
 
     const count = Math.max(1, Math.min(4, input.count ?? 1));
+    // Overgenerate by OVERGEN_SECONDS so CapCut export has tail material to
+    // fade out into; the rendered flac is longer than the timeline slot.
+    const renderSec = Math.min(RENDER_MAX_SECONDS, durationSec + OVERGEN_SECONDS);
     const results = [];
     for (let i = 0; i < count; i++) {
       const seed = (i === 0 && input.seed !== undefined)
@@ -92,6 +101,7 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
       const params: AudioRenderParams = {
         prompt:      promptResolved,
         durationSec,
+        renderSec,
         seed,
         steps:       input.steps       ?? DEFAULT_RENDER_PARAMS.steps,
         cfg:         input.cfg         ?? DEFAULT_RENDER_PARAMS.cfg,
@@ -138,7 +148,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
       const template = this.loadTemplate(project.slug, job.workflowFilename);
       const workflow = this.patch(template, {
         prompt:         params.prompt,
-        durationSec:    params.durationSec,
+        // ACE-Step renders renderSec; CapCut trims to durationSec on export.
+        // Older job rows without renderSec fall back to durationSec.
+        renderSec:      params.renderSec ?? params.durationSec,
         seed:           params.seed,
         steps:          params.steps,
         cfg:            params.cfg,
@@ -246,7 +258,8 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
    */
   private patch(template: Record<string, any>, p: {
     prompt:         string;
-    durationSec:    number;
+    /** Seconds passed to ACE-Step (renderSec — already includes overgen tail). */
+    renderSec:      number;
     seed:           number;
     steps:          number;
     cfg:            number;
@@ -258,9 +271,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     const set = (id: string, key: string, value: unknown) => {
       if (wf[id]) wf[id].inputs[key] = value;
     };
-    set('2', 'seconds',         p.durationSec);
+    set('2', 'seconds',         p.renderSec);
     set('3', 'tags',             p.prompt);
-    set('3', 'duration',         p.durationSec);
+    set('3', 'duration',         p.renderSec);
     set('3', 'seed',             p.seed);
     set('5', 'seed',             p.seed);
     set('5', 'steps',            p.steps);

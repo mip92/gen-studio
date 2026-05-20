@@ -133,9 +133,14 @@ def build_draft(manifest: dict) -> Path:
     total_clips     = 0
     total_tts       = 0
     total_bgm       = 0
+    # Last VideoSegment of each scene — used after the loop to attach a
+    # transition between consecutive scenes. Skipping the very last entry
+    # avoids a transition that has no "next" to dissolve into.
+    last_segment_per_scene: list = []
 
     for scene in manifest["scenes"]:
         scene_start_us = cursor_video_us
+        last_segment_in_scene = None
 
         any_shot_narration = False
 
@@ -157,6 +162,7 @@ def build_draft(manifest: dict) -> Path:
                 target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
             )
             script.add_segment(segment, track_name="main_video")
+            last_segment_in_scene = segment
 
             # Per-shot narration: lay the wav at this shot's exact timeline
             # position. The Node-side duration_us is a text-length estimate; we
@@ -219,23 +225,70 @@ def build_draft(manifest: dict) -> Path:
                 else:
                     _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
 
+        # Done with this scene — remember its last shot for transition placement.
+        if last_segment_in_scene is not None:
+            last_segment_per_scene.append(last_segment_in_scene)
+
+    # ── Scene-boundary transitions ──────────────────────────────────────
+    # Standard non-flashy transitions between consecutive scenes. Cycled so
+    # five scenes don't all use the same crossfade. Applied to the OUTGOING
+    # segment per pyJianYingDraft contract; the final scene is skipped (no
+    # "next" to dissolve into). Names are Chinese identifiers from
+    # `pyJianYingDraft.TransitionType` — looked up via getattr because the
+    # enum members aren't valid Python attribute names without it.
+    TRANSITION_CYCLE = [
+        '叠化',      # cross-dissolve — the editorial workhorse
+        '闪白',      # white flash    — quick subtle attention beat
+        '闪黑',      # black flash    — quick subtle pause beat
+        '雾化',      # haze/blur      — soft scene change
+        '泛白',      # whiten         — gentle bloom into next
+        '色彩溶解',   # color dissolve — subtle saturated wash
+    ]
+    TRANSITION_DURATION_US = 600_000   # 0.6s — short enough to stay invisible
+    for i, seg in enumerate(last_segment_per_scene[:-1]):
+        name = TRANSITION_CYCLE[i % len(TRANSITION_CYCLE)]
+        tt   = getattr(draft.TransitionType, name, None)
+        if tt is None:
+            _log(f'transition lookup failed for "{name}" — skipping at boundary {i}')
+            continue
+        try:
+            seg.add_transition(tt, duration=TRANSITION_DURATION_US)
+        except Exception as e:  # noqa: BLE001
+            _log(f'add_transition failed at boundary {i} ({name}): {e!r}')
+    total_transitions = max(0, len(last_segment_per_scene) - 1)
+
     # ── BGM (ACE-Step) ──────────────────────────────────────────────────
     # Background music sits on its own audio lane. The Node-side manifest has
     # already filtered to approved AudioRenderJob rows and computed each
     # segment's `start_us` from the project's shot timeline (block start
-    # + sum of previous segments). We trust those positions verbatim and only
-    # clip duration to whatever the flac actually contains on disk so
-    # pyJianYingDraft doesn't refuse with "超出了素材时长".
+    # + sum of previous segments).
+    #
+    # Two duration fields per entry:
+    #   - duration_us         playback target on the CapCut timeline (segment slot)
+    #   - render_duration_us  actual flac length on disk (renderSec from ACE-Step,
+    #                         which is duration_us + overgen tail)
+    #
+    # We feed the flac into the segment with source_timerange clipped to
+    # duration_us so the cut lands inside the overgen tail, then add_fade
+    # turns that cut into a soft fade-out — masks ACE-Step's tendency to
+    # end a take mid-phrase.
+    BGM_FADE_IN_US  = 1_000_000   # 1 s in-fade for clean entry
+    BGM_FADE_OUT_US = 1_500_000   # 1.5 s out-fade hides the source_timerange cut
     for mt in manifest.get("music_tracks") or []:
         wav_path = mt["path"].replace("\\", "/")
         actual_us = _audio_duration_us(wav_path)
-        manifest_us = int(mt.get("duration_us") or 0)
-        if actual_us <= 0 and manifest_us <= 0:
+        playback_us = int(mt.get("duration_us") or 0)
+        render_us   = int(mt.get("render_duration_us") or 0)
+        if actual_us <= 0 and playback_us <= 0 and render_us <= 0:
             _log(f'skipping bgm segment {mt.get("segmentId")}: cannot determine duration')
             continue
-        bgm_dur = actual_us if actual_us > 0 else manifest_us
-        if manifest_us > 0:
-            bgm_dur = min(bgm_dur, manifest_us)
+        # Cap playback at whatever's actually on disk — protects against jobs
+        # that finished short for any reason (failed mid-render, then retried
+        # under a stale params row).
+        flac_us = actual_us if actual_us > 0 else render_us
+        bgm_dur = playback_us if playback_us > 0 else flac_us
+        if flac_us > 0:
+            bgm_dur = min(bgm_dur, flac_us)
         if bgm_dur <= 0:
             continue
         material = draft.AudioMaterial(
@@ -249,8 +302,20 @@ def build_draft(manifest: dict) -> Path:
         segment = draft.AudioSegment(
             material=material,
             target_timerange=draft.Timerange(start=int(mt["start_us"]), duration=bgm_dur),
+            # source_timerange crops the flac to the playback slot. Without it,
+            # pyJianYingDraft would default source = target (same length, no
+            # overgen benefit) — we want the overgen tail to be "available
+            # material" that source_timerange reaches into when bgm_dur is
+            # shorter than flac_us, so the cut sits inside that headroom.
+            source_timerange=draft.Timerange(start=0, duration=bgm_dur),
             volume=0.2,
         )
+        # Fade clamps at half the segment length so we don't crossfade past
+        # the middle of a short cue. Out-fade is the important one — it
+        # smooths the source_timerange cut into the next block.
+        fade_in  = min(BGM_FADE_IN_US,  bgm_dur // 2)
+        fade_out = min(BGM_FADE_OUT_US, bgm_dur // 2)
+        segment.add_fade(in_duration=fade_in, out_duration=fade_out)
         script.add_segment(segment, track_name="bgm")
         total_bgm += 1
 
@@ -275,7 +340,7 @@ def build_draft(manifest: dict) -> Path:
 
     _log(f'wrote {out_path}')
     _log(f'project={project} clips={total_clips} narration_tracks={total_tts} '
-         f'bgm_tracks={total_bgm} duration_us={total_us}')
+         f'bgm_tracks={total_bgm} transitions={total_transitions} duration_us={total_us}')
     return draft_dir
 
 
