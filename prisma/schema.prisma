@@ -28,6 +28,7 @@ model Project {
   workflowTemplates WorkflowTemplate[]
   workflowRoutes    WorkflowRoute[]
   referenceAssets   ReferenceAsset[]
+  narrativeBlocks   NarrativeBlock[]
 
   @@map("projects")
 }
@@ -421,4 +422,101 @@ model TTSJob {
   @@index([shotId])
   @@index([status, queuedAt])
   @@map("tts_jobs")
+}
+
+// ─── BGM (ACE-Step v1.5 background music) ────────────────────────────────────
+//
+// Narrative-block-driven background music. A project is split into a small
+// number of NarrativeBlocks ("Старт", "Рост", "Выгорание", …) whose target
+// duration equals the sum of the shots they cover. Each block is auto-filled
+// with one or more MusicSegment rows (30–90s typical, ACE-Step ceiling ~4 min)
+// until total segment duration meets the block's target. Each segment owns its
+// AudioRenderJob history (status + comfyPromptId + flac on disk), same lifecycle
+// as VideoRender. All ACE-Step jobs go through PipelineQueueService — single-slot
+// FIFO with image/video/training so the GPU never gets two music jobs at once.
+//
+// All English prompts/tags in DB content — Russian breaks ACE-Step tokenizer
+// the same way it breaks CLIP for SDXL.
+
+model NarrativeBlock {
+  id        String   @id @default(uuid())
+  projectId String
+  /// Stable identifier for the block within the project. English. e.g. "start",
+  /// "growth", "burnout". Used in filesystem paths data/<slug>/bgm/<blockSlug>/.
+  slug      String
+  /// Human-friendly title for the UI. Russian is fine here — never sent to ACE.
+  title     String?
+  sortOrder Int      @default(0)
+  /// Default ACE-Step tag prompt inherited by every segment unless overridden.
+  /// English comma-separated tags (e.g. "cinematic, warm, hopeful, piano").
+  moodPrompt String?
+  /// Ordered array of Shot.id strings this block covers. Source of truth for
+  /// `targetSeconds` — kept as JSON instead of a join table because order matters
+  /// and the block's "shape" is rarely edited (set once during script breakdown).
+  shotIds   Json
+  /// Cached sum of shot durations in seconds. Recomputed when shotIds changes
+  /// or shot videos are re-rendered with new lengths.
+  targetSeconds Int?
+  /// Lifecycle: filling (auto-fill loop active) | filled (sum(segments) >=
+  /// targetSeconds, idle) | manual (user took over, no auto-fill).
+  status    String   @default("filling")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  project  Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  segments MusicSegment[]
+
+  @@unique([projectId, slug])
+  @@index([projectId, sortOrder])
+  @@map("narrative_blocks")
+}
+
+model MusicSegment {
+  id          String   @id @default(uuid())
+  blockId     String
+  sortOrder   Int      @default(0)
+  /// Override of block.moodPrompt for this segment. English ACE-Step tags. Null
+  /// = use block default. Lets an arc inside one block ("warm → tense → release").
+  prompt      String?
+  /// Target seconds for this segment. Final flac length is decided by ACE-Step
+  /// (driven by node `EmptyAceStep1.5LatentAudio.seconds`); this is the request.
+  durationSec Int      @default(60)
+  /// AudioRenderJob.id chosen as the canonical take for this segment. Plain id,
+  /// no FK — mirrors approvedTTSJobId convention, so deleting a job row doesn't
+  /// cascade-null the segment.
+  approvedJobId String?
+  createdAt   DateTime @default(now())
+
+  block NarrativeBlock     @relation(fields: [blockId], references: [id], onDelete: Cascade)
+  jobs  AudioRenderJob[]
+
+  @@index([blockId, sortOrder])
+  @@map("music_segments")
+}
+
+model AudioRenderJob {
+  id               String    @id @default(uuid())
+  segmentId        String
+  status           String    // pending | running | completed | failed | cancelled
+  /// ComfyUI prompt_id once dispatched.
+  comfyPromptId    String?
+  /// Render parameters at enqueue time: { seed, steps, cfg, samplerName,
+  /// scheduler, durationSec, prompt }. Snapshotted so the worker can rebuild
+  /// the workflow after a backend restart.
+  params           Json?
+  /// Workflow filename used (under data/<slug>/comfy/). Default points at
+  /// the ACE-Step text-to-audio template.
+  workflowFilename String    @default("bgm_acestep_api.json")
+  /// Basename of the rendered flac in data/<slug>/bgm/<blockSlug>/.
+  outputFilename   String?
+  errorMessage     String?
+  queuedAt         DateTime  @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
+
+  segment MusicSegment @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+
+  @@index([segmentId])
+  @@index([status, queuedAt])
+  @@map("audio_render_jobs")
 }

@@ -7,6 +7,7 @@ import { SceneRenderService } from '../generation/scenes/scene-render.service';
 import { VideoRenderService } from '../generation/videos/video-render.service';
 import { TrainingService } from '../training/training.service';
 import { TTSService } from '../tts/tts.service';
+import { BgmRenderService } from '../bgm/bgm-render.service';
 import { EngineService } from './engine.service';
 
 const POLL_MS = 5_000;
@@ -41,6 +42,7 @@ export class PipelineQueueService {
     private readonly videos:   VideoRenderService,
     private readonly training: TrainingService,
     private readonly tts:      TTSService,
+    private readonly bgm:      BgmRenderService,
     private readonly engine:   EngineService,
   ) {}
 
@@ -89,19 +91,23 @@ export class PipelineQueueService {
     const ttsActive = await this.prisma.tTSJob.count({
       where: { status: 'running' },
     });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0) return;
+    const bgmActive = await this.prisma.audioRenderJob.count({
+      where: { status: 'running' },
+    });
+    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0) return;
 
     // ── 3. Pick oldest pending across all queues ───────────────────────────
-    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextTTS] = await Promise.all([
+    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextTTS, nextBgm] = await Promise.all([
       this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
       this.datasets.findNextPending(),
       this.scenes.findNextPending(),
       this.videos.findNextPending(),
       this.videos.findNextPendingUpscale(),
       this.tts.findNextPending(),
+      this.bgm.findNextPending(),
     ]);
 
-    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts'; id: string; ts: number };
+    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts' | 'bgm'; id: string; ts: number };
     const candidates: Pick[] = [];
     if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
@@ -116,6 +122,7 @@ export class PipelineQueueService {
       ts:   (nextUpscale.upscaleQueuedAt ?? nextUpscale.queuedAt).getTime(),
     });
     if (nextTTS)      candidates.push({ type: 'tts',      id: nextTTS.id,      ts: nextTTS.queuedAt.getTime() });
+    if (nextBgm)      candidates.push({ type: 'bgm',      id: nextBgm.id,      ts: nextBgm.queuedAt.getTime() });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
@@ -126,7 +133,8 @@ export class PipelineQueueService {
     else if (winner.type === 'scene')         await this.dispatchScene(winner.id);
     else if (winner.type === 'video')         await this.dispatchVideo(winner.id);
     else if (winner.type === 'video_upscale') await this.dispatchVideoUpscale(winner.id);
-    else                                       await this.dispatchTTS(winner.id);
+    else if (winner.type === 'tts')           await this.dispatchTTS(winner.id);
+    else                                       await this.dispatchBgm(winner.id);
   }
 
   /**
@@ -145,6 +153,12 @@ export class PipelineQueueService {
     if (!(await this.ensureComfyAlive('video', videoId))) return;
     this.logger.log(`Dispatching video render ${videoId} via ComfyUI`);
     await this.videos.dispatchPending(videoId);
+  }
+
+  private async dispatchBgm(jobId: string): Promise<void> {
+    if (!(await this.ensureComfyAlive('bgm', jobId))) return;
+    this.logger.log(`Dispatching BGM (ACE-Step) job ${jobId} via ComfyUI`);
+    await this.bgm.dispatchPending(jobId);
   }
 
   private async dispatchVideoUpscale(videoId: string): Promise<void> {
@@ -189,7 +203,7 @@ export class PipelineQueueService {
    * caller skips dispatch — the next pending pickup happens on the next tick.
    */
   private async ensureComfyAlive(
-    jobType: 'dataset' | 'scene' | 'video' | 'video_upscale',
+    jobType: 'dataset' | 'scene' | 'video' | 'video_upscale' | 'bgm',
     jobId: string,
   ): Promise<boolean> {
     if (await this.engine.isComfyAlive()) return true;
@@ -216,10 +230,15 @@ export class PipelineQueueService {
           where: { id: jobId },
           data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
         });
-      } else {
+      } else if (jobType === 'video_upscale') {
         await this.prisma.videoRender.update({
           where: { id: jobId },
           data:  { upscaleStatus: 'failed', upscaleErrorMessage: errMsg, upscaleCompletedAt: ts },
+        });
+      } else {
+        await this.prisma.audioRenderJob.update({
+          where: { id: jobId },
+          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
         });
       }
       return false;

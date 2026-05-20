@@ -55,6 +55,22 @@ interface ManifestScene {
   narration: { path: string; duration_us: number } | null;
   shots:     ManifestShot[];
 }
+/**
+ * One ACE-Step take placed on the dedicated music audio track. Built from
+ * approved AudioRenderJob rows only — unapproved or failed takes become
+ * silence in their timeline slot. `start_us` is computed from the project's
+ * shot timeline (first-shot-of-block start) + sum of preceding segment
+ * durations within the block.
+ */
+interface ManifestMusic {
+  blockSlug:   string;
+  segmentId:   string;
+  jobId:       string;
+  /** Absolute path to the rendered flac under data/<slug>/bgm/<blockSlug>/. */
+  path:        string;
+  start_us:    number;
+  duration_us: number;
+}
 interface Manifest {
   project_name:        string;
   draft_name:          string;
@@ -72,6 +88,10 @@ interface Manifest {
   height:              number;
   fps:                 number;
   scenes:              ManifestScene[];
+  /** Approved BGM segments laid out on the project timeline. Empty array if
+   *  the project has no NarrativeBlocks, no approved AudioRenderJobs, or all
+   *  approved jobs lost their flac on disk — none of these is fatal. */
+  music_tracks:        ManifestMusic[];
 }
 
 @Injectable()
@@ -230,6 +250,13 @@ export class ExportsService {
 
     const dataRoot = path.join(APP_ROOT, 'data', projectSlug);
     const out: ManifestScene[] = [];
+    /**
+     * shotId → microsecond offset from start of project timeline. Built while
+     * we walk scenes so the BGM placement pass below can resolve each block's
+     * start position without re-traversing the storyboard.
+     */
+    const shotIdToStartUs = new Map<string, number>();
+    let timelineCursorUs = 0;
 
     for (const scene of scenes) {
       // Shots within a scene sort by shotCode — they're like "S01_SH01",
@@ -250,6 +277,8 @@ export class ExportsService {
         const fpsP    = params.fps    ?? 16;
         const lengthP = params.length ?? 81;
         const duration_us = Math.round((lengthP / fpsP) * 1_000_000);
+        shotIdToStartUs.set(shot.id, timelineCursorUs);
+        timelineCursorUs += duration_us;
 
         // Per-shot narration: if the shot has an approved TTSJob with a
         // rendered wav on disk, attach it. The python exporter clips audio
@@ -309,6 +338,75 @@ export class ExportsService {
       });
     }
 
+    // ── BGM (ACE-Step) timeline ─────────────────────────────────────────
+    // Pull every NarrativeBlock with its segments + the segments' jobs, then
+    // map each block's first covered shot to its timeline start (built above
+    // in `shotIdToStartUs`). Segments are laid out sequentially within the
+    // block from that start; unapproved or job-less segments leave silence in
+    // their slot. Music is OPTIONAL — readiness gate doesn't check it.
+    const blocks = await this.prisma.narrativeBlock.findMany({
+      where:   { projectId },
+      include: {
+        segments: {
+          orderBy: { sortOrder: 'asc' },
+          include: { jobs: true },
+        },
+      },
+      orderBy: { sortOrder: 'asc' },
+    });
+    const musicTracks: ManifestMusic[] = [];
+    for (const block of blocks) {
+      const shotIds = ((block.shotIds as unknown) as string[]) ?? [];
+      // Earliest covered shot defines the block's timeline start. Using min()
+      // (not the first shotId) makes the export robust against shotIds arrays
+      // saved in some non-storyboard order.
+      let blockStartUs = Infinity;
+      for (const sid of shotIds) {
+        const v = shotIdToStartUs.get(sid);
+        if (v !== undefined && v < blockStartUs) blockStartUs = v;
+      }
+      if (!Number.isFinite(blockStartUs)) {
+        this.logger.warn(
+          `block ${block.slug}: none of its shotIds resolved to the timeline `
+          + `(no chosen FHD video?) — skipping BGM placement`,
+        );
+        continue;
+      }
+      let cursor = blockStartUs;
+      for (const seg of block.segments) {
+        const durUs = seg.durationSec * 1_000_000;
+        if (!seg.approvedJobId) {
+          // Unapproved segment → leave silence in this slot. Block continues
+          // to advance so subsequent approved segments align with their
+          // intended timeline positions even when a middle one is skipped.
+          cursor += durUs;
+          continue;
+        }
+        const job = seg.jobs.find((j) => j.id === seg.approvedJobId);
+        if (!job || job.status !== 'completed' || !job.outputFilename) {
+          this.logger.warn(`segment ${seg.id}: approvedJobId points at non-completed job, skipping`);
+          cursor += durUs;
+          continue;
+        }
+        const fp = path.join(dataRoot, 'bgm', block.slug, job.outputFilename);
+        if (!existsSync(fp)) {
+          this.logger.warn(`segment ${seg.id}: flac missing on disk (${fp}), skipping`);
+          cursor += durUs;
+          continue;
+        }
+        musicTracks.push({
+          blockSlug:   block.slug,
+          segmentId:   seg.id,
+          jobId:       job.id,
+          path:        fp,
+          start_us:    cursor,
+          duration_us: durUs,
+        });
+        cursor += durUs;
+      }
+    }
+    this.logger.log(`built ${musicTracks.length} music_tracks across ${blocks.length} block(s)`);
+
     const ts        = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 13); // YYYYMMDDtHHMM
     const draftName = `${projectSlug}_${ts}`;
     const outRoot   = path.join(APP_ROOT, 'data', projectSlug, 'exports', 'capcut');
@@ -331,6 +429,7 @@ export class ExportsService {
       height:             EXPORT_HEIGHT,
       fps:                EXPORT_FPS,
       scenes:             out,
+      music_tracks:       musicTracks,
     };
   }
 }

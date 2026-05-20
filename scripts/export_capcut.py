@@ -81,6 +81,27 @@ def _wav_duration_us(path: str) -> int:
         return 0
 
 
+def _audio_duration_us(path: str) -> int:
+    """Duration of an arbitrary audio file in microseconds. Used for BGM flacs
+    from ACE-Step (Silero TTS hits the wav branch above directly). Returns 0
+    on failure so the caller can fall back to the manifest's declared duration.
+    Order of attempts: stdlib `wave` (cheap, no deps) → `soundfile` (usually
+    present in the kohya venv that runs the exporter — Silero uses it too) →
+    give up. Never raises."""
+    if path.lower().endswith('.wav'):
+        return _wav_duration_us(path)
+    try:
+        import soundfile as sf  # type: ignore
+        info = sf.info(path)
+        if info.samplerate <= 0 or info.frames <= 0:
+            return 0
+        raw_us = (info.frames * 1_000_000) // info.samplerate
+        return max(0, raw_us - _WAV_TRIM_MARGIN_US)
+    except Exception as e:  # noqa: BLE001
+        _log(f'audio probe failed for {path}: {e!r}')
+        return 0
+
+
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
@@ -100,14 +121,18 @@ def build_draft(manifest: dict) -> Path:
     # timeranges, so we don't need JianYing's auto-snap behavior.
     script = draft.ScriptFile(width=width, height=height, fps=fps, maintrack_adsorb=False)
 
-    # One video lane, one audio lane. Order matters: video first means the
-    # video is the "main" track in CapCut's UI (top of the layer stack).
+    # One video lane + two audio lanes (narration on top, bgm underneath).
+    # Order matters: video first means the video is the "main" track in
+    # CapCut's UI (top of the layer stack). Narration is added before bgm so
+    # voiceover appears above background music in the audio layer stack.
     script.add_track(draft.TrackType.video, "main_video")
     script.add_track(draft.TrackType.audio, "narration")
+    script.add_track(draft.TrackType.audio, "bgm")
 
     cursor_video_us = 0
     total_clips     = 0
     total_tts       = 0
+    total_bgm       = 0
 
     for scene in manifest["scenes"]:
         scene_start_us = cursor_video_us
@@ -194,6 +219,41 @@ def build_draft(manifest: dict) -> Path:
                 else:
                     _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
 
+    # ── BGM (ACE-Step) ──────────────────────────────────────────────────
+    # Background music sits on its own audio lane. The Node-side manifest has
+    # already filtered to approved AudioRenderJob rows and computed each
+    # segment's `start_us` from the project's shot timeline (block start
+    # + sum of previous segments). We trust those positions verbatim and only
+    # clip duration to whatever the flac actually contains on disk so
+    # pyJianYingDraft doesn't refuse with "超出了素材时长".
+    for mt in manifest.get("music_tracks") or []:
+        wav_path = mt["path"].replace("\\", "/")
+        actual_us = _audio_duration_us(wav_path)
+        manifest_us = int(mt.get("duration_us") or 0)
+        if actual_us <= 0 and manifest_us <= 0:
+            _log(f'skipping bgm segment {mt.get("segmentId")}: cannot determine duration')
+            continue
+        bgm_dur = actual_us if actual_us > 0 else manifest_us
+        if manifest_us > 0:
+            bgm_dur = min(bgm_dur, manifest_us)
+        if bgm_dur <= 0:
+            continue
+        material = draft.AudioMaterial(
+            wav_path,
+            material_name=f'bgm_{mt.get("blockSlug","")}_{mt.get("segmentId","")[:8]}',
+        )
+        # BGM sits under voiceover at 20% gain. ACE-Step output is normalised
+        # to roughly -6 dBFS RMS so a straight pass would drown narration;
+        # 0.2 ≈ -14 dB attenuation puts it where movie cues typically sit
+        # behind dialog. Editable per-segment in CapCut afterward.
+        segment = draft.AudioSegment(
+            material=material,
+            target_timerange=draft.Timerange(start=int(mt["start_us"]), duration=bgm_dur),
+            volume=0.2,
+        )
+        script.add_segment(segment, track_name="bgm")
+        total_bgm += 1
+
     draft_dir.mkdir(parents=True, exist_ok=True)
     # pyJianYingDraft writes draft_content.json directly to the given path.
     out_path = draft_dir / "draft_content.json"
@@ -215,7 +275,7 @@ def build_draft(manifest: dict) -> Path:
 
     _log(f'wrote {out_path}')
     _log(f'project={project} clips={total_clips} narration_tracks={total_tts} '
-         f'duration_us={total_us}')
+         f'bgm_tracks={total_bgm} duration_us={total_us}')
     return draft_dir
 
 

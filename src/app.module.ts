@@ -11,6 +11,7 @@ import { ComfyModule } from './comfy/comfy.module';
 import { GenerationModule } from './generation/generation.module';
 import { TrainingModule } from './training/training.module';
 import { TTSModule } from './tts/tts.module';
+import { BgmModule } from './bgm/bgm.module';
 import { ExportsModule } from './exports/exports.module';
 import { PipelineModule } from './pipeline/pipeline.module';
 
@@ -28,6 +29,7 @@ import { PipelineModule } from './pipeline/pipeline.module';
     GenerationModule,
     TrainingModule,
     TTSModule,
+    BgmModule,
     ExportsModule,
     PipelineModule,
   ],

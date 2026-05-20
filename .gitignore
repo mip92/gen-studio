@@ -16,6 +16,14 @@ data/*/reference/
 data/*/shots/
 # Generated TTS narration audio (large wavs, regenerated on demand).
 data/*/scenes/
+# Generated ACE-Step BGM audio (flacs ~5–30 MB each, regenerated on demand).
+data/*/bgm/
+# CapCut draft outputs (manifest.json + draft_content.json + copies).
+data/*/exports/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
 
 # Manual backups of comfy templates
 data/*/comfy/*.bak
