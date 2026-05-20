@@ -1,8 +1,12 @@
 import { Controller, Get, NotFoundException, Param } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { existsSync, statSync } from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { DatasetService } from '../training/dataset.service';
+import { probeWavDurationMs } from '../tts/wav-duration';
+
+const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 
 @ApiTags('Projects')
 @Controller('projects/:idOrSlug')
@@ -160,7 +164,12 @@ export class ProjectsDashboardController {
     });
     if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
 
-    return {
+    // Collected lazily — any approved TTS job whose row didn't yet have a
+    // durationMs gets probed below; we persist all of them in parallel right
+    // before returning so the next /scenes call reads precomputed values.
+    const ttsDurationBackfills: Array<{ jobId: string; durationMs: number }> = [];
+
+    const response = {
       project: { id: project.id, slug: project.slug, name: project.name },
       scenes: project.scenes.map((s) => ({
         id:              s.id,
@@ -263,6 +272,7 @@ export class ProjectsDashboardController {
             ...(() => {
               const jobs = ((sh as any).ttsJobs ?? []) as Array<{
                 id: string; status: string; queuedAt: Date;
+                outputFilename: string | null; durationMs: number | null;
               }>;
               const approvedId = (sh as any).approvedTTSJobId as string | null;
               // Sort by queuedAt desc — latest first.
@@ -270,17 +280,56 @@ export class ProjectsDashboardController {
               const latestNonTerminal = sorted.find((j) => j.status === 'pending' || j.status === 'running');
               const completedUnapproved = sorted.filter((j) => j.status === 'completed' && j.id !== approvedId);
               const latestCompletedUnapprovedId = completedUnapproved[0]?.id ?? null;
+
+              // Exact wav length for the approved narration. If the row already
+              // has durationMs we use it; otherwise probe the file once now
+              // and queue a DB backfill so subsequent loads are O(1).
+              let approvedTTSDurationMs: number | null = null;
+              const approved = approvedId ? jobs.find((j) => j.id === approvedId) : null;
+              if (approved && approved.status === 'completed' && approved.outputFilename) {
+                if (approved.durationMs != null) {
+                  approvedTTSDurationMs = approved.durationMs;
+                } else {
+                  const wavPath = path.join(
+                    APP_ROOT, 'data', project.slug, 'shots', sh.shotCode, approved.outputFilename,
+                  );
+                  const ms = probeWavDurationMs(wavPath);
+                  if (ms != null) {
+                    approvedTTSDurationMs = ms;
+                    ttsDurationBackfills.push({ jobId: approved.id, durationMs: ms });
+                  }
+                }
+              }
               return {
                 ttsLatestStatus:     latestNonTerminal?.status ?? null,
                 ttsCompletedUnapproved: completedUnapproved.length,
                 /** id of the most recent completed-but-not-approved TTSJob — the
                  *  candidate the "✓ утвердить" quick button approves. */
                 ttsLatestCompletedUnapprovedId: latestCompletedUnapprovedId,
+                /** Exact duration of the approved narration wav (probed once,
+                 *  persisted to tts_jobs.durationMs). Null when nothing approved
+                 *  or the wav can't be probed. */
+                approvedTTSDurationMs,
               };
             })(),
           };
         }),
       })),
     };
+
+    if (ttsDurationBackfills.length > 0) {
+      // Fire-and-forget would be fine, but awaiting lets the next request see
+      // populated rows immediately. The set is tiny (one row per approved-but-
+      // unprobed shot in the scene) so the write storm is bounded.
+      await Promise.all(
+        ttsDurationBackfills.map((b) =>
+          this.prisma.tTSJob.update({
+            where: { id: b.jobId },
+            data:  { durationMs: b.durationMs },
+          }),
+        ),
+      );
+    }
+    return response;
   }
 }

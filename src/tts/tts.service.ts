@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { probeWavDurationMs } from './wav-duration';
 
 const APP_ROOT      = process.env.APP_ROOT      ?? path.resolve(__dirname, '..', '..', '..');
 const KOHYA_DIR     = process.env.KOHYA_DIR     ?? 'E:\\kohya_ss';
@@ -403,16 +404,20 @@ export class TTSService {
       return;
     }
 
+    // Probe the wav header once now so the UI doesn't fall back to the
+    // text-length heuristic. Null if the probe fails — caller backfills lazily.
+    const durationMs = probeWavDurationMs(outPath);
     await this.prisma.tTSJob.update({
       where: { id: job.id },
       data:  {
         status:         'completed',
         outputFilename: outFilename,
+        durationMs,
         completedAt:    new Date(),
         errorMessage:   null,
       },
     });
-    this.logger.log(`TTS job ${job.id} → ${outPath}`);
+    this.logger.log(`TTS job ${job.id} → ${outPath}${durationMs ? ` (${durationMs}ms)` : ''}`);
   }
 
   private async fail(jobId: string, message: string): Promise<void> {

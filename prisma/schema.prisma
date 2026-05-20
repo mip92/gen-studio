@@ -410,6 +410,11 @@ model TTSJob {
   /// data/<slug>/scenes/<sceneKey>/, shot-level jobs in
   /// data/<slug>/shots/<shotCode>/.
   outputFilename String?
+  /// Actual wav duration in milliseconds — probed from the RIFF header on
+  /// completion (or backfilled when an older row is first read by the scenes
+  /// endpoint). Null = not yet measured; UI falls back to the text-length
+  /// heuristic (text.length / 15 cps) until populated.
+  durationMs     Int?
   errorMessage   String?
   queuedAt       DateTime  @default(now())
   startedAt      DateTime?
