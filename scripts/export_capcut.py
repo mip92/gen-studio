@@ -121,26 +121,26 @@ def build_draft(manifest: dict) -> Path:
     # timeranges, so we don't need JianYing's auto-snap behavior.
     script = draft.ScriptFile(width=width, height=height, fps=fps, maintrack_adsorb=False)
 
-    # One video lane + two audio lanes (narration on top, bgm underneath).
-    # Order matters: video first means the video is the "main" track in
-    # CapCut's UI (top of the layer stack). Narration is added before bgm so
-    # voiceover appears above background music in the audio layer stack.
+    # One video lane + one narration lane. BGM tracks are added later, one
+    # per NarrativeBlock, so each block's last cue can play its full overgen
+    # tail without colliding with the next block's first cue (which lives on
+    # its own lane). Order matters: video first means the video is the
+    # "main" track in CapCut's UI (top of the layer stack). Narration is
+    # added before BGM so voiceover sits above background music.
     script.add_track(draft.TrackType.video, "main_video")
     script.add_track(draft.TrackType.audio, "narration")
-    script.add_track(draft.TrackType.audio, "bgm")
 
     cursor_video_us = 0
     total_clips     = 0
     total_tts       = 0
     total_bgm       = 0
-    # Last VideoSegment of each scene — used after the loop to attach a
-    # transition between consecutive scenes. Skipping the very last entry
+    # Every VideoSegment in playback order — used after the loop to attach a
+    # transition between consecutive shots. Skipping the very last entry
     # avoids a transition that has no "next" to dissolve into.
-    last_segment_per_scene: list = []
+    all_video_segments: list = []
 
     for scene in manifest["scenes"]:
         scene_start_us = cursor_video_us
-        last_segment_in_scene = None
 
         any_shot_narration = False
 
@@ -162,7 +162,7 @@ def build_draft(manifest: dict) -> Path:
                 target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
             )
             script.add_segment(segment, track_name="main_video")
-            last_segment_in_scene = segment
+            all_video_segments.append(segment)
 
             # Per-shot narration: lay the wav at this shot's exact timeline
             # position. The Node-side duration_us is a text-length estimate; we
@@ -225,27 +225,24 @@ def build_draft(manifest: dict) -> Path:
                 else:
                     _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
 
-        # Done with this scene — remember its last shot for transition placement.
-        if last_segment_in_scene is not None:
-            last_segment_per_scene.append(last_segment_in_scene)
-
-    # ── Scene-boundary transitions ──────────────────────────────────────
-    # Standard non-flashy transitions between consecutive scenes. Cycled so
-    # five scenes don't all use the same crossfade. Applied to the OUTGOING
-    # segment per pyJianYingDraft contract; the final scene is skipped (no
-    # "next" to dissolve into). Names are Chinese identifiers from
+    # ── Shot-boundary transitions ──────────────────────────────────────
+    # First 12 trending CapCut transitions, cycled across every shot boundary
+    # (not just scene boundaries) so the rotation actually exercises the full
+    # set even on short projects. Applied to the OUTGOING segment per
+    # pyJianYingDraft contract; the very last shot is skipped (no "next" to
+    # dissolve into). Names are Chinese identifiers from
     # `pyJianYingDraft.TransitionType` — looked up via getattr because the
     # enum members aren't valid Python attribute names without it.
     TRANSITION_CYCLE = [
-        '叠化',      # cross-dissolve — the editorial workhorse
-        '闪白',      # white flash    — quick subtle attention beat
-        '闪黑',      # black flash    — quick subtle pause beat
-        '雾化',      # haze/blur      — soft scene change
-        '泛白',      # whiten         — gentle bloom into next
-        '色彩溶解',   # color dissolve — subtle saturated wash
+        '闪黑',        # чёрное затухание       — flash black / fade to black
+        '闪屏故障',     # разрыв-вспышка         — screen-glitch flash
+        '叠加',        # контрастное наложение  — overlay
+        '模糊放大',     # пульсирующее размытие  — blur zoom
+        '旋焦',        # вспышка с поворотом    — spin focus
     ]
     TRANSITION_DURATION_US = 600_000   # 0.6s — short enough to stay invisible
-    for i, seg in enumerate(last_segment_per_scene[:-1]):
+    successful_transitions = 0
+    for i, seg in enumerate(all_video_segments[:-1]):
         name = TRANSITION_CYCLE[i % len(TRANSITION_CYCLE)]
         tt   = getattr(draft.TransitionType, name, None)
         if tt is None:
@@ -253,71 +250,98 @@ def build_draft(manifest: dict) -> Path:
             continue
         try:
             seg.add_transition(tt, duration=TRANSITION_DURATION_US)
+            # pyJianYingDraft only copies a segment's transition into
+            # `script.materials.transitions` inside `add_segment()` (see
+            # script_file.py:338). Since we attach transitions AFTER all
+            # segments are already added, we have to push the material into
+            # the materials list ourselves — otherwise the segment's
+            # extra_material_refs points to a transition that's missing from
+            # the draft's materials dict, and CapCut silently drops it.
+            if seg.transition is not None and seg.transition not in script.materials:
+                script.materials.transitions.append(seg.transition)
+            successful_transitions += 1
         except Exception as e:  # noqa: BLE001
             _log(f'add_transition failed at boundary {i} ({name}): {e!r}')
-    total_transitions = max(0, len(last_segment_per_scene) - 1)
+    total_transitions = successful_transitions
 
     # ── BGM (ACE-Step) ──────────────────────────────────────────────────
-    # Background music sits on its own audio lane. The Node-side manifest has
-    # already filtered to approved AudioRenderJob rows and computed each
-    # segment's `start_us` from the project's shot timeline (block start
-    # + sum of previous segments).
+    # Each NarrativeBlock gets its own audio lane (`bgm_<blockSlug>`). With
+    # blocks on separate tracks, the last cue of a block can play its entire
+    # overgen tail past the planned slot — even when the next block starts
+    # immediately — because there's no same-track neighbour to collide with.
+    # Within a block, consecutive cues still share a lane and so still cap
+    # at the next cue's start.
     #
     # Two duration fields per entry:
-    #   - duration_us         playback target on the CapCut timeline (segment slot)
+    #   - duration_us         planned slot length on the timeline
     #   - render_duration_us  actual flac length on disk (renderSec from ACE-Step,
     #                         which is duration_us + overgen tail)
-    #
-    # We feed the flac into the segment with source_timerange clipped to
-    # duration_us so the cut lands inside the overgen tail, then add_fade
-    # turns that cut into a soft fade-out — masks ACE-Step's tendency to
-    # end a take mid-phrase.
     BGM_FADE_IN_US  = 1_000_000   # 1 s in-fade for clean entry
     BGM_FADE_OUT_US = 1_500_000   # 1.5 s out-fade hides the source_timerange cut
-    for mt in manifest.get("music_tracks") or []:
-        wav_path = mt["path"].replace("\\", "/")
-        actual_us = _audio_duration_us(wav_path)
-        playback_us = int(mt.get("duration_us") or 0)
-        render_us   = int(mt.get("render_duration_us") or 0)
-        if actual_us <= 0 and playback_us <= 0 and render_us <= 0:
-            _log(f'skipping bgm segment {mt.get("segmentId")}: cannot determine duration')
-            continue
-        # Cap playback at whatever's actually on disk — protects against jobs
-        # that finished short for any reason (failed mid-render, then retried
-        # under a stale params row).
-        flac_us = actual_us if actual_us > 0 else render_us
-        bgm_dur = playback_us if playback_us > 0 else flac_us
-        if flac_us > 0:
-            bgm_dur = min(bgm_dur, flac_us)
-        if bgm_dur <= 0:
-            continue
-        material = draft.AudioMaterial(
-            wav_path,
-            material_name=f'bgm_{mt.get("blockSlug","")}_{mt.get("segmentId","")[:8]}',
-        )
-        # BGM sits under voiceover at 20% gain. ACE-Step output is normalised
-        # to roughly -6 dBFS RMS so a straight pass would drown narration;
-        # 0.2 ≈ -14 dB attenuation puts it where movie cues typically sit
-        # behind dialog. Editable per-segment in CapCut afterward.
-        segment = draft.AudioSegment(
-            material=material,
-            target_timerange=draft.Timerange(start=int(mt["start_us"]), duration=bgm_dur),
-            # source_timerange crops the flac to the playback slot. Without it,
-            # pyJianYingDraft would default source = target (same length, no
-            # overgen benefit) — we want the overgen tail to be "available
-            # material" that source_timerange reaches into when bgm_dur is
-            # shorter than flac_us, so the cut sits inside that headroom.
-            source_timerange=draft.Timerange(start=0, duration=bgm_dur),
-            volume=0.2,
-        )
-        # Fade clamps at half the segment length so we don't crossfade past
-        # the middle of a short cue. Out-fade is the important one — it
-        # smooths the source_timerange cut into the next block.
-        fade_in  = min(BGM_FADE_IN_US,  bgm_dur // 2)
-        fade_out = min(BGM_FADE_OUT_US, bgm_dur // 2)
-        segment.add_fade(in_duration=fade_in, out_duration=fade_out)
-        script.add_segment(segment, track_name="bgm")
-        total_bgm += 1
+    tracks = list(manifest.get("music_tracks") or [])
+    # Sort by start_us so "next track" lookup is correct even if blocks were
+    # emitted out of timeline order.
+    tracks.sort(key=lambda t: int(t.get("start_us") or 0))
+
+    # Group by block, preserving sort order within each group. Each group
+    # becomes its own audio lane so blocks can overlap freely.
+    block_groups: Dict[str, List[Dict[str, Any]]] = {}
+    block_order: List[str] = []
+    for mt in tracks:
+        slug = (mt.get("blockSlug") or "default") or "default"
+        if slug not in block_groups:
+            block_groups[slug] = []
+            block_order.append(slug)
+        block_groups[slug].append(mt)
+
+    for slug in block_order:
+        track_name = f"bgm_{slug}"
+        script.add_track(draft.TrackType.audio, track_name)
+        group = block_groups[slug]
+        for j, mt in enumerate(group):
+            wav_path = mt["path"].replace("\\", "/")
+            actual_us = _audio_duration_us(wav_path)
+            playback_us = int(mt.get("duration_us") or 0)
+            render_us   = int(mt.get("render_duration_us") or 0)
+            if actual_us <= 0 and playback_us <= 0 and render_us <= 0:
+                _log(f'skipping bgm segment {mt.get("segmentId")}: cannot determine duration')
+                continue
+            flac_us = actual_us if actual_us > 0 else render_us
+            start_us = int(mt["start_us"])
+            # Within a block: cap by the next cue in the same block (same
+            # lane → would collide). For the last cue of a block: play out
+            # the full flac (no neighbour on this lane, the next block's
+            # first cue is on a different lane).
+            if j + 1 < len(group):
+                next_start_us = int(group[j + 1].get("start_us") or 0)
+                bgm_dur = max(0, next_start_us - start_us)
+                if flac_us > 0:
+                    bgm_dur = min(bgm_dur, flac_us)
+            else:
+                bgm_dur = flac_us if flac_us > 0 else playback_us
+            if bgm_dur <= 0:
+                continue
+            material = draft.AudioMaterial(
+                wav_path,
+                material_name=f'bgm_{slug}_{mt.get("segmentId","")[:8]}',
+            )
+            # BGM sits under voiceover at 20% gain. ACE-Step output is
+            # normalised to roughly -6 dBFS RMS so a straight pass would
+            # drown narration; 0.2 ≈ -14 dB attenuation puts it where movie
+            # cues typically sit behind dialog. Editable per-segment in
+            # CapCut afterward.
+            segment = draft.AudioSegment(
+                material=material,
+                target_timerange=draft.Timerange(start=start_us, duration=bgm_dur),
+                # source_timerange crops the flac to the playback slot.
+                source_timerange=draft.Timerange(start=0, duration=bgm_dur),
+                volume=0.2,
+            )
+            fade_in  = min(BGM_FADE_IN_US,  bgm_dur // 2)
+            fade_out = min(BGM_FADE_OUT_US, bgm_dur // 2)
+            segment.add_fade(in_duration=fade_in, out_duration=fade_out)
+            script.add_segment(segment, track_name=track_name)
+            total_bgm += 1
 
     draft_dir.mkdir(parents=True, exist_ok=True)
     # pyJianYingDraft writes draft_content.json directly to the given path.

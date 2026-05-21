@@ -8,12 +8,12 @@ import {
   Patch,
   Post,
   Query,
+  Req,
   Res,
-  StreamableFile,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { createReadStream } from 'fs';
-import type { Response } from 'express';
+import { createReadStream, statSync } from 'fs';
+import type { Request, Response } from 'express';
 import { BgmService } from './bgm.service';
 import { BgmRenderService } from './bgm-render.service';
 import {
@@ -138,15 +138,56 @@ export class BgmController {
   }
 
   @Get('jobs/:jobId/file')
-  @ApiOperation({ summary: 'Stream the rendered flac (200 once completed, 204 if missing on disk)' })
-  async file(@Param('jobId') jobId: string, @Res({ passthrough: true }) res: Response) {
+  @ApiOperation({ summary: 'Stream the rendered flac with HTTP Range support (200/206/204)' })
+  async file(
+    @Param('jobId') jobId: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
     const fp = await this.render.filePath(jobId);
-    if (!fp) {
-      res.status(204);
-      return undefined as unknown as StreamableFile;
+    if (!fp) { res.status(204).end(); return; }
+
+    const total = statSync(fp).size;
+    // Accept-Ranges + Content-Length is what makes <audio controls> show a
+    // working seek slider. Without these the browser doesn't know total
+    // length, can't request byte ranges, and the timeline scrubber breaks.
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Type', 'audio/flac');
+    // Disable response compression — gzip on a flac stream wastes CPU and
+    // hides Content-Length from intermediaries which can re-break seeking.
+    res.setHeader('Cache-Control', 'no-transform');
+
+    const range = req.headers.range;
+    if (!range) {
+      res.setHeader('Content-Length', String(total));
+      createReadStream(fp).pipe(res);
+      return;
     }
-    res.set({ 'Content-Type': 'audio/flac' });
-    return new StreamableFile(createReadStream(fp));
+
+    // Parse `Range: bytes=START-END` (either end may be empty).
+    const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!m) {
+      res.setHeader('Content-Range', `bytes */${total}`);
+      res.status(416).end();
+      return;
+    }
+    const start = m[1] === '' ? 0 : Number.parseInt(m[1], 10);
+    const end   = m[2] === '' ? total - 1 : Math.min(Number.parseInt(m[2], 10), total - 1);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+      res.setHeader('Content-Range', `bytes */${total}`);
+      res.status(416).end();
+      return;
+    }
+    res.status(206);
+    res.setHeader('Content-Range',  `bytes ${start}-${end}/${total}`);
+    res.setHeader('Content-Length', String(end - start + 1));
+    createReadStream(fp, { start, end }).pipe(res);
+  }
+
+  @Get('jobs/:jobId/meta')
+  @ApiOperation({ summary: 'File size + computed bitrate for the rendered flac' })
+  async meta(@Param('jobId') jobId: string) {
+    return this.render.meta(jobId);
   }
 
   @Delete('jobs/:jobId')

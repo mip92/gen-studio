@@ -12,6 +12,7 @@ import {
   readFileSync,
   renameSync,
   copyFileSync,
+  statSync,
   unlinkSync,
 } from 'fs';
 import * as path from 'path';
@@ -359,6 +360,39 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
       return null;
     }
     return fp;
+  }
+
+  /**
+   * Lightweight metadata for the rendered flac. `bytes` comes from the OS,
+   * `durationSec` is taken from the job's renderSec param (snapshotted at
+   * enqueue) falling back to the parent segment's planned duration. The
+   * bitrate computed from these two is an average — flac is variable, but the
+   * average is what users compare against typical music-bitrate references.
+   *
+   * Returns `null` if the file is missing on disk so callers can answer 204
+   * the same way `filePath()` does.
+   */
+  async meta(jobId: string): Promise<{
+    bytes:        number;
+    durationSec:  number;
+    bitrateKbps:  number;
+  } | null> {
+    const j = await this.prisma.audioRenderJob.findUnique({
+      where:   { id: jobId },
+      include: { segment: { include: { block: { include: { project: true } } } } },
+    });
+    if (!j || !j.outputFilename || j.status !== 'completed') return null;
+    const fp = path.join(
+      APP_ROOT, 'data', j.segment.block.project.slug, 'bgm', j.segment.block.slug, j.outputFilename,
+    );
+    if (!existsSync(fp)) return null;
+    const bytes = statSync(fp).size;
+    const params = (j.params ?? null) as null | { renderSec?: number };
+    const durationSec = params?.renderSec ?? j.segment.durationSec ?? 0;
+    const bitrateKbps = durationSec > 0
+      ? Math.round((bytes * 8) / durationSec / 1000)
+      : 0;
+    return { bytes, durationSec, bitrateKbps };
   }
 
   async delete(jobId: string): Promise<{ deleted: true; id: string }> {
