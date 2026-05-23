@@ -1,0 +1,72 @@
+{
+  "1": {
+    "class_type": "CheckpointLoaderSimple",
+    "inputs": {
+      "ckpt_name": "sdxl\\lustifySDXLNSFW_ggwpV7.safetensors"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "clip": ["1", 1], "text": "PLACEHOLDER" }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": { "clip": ["1", 1], "text": "PLACEHOLDER" }
+  },
+  "5": {
+    "class_type": "EmptyLatentImage",
+    "inputs": { "width": 1344, "height": 768, "batch_size": 1 }
+  },
+
+  "6": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model":         ["1", 0],
+      "positive":      ["3", 0],
+      "negative":      ["4", 0],
+      "latent_image":  ["5", 0],
+      "seed":          0,
+      "steps":         28,
+      "cfg":           6.0,
+      "sampler_name":  "dpmpp_2m",
+      "scheduler":     "karras",
+      "denoise":       1.0
+    }
+  },
+
+  "20": {
+    "class_type": "LatentUpscale",
+    "inputs": {
+      "samples":        ["6", 0],
+      "upscale_method": "bislerp",
+      "width":          1920,
+      "height":         1088,
+      "crop":           "disabled"
+    }
+  },
+
+  "21": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model":         ["1", 0],
+      "positive":      ["3", 0],
+      "negative":      ["4", 0],
+      "latent_image":  ["20", 0],
+      "seed":          0,
+      "steps":         15,
+      "cfg":           5.5,
+      "sampler_name":  "dpmpp_2m",
+      "scheduler":     "karras",
+      "denoise":       0.3
+    }
+  },
+
+  "7": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["21", 0], "vae": ["1", 2] }
+  },
+  "8": {
+    "class_type": "SaveImage",
+    "inputs": { "images": ["7", 0], "filename_prefix": "scene" }
+  }
+}

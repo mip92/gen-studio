@@ -1,0 +1,106 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "ultrarealFineTune_v4_fp8.safetensors",
+      "weight_dtype": "default"
+    }
+  },
+  "10": {
+    "class_type": "DualCLIPLoader",
+    "inputs": {
+      "clip_name1": "t5xxl_fp8_e4m3fn_scaled.safetensors",
+      "clip_name2": "clip_l.safetensors",
+      "type": "flux"
+    }
+  },
+  "11": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    }
+  },
+  "3": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": ["10", 0],
+      "text": "PLACEHOLDER"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "clip": ["10", 0],
+      "text": "PLACEHOLDER"
+    }
+  },
+  "12": {
+    "class_type": "FluxGuidance",
+    "inputs": {
+      "conditioning": ["3", 0],
+      "guidance": 3.5
+    }
+  },
+  "5": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1280,
+      "height": 720,
+      "batch_size": 1
+    }
+  },
+  "6": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["12", 0],
+      "negative": ["4", 0],
+      "latent_image": ["5", 0],
+      "seed": 0,
+      "steps": 25,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0
+    }
+  },
+  "20": {
+    "class_type": "LatentUpscale",
+    "inputs": {
+      "samples": ["6", 0],
+      "width": 1920,
+      "height": 1080,
+      "upscale_method": "bislerp",
+      "crop": "disabled"
+    }
+  },
+  "21": {
+    "class_type": "KSampler",
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["12", 0],
+      "negative": ["4", 0],
+      "latent_image": ["20", 0],
+      "seed": 0,
+      "steps": 12,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 0.4
+    }
+  },
+  "7": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": ["21", 0],
+      "vae": ["11", 0]
+    }
+  },
+  "8": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": ["7", 0],
+      "filename_prefix": "scene_flux_hires"
+    }
+  }
+}

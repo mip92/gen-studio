@@ -19,6 +19,15 @@ model Project {
   /// in the database so the API can serve it without depending on filesystem
   /// state. Scenes hold their own snippet of this in Scene.narrationText.
   scriptText String?
+  /// Distribution target: "youtube" | "tiktok" | "shorts" | "longform".
+  /// Drives platform-specific safety/length checks at shotlist time.
+  targetPlatform String?
+  /// Safety tier for advertiser-friendliness checks. "advertiser_safe" =
+  /// strict YouTube monetization guardrails (no self-harm, no graphic violence,
+  /// no brands, etc.); "limited" = age-gate acceptable; "unrestricted" = no
+  /// filtering. Default null = unrestricted. Applied by shotlist generator
+  /// and prompt sanitizer.
+  safetyTier String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -70,6 +79,12 @@ model CharacterProfile {
   /// Latest training overwrites this list to reflect current disk state.
   loraVariants   Json?
   triggerToken   String?
+  /// If true, this profile is rendered without LoRA and identity is locked
+  /// via IP-Adapter FaceID (or PuLID) using a single reference portrait.
+  /// Used for "passenger"-style minor characters where training a LoRA per
+  /// person is uneconomical. The reference image lives in ReferenceAsset
+  /// for this profileCode (sortOrder = 0 is the FaceID anchor).
+  useIpAdapter   Boolean  @default(false)
   createdAt      DateTime @default(now())
 
   character        Character         @relation(fields: [characterId], references: [id], onDelete: Cascade)
@@ -121,6 +136,20 @@ model Scene {
   /// "scene → source paragraphs" without duplicating ranges in code.
   scriptStartLine             Int?
   scriptEndLine               Int?
+  /// Dramaturgical role of this scene in the 5-act / Freytag structure.
+  /// Free-form per project — typical values: "setup" | "rising" | "midpoint"
+  /// | "climax" | "resolution". Used by shotlist tools to enforce beat
+  /// distribution across the project.
+  actBeat                     String?
+  /// Default palette key for shots in this scene. Project-specific token
+  /// (e.g. "S01_sodium", "S04_dark_emerald"). Individual shots can override
+  /// via Shot.paletteKey; this is the inherited default for atmosphere
+  /// consistency across the scene.
+  defaultPaletteKey           String?
+  /// Default time-of-day for shots in this scene. Project-specific token
+  /// (e.g. "sunset_day1", "night_day2", "dawn_day2"). Shot.timeOfDay
+  /// overrides this when set.
+  defaultTimeOfDay            String?
   createdAt                   DateTime @default(now())
 
   project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -165,6 +194,44 @@ model Shot {
   /// TTSJob row doesn't cascade-null the shot state — UI just shows nothing
   /// approved if the id stops resolving. Mirrors Scene.approvedTTSJobId.
   approvedTTSJobId   String?
+  /// Camera framing for this shot. Canonical values: "EWS" | "WS" | "MS" |
+  /// "MCU" | "CU" | "ECU" | "OTS" | "BACK" | "POV". First-class column
+  /// (not promptFields jsonb) so quota-checking and shot-variety enforcement
+  /// can SQL-query distribution without parsing JSON. See [[feedback_shot_variety]].
+  shotType           String?
+  /// Camera angle. Canonical values: "eye" | "low" | "high" | "dutch".
+  cameraAngle        String?
+  /// Camera movement. Canonical values: "static" | "track_lateral" |
+  /// "push_in" | "pull_out" | "window_pov" | "locked_off" | "handheld".
+  cameraMove         String?
+  /// Dramaturgical beat this shot serves. Project-specific token, e.g.
+  /// "opening_image", "catalyst", "midpoint_twist", "all_is_lost",
+  /// "break_into_three", "final_image". Lets the shotlist tool verify every
+  /// shot earns its place in the plot.
+  storyBeat          String?
+  /// What this shot is doing narratively: "plot" | "character" | "atmosphere"
+  /// | "transition" | "iconic". Helps balance the act so atmosphere-only
+  /// shots don't crowd out plot-advancing ones.
+  narrativeFunction  String?
+  /// Which character/passenger vignette this shot belongs to. Free-form
+  /// slug per project (e.g. "military", "mother_baby", "child_girl",
+  /// "conductor"). Lets the shotlist verify each vignette gets its quota
+  /// of shots and that beats are spread inside the vignette.
+  vignetteSlug       String?
+  /// True if this shot has no main characters (pure exterior, object macro,
+  /// landscape). Used to enforce the ~15% B-roll quota that night_courier
+  /// lacked. Mutually compatible with isIconic.
+  isBroll            Boolean  @default(false)
+  /// True if this shot is intentionally designed to be screenshot-worthy —
+  /// composition, lighting and prop arrangement curated for thumbnail /
+  /// preview use. Project should target ~1 iconic frame per 20-25 shots.
+  isIconic           Boolean  @default(false)
+  /// Override of Scene.defaultTimeOfDay. Project-specific token. Null =
+  /// inherit from scene.
+  timeOfDay          String?
+  /// Override of Scene.defaultPaletteKey. Project-specific token. Null =
+  /// inherit from scene.
+  paletteKey         String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
@@ -177,6 +244,10 @@ model Shot {
 
   @@unique([projectId, shotCode])
   @@index([projectId, sceneId])
+  @@index([projectId, shotType])
+  @@index([projectId, vignetteSlug])
+  @@index([projectId, isBroll])
+  @@index([projectId, isIconic])
   @@map("shots")
 }
 

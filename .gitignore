@@ -20,6 +20,8 @@ data/*/scenes/
 data/*/bgm/
 # CapCut draft outputs (manifest.json + draft_content.json + copies).
 data/*/exports/
+# Final rendered videos (.mp4, often >100MB — over GitHub per-file limit).
+data/*/finish/
 
 # Python bytecode cache
 __pycache__/

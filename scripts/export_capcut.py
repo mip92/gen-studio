@@ -233,12 +233,25 @@ def build_draft(manifest: dict) -> Path:
     # dissolve into). Names are Chinese identifiers from
     # `pyJianYingDraft.TransitionType` — looked up via getattr because the
     # enum members aren't valid Python attribute names without it.
+    # All five must be is_vip=False AND is_overlap=False — anything VIP
+    # silently fails to render without CapCut Pro, and is_overlap=True
+    # transitions need the next segment to actually overlap on the timeline
+    # (which we don't do; clips are laid back-to-back). Failed picks from
+    # the previous iteration: 闪屏故障 (VIP), 叠加 (overlap), 模糊放大 (VIP),
+    # 旋焦 (VIP) — all four "inserted but invisible" in CapCut.
+    # Final curated set picked by the user after auditioning all 38 free
+    # transitions. Grouped by character: fade → camera moves → directional
+    # slides → glitch accent. All non-VIP, all is_overlap=False, all render
+    # without CapCut Pro.
     TRANSITION_CYCLE = [
-        '闪黑',        # чёрное затухание       — flash black / fade to black
-        '闪屏故障',     # разрыв-вспышка         — screen-glitch flash
-        '叠加',        # контрастное наложение  — overlay
-        '模糊放大',     # пульсирующее размытие  — blur zoom
-        '旋焦',        # вспышка с поворотом    — spin focus
+        '闪黑',   # Black Fade   — затухание в чёрный
+        '推近',   # Push In      — наезд камеры
+        '拉远',   # Pull Out     — отъезд камеры
+        '向上',   # Slide Up     — сдвиг вверх
+        '向下',   # Slide Down   — сдвиг вниз
+        '向左',   # Slide Left   — сдвиг влево
+        '向右',   # Slide Right  — сдвиг вправо
+        '故障',   # Glitch       — цифровой глитч-срыв
     ]
     TRANSITION_DURATION_US = 600_000   # 0.6s — short enough to stay invisible
     successful_transitions = 0
@@ -259,6 +272,9 @@ def build_draft(manifest: dict) -> Path:
             # the draft's materials dict, and CapCut silently drops it.
             if seg.transition is not None and seg.transition not in script.materials:
                 script.materials.transitions.append(seg.transition)
+            # Map shot-boundary index to transition name so the user can match
+            # "I liked the transition between shot 23 and 24" → name.
+            _log(f'transition shot{i:>3}->shot{i+1:<3} {name}')
             successful_transitions += 1
         except Exception as e:  # noqa: BLE001
             _log(f'add_transition failed at boundary {i} ({name}): {e!r}')
