@@ -21,8 +21,18 @@ const SHOT_FULL_INCLUDE = {
       profile:   true,
     },
   },
-  scene: true,
-} as const;
+  scene:   true,
+  project: { select: { id: true, slug: true, name: true } },
+  // Used by the Telegram bot's approval flow and the videos tab — full list
+  // of completed/in-flight VideoRender rows for this shot. No `orderBy as
+  // const` because Prisma's input-types reject it under TypeScript strict.
+  videoRenders: {
+    select: {
+      id: true, status: true, outputFilename: true,
+      upscaleStatus: true, upscaledFilename: true,
+    },
+  },
+};
 
 @Injectable()
 export class ShotsService {

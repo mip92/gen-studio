@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { Bot } from 'grammy';
 import { registerQueueHandlers } from './handlers/queue';
+import { registerActionsHandlers } from './handlers/actions';
 
 const token   = process.env.TELEGRAM_BOT_TOKEN;
 const ownerId = Number(process.env.TELEGRAM_ALLOWED_USER_ID);
@@ -27,11 +28,13 @@ bot.use(async (ctx, next) => {
 bot.command('start', (ctx) =>
   ctx.reply(
     'gen-studio bot. Commands:\n' +
-    '• /queue — current queue (filterable)',
+    '• /queue — current queue (filterable)\n' +
+    '• /actions — pending pipeline gates + image/video approval from phone',
   ),
 );
 
 registerQueueHandlers(bot);
+registerActionsHandlers(bot);
 
 bot.catch((err) => {
   console.error('[bot] unhandled error in handler:', err);
