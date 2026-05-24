@@ -337,10 +337,16 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     const HARDCODED_DEFAULT = 'subtle camera push-in, gentle breathing motion, natural micro-movements';
 
     const userMotion = motion?.trim() ?? '';
+    // Per-shot baked motion-direction override. Wins over project-level
+    // static/non-static fallback so shots like "static aerial of moving train"
+    // can express "camera locked but subject moves" without abusing the
+    // camera.movement field. Per-render `motion` arg still wins over this
+    // (the user typed something at queue time).
+    const shotMotion = typeof pf.motionPrompt === 'string' ? pf.motionPrompt.trim() : '';
     const projectFallback = isStatic
       ? (project?.defaultStaticMotionPrompt?.trim() || HARDCODED_STATIC)
       : (project?.defaultMotionPrompt?.trim()       || HARDCODED_DEFAULT);
-    const motionLine = userMotion || projectFallback;
+    const motionLine = userMotion || shotMotion || projectFallback;
 
     const beat = typeof pf.narrativeBeat === 'string' ? pf.narrativeBeat : '';
     const parts = isStatic
