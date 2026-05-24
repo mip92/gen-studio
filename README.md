@@ -3,6 +3,10 @@
 NestJS API that orchestrates ComfyUI generation jobs for character training datasets.
 One project can contain multiple characters, each with multiple age/mood profiles.
 
+> 🛑 **AI agents and contributors — read [`AGENTS.md`](AGENTS.md) first.**
+> Hard rules: never edit `data/<slug>/comfy/*.json` workflow templates, all
+> prompt content lives in the DB, all GPU jobs go through PipelineQueueService.
+
 > 📖 **Starting a new film project? Read [`docs/PROJECT_CREATION_GUIDE.md`](docs/PROJECT_CREATION_GUIDE.md)** —
 > covers concept → DB seed → LoRA training → render pipeline. Distilled from
 > `night_courier` (lessons) and `last_shift` (current best practice).

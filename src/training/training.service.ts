@@ -5,7 +5,8 @@ import { PrismaService } from '../prisma/prisma.service';
 import { DatasetService } from './dataset.service';
 import { TrainerService } from './trainer.service';
 import { EngineService } from '../pipeline/engine.service';
-import { scanLoraVariants, loraOutputDir, loraOutputName } from './lora-variants.util';
+import { scanLoraVariants, loraOutputName } from './lora-variants.util';
+import { datasetRootFor, loraOutputDirFor } from './character-paths.util';
 import { parseStepSamples, tailFile, readUpTo, decimate, TrainStepSample } from './train-log.util';
 
 const APP_ROOT      = process.env.APP_ROOT      ?? path.resolve(__dirname, '..', '..', '..');
@@ -211,14 +212,18 @@ export class TrainingService {
       networkDim:   typeof snap.networkDim === 'number' ? snap.networkDim : 32,
     };
 
-    const project = profile.character.project;
-    const outputDir = loraOutputDir(project.slug);
+    // Phase 2: library characters (character.project === null) use
+    // data/_characters/<charCode>/<profileCode>/datasets and
+    // models/loras/gen-studio/_characters/<charCode>/ instead of the legacy
+    // project-bound paths. Path helpers handle both layouts uniformly.
+    const outputDir = loraOutputDirFor(profile);
+    const datasetRoot = datasetRootFor(profile);
     const outputName = loraOutputName(profile.profileCode);
 
     try {
       await this.update(jobId, { status: 'preparing', startedAt: new Date() });
       const prepared = this.dataset.prepare({
-        projectSlug:    project.slug,
+        datasetRoot,
         profileCode:    profile.profileCode,
         filenamePrefix: profile.profileCode,
         triggerToken:   cfg.triggerToken,

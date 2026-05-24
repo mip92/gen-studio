@@ -1,5 +1,7 @@
 import { Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Res } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+import { IsArray, IsOptional, IsString, IsUUID, ValidateNested } from 'class-validator';
 import { Response } from 'express';
 import { createReadStream, statSync } from 'fs';
 import * as path from 'path';
@@ -8,12 +10,19 @@ import { CreateShotDto } from './dto/create-shot.dto';
 import { UpdateShotDto } from './dto/update-shot.dto';
 import { SceneRenderService } from '../generation/scenes/scene-render.service';
 
-interface ParticipantInput {
-  label:        string;
+class ParticipantInput {
+  @IsString()
+  label!: string;
+
+  @IsOptional() @IsUUID()
   characterId?: string | null;
+
+  @IsOptional() @IsUUID()
+  profileId?: string | null;
 }
 
 class UpdateShotBody extends UpdateShotDto {
+  @IsOptional() @IsArray() @ValidateNested({ each: true }) @Type(() => ParticipantInput)
   participants?: ParticipantInput[];
 }
 

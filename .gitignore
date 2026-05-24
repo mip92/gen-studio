@@ -14,6 +14,10 @@ data/*/characters/
 data/*/datasets/
 data/*/reference/
 data/*/shots/
+# Phase 2 library-character layout — same heavy artifacts under a different
+# folder shape (data/_characters/<charCode>/<profileCode>/{reference,datasets}/).
+data/_characters/*/*/reference/
+data/_characters/*/*/datasets/
 # Generated TTS narration audio (large wavs, regenerated on demand).
 data/*/scenes/
 # Generated ACE-Step BGM audio (flacs ~5–30 MB each, regenerated on demand).

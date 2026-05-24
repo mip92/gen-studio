@@ -4,7 +4,9 @@ import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCharacterDto } from './dto/create-character.dto';
 import { CreateProfileDto } from './dto/create-profile.dto';
-import { scanLoraVariants, loraOutputDir, loraOutputName, LoraVariant } from '../training/lora-variants.util';
+import { scanLoraVariants, loraOutputName, LoraVariant } from '../training/lora-variants.util';
+import { loraOutputDirFor } from '../training/character-paths.util';
+import { DatasetService } from '../training/dataset.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..');
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
@@ -19,21 +21,100 @@ interface CreateCharacterWithProfile extends CreateCharacterDto {
 export class CharactersService {
   private readonly logger = new Logger(CharactersService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma:  PrismaService,
+    private readonly dataset: DatasetService,
+  ) {}
+
+  /**
+   * Returns the per-profile readiness summary the character pages need.
+   * Same shape as one element of the project dashboard's `profiles` array,
+   * but scoped to a single profile and **completely project-independent** —
+   * persona pages don't need to know which projects (if any) attached the
+   * character.
+   */
+  async profileSummary(profileId: string) {
+    const profile = await this.prisma.characterProfile.findUnique({
+      where: { id: profileId },
+      include: {
+        character:    true,
+        datasetJobs:  { orderBy: { queuedAt:  'desc' }, take: 1 },
+        trainingJobs: { orderBy: { createdAt: 'desc' }, take: 1 },
+      },
+    });
+    if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
+
+    const images       = this.dataset.listImages(profile.profileCode);
+    const lastDsJob    = profile.datasetJobs[0]    ?? null;
+    const lastTrainJob = profile.trainingJobs[0]   ?? null;
+    const loraReady    = !!profile.loraPath && existsSync(profile.loraPath);
+
+    let phase: 'idle' | 'queued' | 'generating' | 'has_dataset' | 'training' | 'ready' = 'idle';
+    if (loraReady)                                                                phase = 'ready';
+    else if (lastTrainJob && lastTrainJob.status === 'training')                  phase = 'training';
+    else if (lastTrainJob && lastTrainJob.status === 'preparing')                 phase = 'training';
+    else if (lastTrainJob && lastTrainJob.status === 'captioning')                phase = 'training';
+    else if (lastDsJob && (lastDsJob.status === 'pending' || lastDsJob.status === 'blocked')) phase = 'queued';
+    else if (lastDsJob && lastDsJob.status === 'running')                         phase = 'generating';
+    else if (images.length > 0)                                                   phase = 'has_dataset';
+
+    return {
+      profileId:     profile.id,
+      characterId:   profile.characterId,
+      characterCode: profile.character.code,
+      displayName:   profile.character.displayName,
+      profileCode:   profile.profileCode,
+      ageLabel:      profile.ageLabel,
+      targetImages:  profile.targetImages,
+      triggerToken:  profile.triggerToken,
+      datasetCount:  images.length,
+      loraReady,
+      loraPath:      profile.loraPath,
+      loraSizeMB:    loraReady ? Math.round(statSync(profile.loraPath!).size / 1_000_000) : null,
+      phase,
+      lastDatasetJob: lastDsJob && {
+        id: lastDsJob.id, status: lastDsJob.status,
+        dependsOnProfileId: lastDsJob.dependsOnProfileId,
+        referenceProfileId: lastDsJob.referenceProfileId,
+        error: lastDsJob.errorMessage,
+        queuedAt: lastDsJob.queuedAt,
+      },
+      lastTrainingJob: lastTrainJob && {
+        id: lastTrainJob.id, status: lastTrainJob.status,
+        error: lastTrainJob.errorMessage,
+        startedAt: lastTrainJob.startedAt,
+        completedAt: lastTrainJob.completedAt,
+      },
+    };
+  }
 
   // ── Characters ──────────────────────────────────────────────────────────
 
-  findAll(projectId: string) {
+  /**
+   * List characters attached to a project. Reads through `project_characters`
+   * (the M:N join introduced in the character library refactor) so library
+   * characters attached via /attach show up alongside the legacy ones that
+   * have `Character.projectId` set. After the Phase 1 migration every existing
+   * row has a join entry, so the result matches the pre-refactor behaviour.
+   */
+  findAll(projectIdOrSlug: string) {
     return this.prisma.character.findMany({
-      where: { OR: [{ projectId }, { project: { slug: projectId } }] },
+      where: {
+        projectLinks: {
+          some: {
+            project: { OR: [{ id: projectIdOrSlug }, { slug: projectIdOrSlug }] },
+          },
+        },
+      },
       include: { profiles: true },
       orderBy: { createdAt: 'asc' },
     });
   }
 
   /**
-   * Create a character. Accepts project id OR slug as the first arg.
-   * Optionally creates a first profile in the same transaction.
+   * Create a character bound to a specific project (legacy behaviour). Sets
+   * both `Character.projectId` AND inserts a `project_characters` join row so
+   * the new library-aware queries see it. Optionally creates a first profile.
    */
   async create(projectIdOrSlug: string, data: CreateCharacterWithProfile) {
     const project = await this.prisma.project.findFirst({
@@ -51,6 +132,43 @@ export class CharactersService {
         projectId:   project.id,
         code:        data.code,
         displayName: data.displayName,
+        projectLinks: { create: [{ projectId: project.id }] },
+        profiles: data.profile ? {
+          create: [{
+            profileCode:   data.profile.profileCode,
+            promptBase:    data.profile.promptBase,
+            negative:      data.profile.negative,
+            ageLabel:      data.profile.ageLabel,
+            targetImages:  data.profile.targetImages ?? 60,
+            promptAngles:  data.profile.promptAngles,
+            promptVariety: data.profile.promptVariety,
+            triggerToken:  data.profile.triggerToken,
+          }],
+        } : undefined,
+      },
+      include: { profiles: true, projectLinks: true },
+    });
+  }
+
+  // ── Library (project-independent) ───────────────────────────────────────
+
+  /**
+   * Create a character in the global library (no `projectId`). The character
+   * starts unattached; callers can `attach` it to any number of projects.
+   * Library codes have their own partial unique index so two library chars
+   * can't share a `code` even though project-bound rows reuse the same scope.
+   */
+  async createLibrary(data: CreateCharacterWithProfile) {
+    const dup = await this.prisma.character.findFirst({
+      where: { projectId: null, code: data.code },
+    });
+    if (dup) throw new BadRequestException(`Library character code "${data.code}" already exists`);
+
+    return this.prisma.character.create({
+      data: {
+        projectId:   null,
+        code:        data.code,
+        displayName: data.displayName,
         profiles: data.profile ? {
           create: [{
             profileCode:   data.profile.profileCode,
@@ -66,6 +184,60 @@ export class CharactersService {
       },
       include: { profiles: true },
     });
+  }
+
+  /**
+   * List every character in the system. Each row carries its `attachedProjects`
+   * so the picker UI can show "in 3 projects" / "library only".
+   */
+  async listLibrary() {
+    return this.prisma.character.findMany({
+      include: {
+        profiles:     true,
+        projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+      },
+      orderBy: { code: 'asc' },
+    });
+  }
+
+  /**
+   * Attach an existing character (library or already in other projects) to a
+   * project. Idempotent — re-attaching is a no-op.
+   */
+  async attach(projectIdOrSlug: string, characterId: string) {
+    const project = await this.prisma.project.findFirst({
+      where: { OR: [{ id: projectIdOrSlug }, { slug: projectIdOrSlug }] },
+    });
+    if (!project) throw new NotFoundException(`Project "${projectIdOrSlug}" not found`);
+
+    const character = await this.prisma.character.findUnique({ where: { id: characterId } });
+    if (!character) throw new NotFoundException(`Character ${characterId} not found`);
+
+    await this.prisma.projectCharacter.upsert({
+      where:  { projectId_characterId: { projectId: project.id, characterId } },
+      create: { projectId: project.id, characterId },
+      update: {},
+    });
+
+    return { projectId: project.id, characterId, code: character.code };
+  }
+
+  /**
+   * Detach a character from a project. Removes only the `project_characters`
+   * row — the character itself stays in the library and remains attached to
+   * its other projects. Use `remove` for full deletion.
+   */
+  async detach(projectIdOrSlug: string, characterId: string) {
+    const project = await this.prisma.project.findFirst({
+      where: { OR: [{ id: projectIdOrSlug }, { slug: projectIdOrSlug }] },
+    });
+    if (!project) throw new NotFoundException(`Project "${projectIdOrSlug}" not found`);
+
+    await this.prisma.projectCharacter.deleteMany({
+      where: { projectId: project.id, characterId },
+    });
+
+    return { projectId: project.id, characterId };
   }
 
   async addProfile(characterId: string, dto: CreateProfileDto) {
@@ -92,13 +264,28 @@ export class CharactersService {
     });
   }
 
-  async findOne(projectId: string, characterId: string) {
+  async findOne(projectIdOrSlug: string, characterId: string) {
     const character = await this.prisma.character.findFirst({
       where: {
         id: characterId,
-        OR: [{ projectId }, { project: { slug: projectId } }],
+        projectLinks: {
+          some: { project: { OR: [{ id: projectIdOrSlug }, { slug: projectIdOrSlug }] } },
+        },
       },
       include: { profiles: true },
+    });
+    if (!character) throw new NotFoundException(`Character ${characterId} not found`);
+    return character;
+  }
+
+  /** Library lookup by character id (project scope independent). */
+  async findOneById(characterId: string) {
+    const character = await this.prisma.character.findUnique({
+      where:   { id: characterId },
+      include: {
+        profiles:     true,
+        projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+      },
     });
     if (!character) throw new NotFoundException(`Character ${characterId} not found`);
     return character;
@@ -160,6 +347,11 @@ export class CharactersService {
       include: { profiles: true, project: true },
     });
     if (!character) throw new NotFoundException(`Character ${characterId} not found`);
+    if (!character.project) {
+      throw new BadRequestException(
+        `Character ${character.code} has no creator project (library character). Use DELETE /library/characters/${characterId} once Phase 2 library deletion lands.`,
+      );
+    }
 
     const slug = character.project.slug;
     const profileCodes = character.profiles.map((p) => p.profileCode);
@@ -245,11 +437,25 @@ export class CharactersService {
     return profile;
   }
 
-  /** Standalone lookup by profileId only — for the frontend detail page. */
+  /** Standalone lookup by profileId only — for the frontend detail page.
+   * Returns the character's legacy "creator project" AND the live
+   * `projectLinks` (M:N attachments) so the UI can pick a project context
+   * even for library-only characters where `character.projectId` is null.
+   * Both project shapes are projected to (id, slug, name) only — `scriptText`
+   * and other heavy fields stay on the project endpoint where they belong. */
   async findProfileById(profileId: string) {
     const profile = await this.prisma.characterProfile.findUnique({
       where:   { id: profileId },
-      include: { character: { include: { project: true } } },
+      include: {
+        character: {
+          include: {
+            project:      { select: { id: true, slug: true, name: true } },
+            projectLinks: {
+              include: { project: { select: { id: true, slug: true, name: true } } },
+            },
+          },
+        },
+      },
     });
     if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
     return profile;
@@ -279,8 +485,11 @@ export class CharactersService {
     });
     if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
 
-    const slug = profile.character.project.slug;
-    const variants = scanLoraVariants(loraOutputDir(slug), loraOutputName(profile.profileCode));
+    // Phase 2: library characters resolve their LoRA dir via the path helper
+    // (models/loras/gen-studio/_characters/<charCode>/) instead of the legacy
+    // project-bound path.
+    const outDir = loraOutputDirFor(profile);
+    const variants = scanLoraVariants(outDir, loraOutputName(profile.profileCode));
 
     // Refresh the cached list. If the active path no longer exists on disk,
     // null it out so the UI doesn't keep claiming a missing LoRA is ready.
@@ -312,10 +521,10 @@ export class CharactersService {
     });
     if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
 
-    const slug = profile.character.project.slug;
-    const variants = scanLoraVariants(loraOutputDir(slug), loraOutputName(profile.profileCode));
+    const outDir = loraOutputDirFor(profile);
+    const variants = scanLoraVariants(outDir, loraOutputName(profile.profileCode));
     const target = variants.find((v) => v.filename === filename);
-    if (!target) throw new NotFoundException(`LoRA file "${filename}" not found in ${loraOutputDir(slug)}`);
+    if (!target) throw new NotFoundException(`LoRA file "${filename}" not found in ${outDir}`);
 
     return this.prisma.characterProfile.update({
       where: { id: profileId },
@@ -335,8 +544,7 @@ export class CharactersService {
     });
     if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
 
-    const slug = profile.character.project.slug;
-    const dir  = loraOutputDir(slug);
+    const dir  = loraOutputDirFor(profile);
     const variants = scanLoraVariants(dir, loraOutputName(profile.profileCode));
     const target = variants.find((v) => v.filename === filename);
     if (!target) throw new NotFoundException(`LoRA file "${filename}" not found in ${dir}`);

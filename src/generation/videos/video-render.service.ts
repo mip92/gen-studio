@@ -144,9 +144,20 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     try {
       const params = v.params as { seed: number; width: number; height: number; length: number; fps: number };
       const template = this.loadTemplate(v.shot.project.slug);
+      // Resolve motion negative from DB: per-shot override > project default.
+      // When both empty, the workflow JSON's hardcoded fallback stays.
+      const pf      = (v.shot.promptFields ?? {}) as Record<string, unknown>;
+      const project = v.shot.project as any;
+      const motionNegative =
+        (typeof pf.motionNegative === 'string' && pf.motionNegative.trim().length > 0)
+          ? (pf.motionNegative as string)
+          : (typeof project.defaultVideoNegative === 'string' && project.defaultVideoNegative.trim().length > 0
+              ? project.defaultVideoNegative as string
+              : undefined);
       const workflow = this.patch(template, {
         sourceImage:    inputBasename,
-        motionPrompt:   this.composeMotionPrompt(v.motionPrompt, v.shot),
+        motionPrompt:   this.composeMotionPrompt(v.motionPrompt, v.shot, project),
+        motionNegative,
         seed:           params.seed,
         width:          params.width,
         height:         params.height,
@@ -257,6 +268,10 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   private patch(template: Record<string, any>, p: {
     sourceImage:    string;
     motionPrompt:   string;
+    /** Optional override for node 10 (negative). When undefined, the workflow
+     *  JSON's hardcoded fallback stays. Resolved from
+     *  `Shot.promptFields.motionNegative || Project.defaultVideoNegative`. */
+    motionNegative?: string;
     seed:           number;
     width:          number;
     height:         number;
@@ -276,8 +291,11 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     set('13', 'height', p.height);
     set('13', 'length', p.length);
 
-    // Positive prompt is on node 9.
+    // Positive prompt is on node 9; negative on node 10. Negative only set
+    // when the caller provides one (per-shot or per-project DB value) — when
+    // undefined the JSON's hardcoded text stays.
     set('9',  'text',   p.motionPrompt);
+    if (p.motionNegative !== undefined) set('10', 'text', p.motionNegative);
 
     // Both KSampler stages need the same seed (14 = high-noise stage, 15 = low-noise).
     set('14', 'noise_seed', p.seed);
@@ -301,17 +319,28 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
    * beats like "a wheel in a skid is an abstraction" leak motion verbs into
    * Wan2.2 and force the model to add skidding/push-in even on a locked-off shot.
    */
-  private composeMotionPrompt(motion: string, shot: { promptFields: any }): string {
+  private composeMotionPrompt(
+    motion: string,
+    shot: { promptFields: any },
+    project?: { defaultMotionPrompt?: string | null; defaultStaticMotionPrompt?: string | null },
+  ): string {
     const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
     const cam = (pf.camera as Record<string, unknown> | undefined) ?? {};
     const movement = typeof cam.movement === 'string' ? cam.movement : '';
     const isStatic = /^static/i.test(movement.trim());
 
+    // Hard-coded last-resort fallback used only if BOTH the per-render motion
+    // prompt AND the project's default are empty. Project owners should
+    // override via `Project.defaultMotionPrompt` /
+    // `Project.defaultStaticMotionPrompt` from the UI.
+    const HARDCODED_STATIC  = 'completely static shot, frozen frame, locked-off tripod camera, no camera motion, no parallax, no zoom, no pan, no dolly, no handheld shake. Every object in frame remains completely stationary. No people walking, no figures moving, no environmental motion, no wind, no leaves moving, no flickering lights. The entire scene is a still photograph come to life with zero motion, freeze frame.';
+    const HARDCODED_DEFAULT = 'subtle camera push-in, gentle breathing motion, natural micro-movements';
+
     const userMotion = motion?.trim() ?? '';
-    const motionLine = userMotion
-      || (isStatic
-            ? 'completely static shot, frozen frame, locked-off tripod camera, no camera motion, no parallax, no zoom, no pan, no dolly, no handheld shake. Every object in frame remains completely stationary. All vehicles in frame are parked and frozen in place — no wheels turning, no cars rolling, no cars driving, no skidding in progress, no headlights moving, no exhaust, no smoke trail, no tire smoke. No people walking, no figures moving, no environmental motion, no wind, no leaves moving, no flickering lights. The entire scene is a still photograph come to life with zero motion, freeze frame.'
-            : 'subtle camera push-in, gentle breathing motion, natural micro-movements');
+    const projectFallback = isStatic
+      ? (project?.defaultStaticMotionPrompt?.trim() || HARDCODED_STATIC)
+      : (project?.defaultMotionPrompt?.trim()       || HARDCODED_DEFAULT);
+    const motionLine = userMotion || projectFallback;
 
     const beat = typeof pf.narrativeBeat === 'string' ? pf.narrativeBeat : '';
     const parts = isStatic

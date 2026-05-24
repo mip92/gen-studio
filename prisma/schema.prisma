@@ -28,12 +28,37 @@ model Project {
   /// filtering. Default null = unrestricted. Applied by shotlist generator
   /// and prompt sanitizer.
   safetyTier String?
+  /// Canonical negative prompt for every shot in this project. SDXL accepts it
+  /// verbatim. Single source of truth — `Shot.promptFields.negative` is treated
+  /// as a per-shot override; if absent or empty the renderer reads this value.
+  /// Lets editing happen in one place instead of touching all shots.
+  ///
+  /// **Required** (NOT NULL + CHECK non-empty) — every project must define its
+  /// own. See AGENTS.md §1, §6.
+  defaultNegative String
+  /// Canonical negative prompt for the i2v / video model (Wan2.2 etc.). Same
+  /// fallback chain as `defaultNegative` but for video render workflows.
+  /// Per-shot override lives in `Shot.promptFields.motionNegative`.
+  /// **Required** (NOT NULL + CHECK non-empty).
+  defaultVideoNegative String
+  /// Default motion-prompt text used when a video render has no explicit
+  /// motion prompt and the shot is NOT marked static. Per-shot override:
+  /// `Shot.promptFields.motionPrompt`.
+  /// **Required** (NOT NULL + CHECK non-empty).
+  defaultMotionPrompt String
+  /// Default motion-prompt text used when a video render has no explicit
+  /// motion prompt AND `Shot.promptFields.camera.movement` starts with
+  /// "static". Should be a strong "freeze frame, no motion" directive.
+  /// **Required** (NOT NULL + CHECK non-empty).
+  defaultStaticMotionPrompt String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   characters        Character[]
+  characterLinks    ProjectCharacter[]
   scenes            Scene[]
   shots             Shot[]
+  locations         Location[]
   workflowTemplates WorkflowTemplate[]
   workflowRoutes    WorkflowRoute[]
   referenceAssets   ReferenceAsset[]
@@ -46,17 +71,45 @@ model Project {
 
 model Character {
   id          String   @id @default(uuid())
-  projectId   String
+  /// Legacy "creator project" reference. Null = library character (no creator project).
+  /// Project participation is the source of truth via the `project_characters` join (see ProjectCharacter).
+  /// Phase 2 will drop this column once existing characters are migrated to the library FS layout
+  /// (`data/_characters/<code>/<profileCode>/...`) and all legacy `data/<slug>/datasets/<code>/`
+  /// paths are repointed.
+  projectId   String?
   code        String
   displayName String?
   createdAt   DateTime @default(now())
 
-  project          Project            @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  /// Legacy back-reference to the "creator project". onDelete: SetNull so that
+  /// deleting a project leaves library characters orphaned rather than cascade-deleted.
+  /// Real project membership lives in `project_characters`.
+  project          Project?           @relation(fields: [projectId], references: [id], onDelete: SetNull)
   profiles         CharacterProfile[]
   shotParticipants ShotParticipant[]
+  /// M:N to projects. A character can be attached to any number of projects.
+  projectLinks     ProjectCharacter[]
+  referenceAssets  ReferenceAsset[]
 
   @@unique([projectId, code])
   @@map("characters")
+}
+
+/// Many-to-many join: which projects a character is attached to. A character
+/// can live in the library (no rows here) or be attached to one or more
+/// projects. Replacing the old "Character.projectId" hard-binding so projects
+/// can share LoRAs / datasets.
+model ProjectCharacter {
+  projectId   String
+  characterId String
+  attachedAt  DateTime @default(now())
+
+  project   Project   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  character Character @relation(fields: [characterId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, characterId])
+  @@index([characterId])
+  @@map("project_characters")
 }
 
 model CharacterProfile {
@@ -100,15 +153,23 @@ model CharacterProfile {
 
 model ReferenceAsset {
   id          String   @id @default(uuid())
-  projectId   String
+  /// Legacy project scope. Null = library asset (owned by character). Kept nullable for Phase 1 backwards compat;
+  /// Phase 2 will drop this and `profileCode` once all rows have `characterId` populated.
+  projectId   String?
+  /// Legacy soft-deprecated profile code key. Use `characterId` as the canonical owner going forward.
   profileCode String
+  /// Canonical owner of the reference asset. Backfilled from (projectId, profileCode → profile → character).
+  /// Library assets must have this set.
+  characterId String?
   path        String
   sortOrder   Int      @default(0)
   createdAt   DateTime @default(now())
 
-  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project   Project?   @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  character Character? @relation(fields: [characterId], references: [id], onDelete: Cascade)
 
   @@index([projectId, profileCode])
+  @@index([characterId])
   @@map("reference_assets")
 }
 
@@ -150,6 +211,12 @@ model Scene {
   /// (e.g. "sunset_day1", "night_day2", "dawn_day2"). Shot.timeOfDay
   /// overrides this when set.
   defaultTimeOfDay            String?
+  /// Single canonical lighting-tokens string for every shot in this scene
+  /// (e.g. "warm tungsten corridor lamps, deep indigo night windows, soft
+  /// falloff, sleep silence"). Source of truth for atmosphere lighting —
+  /// `Shot.promptFields.lightingMood` is a per-shot override that the renderer
+  /// reads first and falls back to this scene-level value when absent.
+  lightingMood                String?
   createdAt                   DateTime @default(now())
 
   project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -232,11 +299,18 @@ model Shot {
   /// Override of Scene.defaultPaletteKey. Project-specific token. Null =
   /// inherit from scene.
   paletteKey         String?
+  /// FK to the Location row whose `description` gets prepended into the
+  /// shot's positive prompt at render time. Null = no location injection
+  /// (use raw promptFields.positive verbatim). Set per-shot so a single
+  /// canonical "interior of cramped Soviet train kupe" description can be
+  /// reused by 90% of shots without duplicating prose in every promptFields.
+  locationId         String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
   project      Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
   scene        Scene             @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  location     Location?         @relation(fields: [locationId], references: [id], onDelete: SetNull)
   participants ShotParticipant[]
   renderJobs   SceneRenderJob[]
   videoRenders VideoRender[]
@@ -248,7 +322,35 @@ model Shot {
   @@index([projectId, vignetteSlug])
   @@index([projectId, isBroll])
   @@index([projectId, isIconic])
+  @@index([locationId])
   @@map("shots")
+}
+
+/// Reusable location description per project. One row per setting
+/// (train kupe, train corridor, train vestibule, station platform, snow
+/// field, etc.). The `description` is rich prose that gets prepended into
+/// the rendered positive prompt for any shot tagged with this location.
+/// Edit once → every shot using this location updates.
+model Location {
+  id          String   @id @default(uuid())
+  projectId   String
+  slug        String
+  name        String
+  /// SDXL-ready prose, e.g. "interior of cramped narrow old Soviet
+  /// long-distance passenger train kupe compartment, very tight space, two
+  /// narrow lower berths and two narrow upper berths only (NO double beds),
+  /// painted wood-and-frosted-glass door, single small window with curtain,
+  /// indigo night outside, warm tungsten reading lamp, NOT outside, NOT at
+  /// a platform, NOT in an apartment". Prepended to shot positive prompts.
+  description String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  shots   Shot[]
+
+  @@unique([projectId, slug])
+  @@map("locations")
 }
 
 model ShotParticipant {

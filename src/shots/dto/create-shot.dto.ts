@@ -25,4 +25,9 @@ export class CreateShotDto {
   @IsString({ each: true })
   @IsOptional()
   referenceImagePool?: string[];
+
+  /** FK to a Location row (locations.id). Renderer prepends location.description. */
+  @IsOptional()
+  @IsUUID()
+  locationId?: string | null;
 }

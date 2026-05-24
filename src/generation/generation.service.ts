@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { existsSync, copyFileSync, readdirSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
@@ -43,24 +43,49 @@ export class GenerationService {
     // ── Load profile → character → project ──────────────────────────────────
     const profile = await this.prisma.characterProfile.findUnique({
       where: { id: profileId },
-      include: { character: { include: { project: true } } },
+      include: {
+        character: {
+          include: {
+            project: true,
+            // Phase 2: library characters borrow workflow/settings from one of
+            // their attached projects.
+            projectLinks: { include: { project: true } },
+          },
+        },
+      },
     });
     if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
 
     const character = profile.character;
     const project   = character.project;
-    const settings  = (project.settings ?? {}) as ProjectSettings;
+    // For library chars borrow the first attached project (alphabetical by slug
+    // for determinism) — used purely as a source of workflow template + settings.
+    const templateProject = project ?? character.projectLinks
+      .map((pl) => pl.project)
+      .sort((a, b) => a.slug.localeCompare(b.slug))[0];
+    if (!templateProject) {
+      throw new BadRequestException(
+        `Library character ${character.code} has no attached project — attach it to a project ` +
+        `before generation so the workflow template can be borrowed.`,
+      );
+    }
+    const settings  = (templateProject.settings ?? {}) as ProjectSettings;
 
     // ── Select workflow strategy ─────────────────────────────────────────────
     const workflowId = settings.workflowId ?? DEFAULT_WORKFLOW_ID;
     const strategy   = this.workflows.get(workflowId);
-    const template   = this.workflows.loadTemplate(strategy, project.slug);
+    const template   = this.workflows.loadTemplate(strategy, templateProject.slug);
 
     // ── Resolve reference image ──────────────────────────────────────────────
-    // Standard layout: data/<projectSlug>/reference/<profileCode>/reference.<ext>
-    // Legacy layout (UUID-based) is also checked for backward compat.
-    const refDirNew    = path.join(APP_ROOT, 'data', project.slug, 'reference', profile.profileCode);
-    const refDirLegacy = path.join(APP_ROOT, 'projects', project.id, 'characters', character.id, profileId);
+    // Project-bound: data/<projectSlug>/reference/<profileCode>/reference.<ext>
+    // Library:       data/_characters/<charCode>/<profileCode>/reference/reference.<ext>
+    // Legacy UUID layout is also checked for project-bound chars (backward compat).
+    const refDirNew    = project
+      ? path.join(APP_ROOT, 'data', project.slug, 'reference', profile.profileCode)
+      : path.join(APP_ROOT, 'data', '_characters', character.code, profile.profileCode, 'reference');
+    const refDirLegacy = project
+      ? path.join(APP_ROOT, 'projects', project.id, 'characters', character.id, profileId)
+      : refDirNew;
     const referenceImage = findReferenceImage(refDirNew) ?? findReferenceImage(refDirLegacy);
 
     let comfyImageFilename: string | null = null;

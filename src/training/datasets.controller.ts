@@ -15,6 +15,37 @@ import { DatasetService } from './dataset.service';
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..');
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 
+/**
+ * Resolve the on-disk reference dir for a profile. Two layouts coexist
+ * during the character-library refactor:
+ *  - Legacy (project-bound): data/<projectSlug>/reference/<profileCode>/
+ *  - Library:                data/_characters/<characterCode>/<profileCode>/reference/
+ *
+ * The profile object must come from a query that includes character + project,
+ * e.g. `include: { character: { include: { project: true } } }`. Library
+ * characters return null for `character.project`, which is the cue to fall
+ * through to the library path.
+ */
+function referenceDirFor(profile: {
+  profileCode: string;
+  character: { code: string; project: { slug: string } | null };
+}): string {
+  if (profile.character.project) {
+    return path.join(APP_ROOT, 'data', profile.character.project.slug, 'reference', profile.profileCode);
+  }
+  return path.join(APP_ROOT, 'data', '_characters', profile.character.code, profile.profileCode, 'reference');
+}
+
+function pickReferenceFile(dir: string): { filename: string; fullPath: string } | null {
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) return null;
+  for (const f of readdirSync(dir)) {
+    if (path.parse(f).name === 'reference' && ALLOWED_REF_EXT.has(path.extname(f).toLowerCase())) {
+      return { filename: f, fullPath: path.join(dir, f) };
+    }
+  }
+  return null;
+}
+
 const REF_EXT_BY_MIME: Record<string, string> = {
   'image/png':  '.png',
   'image/jpeg': '.jpg',
@@ -145,9 +176,7 @@ export class DatasetsController {
     });
     if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
 
-    const refDir  = path.join(
-      APP_ROOT, 'data', profile.character.project.slug, 'reference', profile.profileCode,
-    );
+    const refDir = referenceDirFor(profile);
     mkdirSync(refDir, { recursive: true });
 
     // Wipe any previous reference.* so only the new one remains
@@ -183,19 +212,27 @@ export class DatasetsController {
   // ── Helpers ──────────────────────────────────────────────────────────────
 
   private findReference(profile: { profileCode: string; characterId: string }) {
-    // Synchronously walk reference dirs across projects until we find
-    // data/<slug>/reference/<profileCode>/reference.<ext>
-    // We can determine the slug via DB but to keep this fast we use the
-    // profileCode-folder convention and look across all projects.
+    // Walk every legacy project-bound reference dir AND every library-scoped
+    // dir under `_characters/`. The first match wins; library/project ordering
+    // doesn't matter because (profileCode, characterId) is globally unique
+    // post the persona-library refactor.
     const projectsRoot = path.join(APP_ROOT, 'data');
     if (!existsSync(projectsRoot)) return null;
     for (const slug of readdirSync(projectsRoot)) {
-      const dir = path.join(projectsRoot, slug, 'reference', profile.profileCode);
-      if (!existsSync(dir)) continue;
-      for (const f of readdirSync(dir)) {
-        if (path.parse(f).name === 'reference' && ALLOWED_REF_EXT.has(path.extname(f).toLowerCase())) {
-          return { filename: f, fullPath: path.join(dir, f) };
+      if (slug === '_characters') {
+        // Library layout: data/_characters/<charCode>/<profileCode>/reference/reference.<ext>
+        const libRoot = path.join(projectsRoot, slug);
+        if (!statSync(libRoot).isDirectory()) continue;
+        for (const charDir of readdirSync(libRoot)) {
+          const dir = path.join(libRoot, charDir, profile.profileCode, 'reference');
+          const hit = pickReferenceFile(dir);
+          if (hit) return hit;
         }
+      } else {
+        // Legacy layout: data/<projectSlug>/reference/<profileCode>/reference.<ext>
+        const dir = path.join(projectsRoot, slug, 'reference', profile.profileCode);
+        const hit = pickReferenceFile(dir);
+        if (hit) return hit;
       }
     }
     return null;

@@ -1,5 +1,6 @@
-import { Controller, Get, NotFoundException, Param } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Patch } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { IsOptional, IsString } from 'class-validator';
 import { existsSync, statSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
@@ -7,6 +8,11 @@ import { DatasetService } from '../training/dataset.service';
 import { probeWavDurationMs } from '../tts/wav-duration';
 
 const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
+
+class SetScriptBody {
+  @IsOptional() @IsString()
+  text?: string;
+}
 
 @ApiTags('Projects')
 @Controller('projects/:idOrSlug')
@@ -26,23 +32,33 @@ export class ProjectsDashboardController {
   async dashboard(@Param('idOrSlug') idOrSlug: string) {
     const project = await this.prisma.project.findFirst({
       where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
-      include: {
-        characters: {
-          include: {
-            profiles: {
-              include: {
-                datasetJobs:  { orderBy: { queuedAt:  'desc' }, take: 1 },
-                trainingJobs: { orderBy: { createdAt: 'desc' }, take: 1 },
-              },
-            },
-          },
-          orderBy: { createdAt: 'asc' },
-        },
-      },
     });
     if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
 
-    const profiles = project.characters.flatMap((c) =>
+    // Fetch characters attached via EITHER legacy `Character.projectId` OR the
+    // Phase 1 `ProjectCharacter` M:N join. Without the OR clause library
+    // characters (projectId=null, only attached via projectLinks) silently
+    // disappear from the dashboard — that's how PAX_STU was counted as
+    // "9/9 LoRAs ready" instead of "9/10".
+    const characters = await this.prisma.character.findMany({
+      where: {
+        OR: [
+          { projectId: project.id },
+          { projectLinks: { some: { projectId: project.id } } },
+        ],
+      },
+      include: {
+        profiles: {
+          include: {
+            datasetJobs:  { orderBy: { queuedAt:  'desc' }, take: 1 },
+            trainingJobs: { orderBy: { createdAt: 'desc' }, take: 1 },
+          },
+        },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const profiles = characters.flatMap((c) =>
       c.profiles.map((p) => {
         const images       = this.dataset.listImages(p.profileCode);
         const lastDsJob    = p.datasetJobs[0]    ?? null;
@@ -113,6 +129,185 @@ export class ProjectsDashboardController {
     });
     if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
     return { text: project.scriptText ?? null };
+  }
+
+  @Patch('script')
+  @ApiOperation({
+    summary: 'Write the project narration script (Project.scriptText)',
+    description: 'Pass `{text: "..."}` to overwrite. Empty string clears the field. '
+              + 'Replaces the previous "only SQL works" workaround.',
+  })
+  async setScript(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() body: SetScriptBody,
+  ) {
+    if (typeof body?.text !== 'string') {
+      throw new BadRequestException('Body must be {text: string}.');
+    }
+    const project = await this.prisma.project.findFirst({
+      where:  { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+      select: { id: true },
+    });
+    if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
+    const updated = await this.prisma.project.update({
+      where:  { id: project.id },
+      data:   { scriptText: body.text.length === 0 ? null : body.text },
+      select: { scriptText: true },
+    });
+    return { text: updated.scriptText ?? null };
+  }
+
+  /**
+   * Per-project pipeline statistics for the Overview page. Computes average
+   * wall-clock time for every job type (scene render, video i2v, video upscale,
+   * TTS, BGM, dataset, training), plus the count of completed jobs, the
+   * estimated regeneration count (shots with > 1 completed scene render),
+   * and the estimated number of generated images that have since been
+   * deleted from `Shot.renderedImages`.
+   */
+  @Get('stats')
+  @ApiOperation({ summary: 'Pipeline timing + waste statistics for the Overview page' })
+  async stats(@Param('idOrSlug') idOrSlug: string) {
+    const project = await this.prisma.project.findFirst({
+      where:  { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
+      select: { id: true, slug: true, name: true },
+    });
+    if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
+
+    // Average wall-clock seconds for a job table, filtered to this project's
+    // shots/profiles. `started` and `completed` are the column names that
+    // bound the timing window; some tables (VideoRender.upscale*) use
+    // different columns.
+    const avgPair = async <
+      T extends Record<string, any>,
+    >(rows: T[], started: keyof T, completed: keyof T) => {
+      let sumMs = 0; let n = 0;
+      for (const r of rows) {
+        const s = r[started] as Date | null | undefined;
+        const c = r[completed] as Date | null | undefined;
+        if (!s || !c) continue;
+        const delta = (c as Date).getTime() - (s as Date).getTime();
+        if (delta < 0) continue;
+        sumMs += delta; n++;
+      }
+      return { count: n, avgSeconds: n > 0 ? Math.round(sumMs / n / 1000) : null };
+    };
+
+    // ── Scene render (SDXL) ──────────────────────────────────────────────
+    const sceneRows = await this.prisma.sceneRenderJob.findMany({
+      where:  { shot: { projectId: project.id }, status: 'completed' },
+      select: { id: true, shotId: true, startedAt: true, completedAt: true },
+    });
+    const sceneStats = await avgPair(sceneRows, 'startedAt', 'completedAt');
+
+    // Regeneration: shots with more than one completed scene render.
+    const perShotCounts = new Map<string, number>();
+    for (const r of sceneRows) perShotCounts.set(r.shotId, (perShotCounts.get(r.shotId) ?? 0) + 1);
+    const shotsRegenerated = [...perShotCounts.values()].filter((n) => n > 1).length;
+    const totalRegenerations = [...perShotCounts.values()].reduce((sum, n) => sum + Math.max(0, n - 1), 0);
+
+    // Deleted images: each completed scene render produces ~5 images (default
+    // batchSize). Compare to images currently in renderedImages arrays.
+    // Inaccurate when batchSize was customised — best-effort estimate.
+    const shots = await this.prisma.shot.findMany({
+      where:  { projectId: project.id },
+      select: { id: true, renderedImages: true },
+    });
+    let currentImages = 0;
+    for (const s of shots) {
+      const arr = (s.renderedImages as Array<unknown> | null) ?? [];
+      currentImages += Array.isArray(arr) ? arr.length : 0;
+    }
+    const generatedEstimate = sceneRows.length * 5;
+    const deletedEstimate   = Math.max(0, generatedEstimate - currentImages);
+
+    // ── Video i2v (Wan2.2) ───────────────────────────────────────────────
+    const videoRows = await this.prisma.videoRender.findMany({
+      where:  { shot: { projectId: project.id }, status: 'completed' },
+      select: { startedAt: true, completedAt: true, upscaleStartedAt: true, upscaleCompletedAt: true, upscaleStatus: true },
+    });
+    const videoStats = await avgPair(videoRows, 'startedAt', 'completedAt');
+    const upscaleRows = videoRows.filter((r) => r.upscaleStatus === 'completed');
+    const upscaleStats = await avgPair(upscaleRows, 'upscaleStartedAt', 'upscaleCompletedAt');
+
+    // ── TTS ──────────────────────────────────────────────────────────────
+    // Owner: either scene or shot, both FK to project chains. Filter by
+    // either-or so scene-level and shot-level TTS are both counted.
+    const ttsRows = await this.prisma.tTSJob.findMany({
+      where: {
+        status: 'completed',
+        OR: [
+          { shot:  { projectId: project.id } },
+          { scene: { projectId: project.id } },
+        ],
+      },
+      select: { startedAt: true, completedAt: true },
+    });
+    const ttsStats = await avgPair(ttsRows, 'startedAt', 'completedAt');
+
+    // ── BGM (ACE-Step via AudioRenderJob) ───────────────────────────────
+    const bgmRows = await this.prisma.audioRenderJob.findMany({
+      where: {
+        status: 'completed',
+        segment: { block: { projectId: project.id } },
+      },
+      select: { startedAt: true, completedAt: true },
+    });
+    const bgmStats = await avgPair(bgmRows, 'startedAt', 'completedAt');
+
+    // ── Dataset generation ──────────────────────────────────────────────
+    // DatasetJob FKs to CharacterProfile → Character. Character belongs to
+    // the project via legacy Character.projectId OR ProjectCharacter join.
+    const datasetRows = await this.prisma.datasetJob.findMany({
+      where: {
+        status: 'completed',
+        profile: {
+          character: {
+            OR: [
+              { projectId: project.id },
+              { projectLinks: { some: { projectId: project.id } } },
+            ],
+          },
+        },
+      },
+      select: { startedAt: true, completedAt: true },
+    });
+    const datasetStats = await avgPair(datasetRows, 'startedAt', 'completedAt');
+
+    // ── LoRA training ────────────────────────────────────────────────────
+    const trainingRows = await this.prisma.trainingJob.findMany({
+      where: {
+        status: 'completed',
+        profile: {
+          character: {
+            OR: [
+              { projectId: project.id },
+              { projectLinks: { some: { projectId: project.id } } },
+            ],
+          },
+        },
+      },
+      select: { startedAt: true, completedAt: true },
+    });
+    const trainingStats = await avgPair(trainingRows, 'startedAt', 'completedAt');
+
+    return {
+      project,
+      sceneRender:   sceneStats,
+      videoRender:   videoStats,
+      videoUpscale:  upscaleStats,
+      tts:           ttsStats,
+      bgm:           bgmStats,
+      dataset:       datasetStats,
+      training:      trainingStats,
+      waste: {
+        currentImages,
+        estimatedGenerated: generatedEstimate,
+        estimatedDeleted:   deletedEstimate,
+        shotsRegenerated,
+        totalRegenerations,
+      },
+    };
   }
 
   /**

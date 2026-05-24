@@ -61,6 +61,31 @@ export class CharactersController {
     return this.charactersService.remove(projectId, characterId);
   }
 
+  // ── Project ↔ character attach/detach (library refactor) ────────────────
+
+  @Post(':characterId/attach')
+  @ApiOperation({
+    summary: 'Attach an existing (library or other-project) character to this project',
+    description: 'Idempotent — re-attaching is a no-op. Use POST / to create a new project-bound character.',
+  })
+  attach(
+    @Param('projectId') projectId: string,
+    @Param('characterId') characterId: string,
+  ) {
+    return this.charactersService.attach(projectId, characterId);
+  }
+
+  @Delete(':characterId/attach')
+  @ApiOperation({
+    summary: 'Detach a character from this project (keeps the character in the library / other projects, no files removed)',
+  })
+  detach(
+    @Param('projectId') projectId: string,
+    @Param('characterId') characterId: string,
+  ) {
+    return this.charactersService.detach(projectId, characterId);
+  }
+
   // ── Profiles ─────────────────────────────────────────────────────────────
 
   @Get(':characterId/profiles')

@@ -14,6 +14,8 @@ import { TTSModule } from './tts/tts.module';
 import { BgmModule } from './bgm/bgm.module';
 import { ExportsModule } from './exports/exports.module';
 import { PipelineModule } from './pipeline/pipeline.module';
+import { ActionsModule } from './actions/actions.module';
+import { LocationsModule } from './locations/locations.module';
 
 @Module({
   imports: [
@@ -32,6 +34,8 @@ import { PipelineModule } from './pipeline/pipeline.module';
     BgmModule,
     ExportsModule,
     PipelineModule,
+    ActionsModule,
+    LocationsModule,
   ],
 })
 export class AppModule {}

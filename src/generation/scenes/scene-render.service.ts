@@ -51,10 +51,24 @@ export class SceneRenderService {
 
   // ── Queue-aware API (used by PipelineQueueService) ──────────────────────────
 
-  /** Enqueue a render: creates a `pending` SceneRenderJob; pipeline-tick will dispatch it. */
+  /** Enqueue a render: creates a `pending` SceneRenderJob; pipeline-tick will dispatch it.
+   *
+   * Re-render semantics: any previously-rendered candidates for this shot are
+   * wiped before the new job is queued — both the files on disk and the
+   * `Shot.renderedImages` JSON list, and any `chosenRender` selection. This
+   * matches the "regenerate replaces" expectation: users who click render
+   * twice in a row don't end up with stale outputs piling next to the new
+   * batch. In-flight renders (pending/running scene jobs) are NOT touched —
+   * pollRunning will still append their outputs when they finish.
+   */
   async enqueueRender(input: RenderShotInput) {
-    const shot = await this.prisma.shot.findUnique({ where: { id: input.shotId } });
+    const shot = await this.prisma.shot.findUnique({
+      where:   { id: input.shotId },
+      include: { project: true },
+    });
     if (!shot) throw new NotFoundException(`Shot ${input.shotId} not found`);
+
+    await this.wipePreviousRenders(shot);
 
     // Strip non-serialisable fields (shotId is on the row itself; dryRun doesn't queue).
     const { shotId, dryRun: _dryRun, ...params } = input;
@@ -65,6 +79,42 @@ export class SceneRenderService {
         params: params as any,
       },
     });
+  }
+
+  /** Delete previously-rendered files + clear renderedImages/chosenRender for a shot.
+   *  Best-effort on files (missing/permission errors are logged, not raised). */
+  private async wipePreviousRenders(shot: { id: string; shotCode: string; renderedImages: unknown; project: { slug: string } | null }) {
+    const list = (shot.renderedImages as Array<{ filename: string }> | null) ?? [];
+    if (list.length === 0) {
+      // Nothing recorded — also clear chosenRender defensively in case of drift.
+      await this.prisma.shot.update({
+        where: { id: shot.id },
+        data:  { chosenRender: null },
+      });
+      return;
+    }
+
+    const slug = shot.project?.slug;
+    if (slug) {
+      const dir = path.join(APP_ROOT, 'data', slug, 'shots', shot.shotCode);
+      for (const r of list) {
+        const full = path.join(dir, r.filename);
+        if (existsSync(full)) {
+          try { unlinkSync(full); }
+          catch (e: any) { this.logger.warn(`wipePreviousRenders: failed to delete ${full}: ${e?.message}`); }
+        }
+      }
+    }
+    await this.prisma.shot.update({
+      where: { id: shot.id },
+      data:  {
+        renderedImages:       [] as any,
+        chosenRender:         null,
+        // Also clear in-flight tracking — the new job will set this fresh.
+        activeRenderPromptId: null,
+      },
+    });
+    this.logger.log(`wipePreviousRenders: shot ${shot.shotCode} cleared ${list.length} previous render(s)`);
   }
 
   async findNextPending() {
@@ -293,6 +343,9 @@ export class SceneRenderService {
       where:   { id: input.shotId },
       include: {
         project:      true,
+        // Scene carries the canonical act-level lightingMood / palette / time-of-day
+        // defaults used as fallback when the shot's promptFields don't override them.
+        scene:        true,
         participants: {
           include: {
             character: { include: { profiles: true } },
@@ -302,6 +355,18 @@ export class SceneRenderService {
       },
     });
     if (!shot) throw new NotFoundException(`Shot ${input.shotId} not found`);
+
+    // Location lookup via $queryRaw — bypasses the need for a Prisma client
+    // regeneration when the locations table was added mid-session. Prepends
+    // location.description to the positive so a single edit in the location
+    // row updates every shot tagged with it.
+    const locationRows = await this.prisma.$queryRaw<Array<{ description: string }>>`
+      SELECT l.description
+      FROM shots sh
+      LEFT JOIN locations l ON sh."locationId" = l.id
+      WHERE sh.id = ${input.shotId}
+    `;
+    const locationDescription = locationRows[0]?.description ?? null;
 
     // ── 2. Resolve participant → trained CharacterProfile ────────────────────
     // If the participant explicitly picks a profile (age variant), use it.
@@ -343,22 +408,54 @@ export class SceneRenderService {
     // translated from `pf.camera.framing`. The directive carries explicit
     // composition language (rule of thirds, shot size, environment visibility)
     // so SDXL doesn't default to face-fills-frame.
+    // Lighting fallback: per-shot override beats the act-level canonical value
+    // (`Scene.lightingMood`). One edit in `Scene.lightingMood` shifts every
+    // shot in that act that hasn't explicitly overridden it.
+    const shotLighting   = pf.lightingMood as string | undefined;
+    const sceneLighting  = shot.scene?.lightingMood ?? null;
+    const effectiveLight = (shotLighting && shotLighting.trim().length > 0)
+      ? shotLighting
+      : sceneLighting;
+
     const userPositive = pf.positive as string | undefined;
     let positive: string;
     if (userPositive && userPositive.trim().length > 0) {
       positive = userPositive;
     } else {
+      // Composition mode — used when the shot has no baked positive yet (new
+      // shots or freshly cleared). Pull the act-level lighting as the lighting
+      // fragment so a new shot doesn't have to repeat tokens already written
+      // once at the scene level.
       const camera = pf.camera as { framing?: string } | undefined;
       const framingDirective = framingPromptFor(camera?.framing);
       const parts: string[] = [];
       if (framingDirective) parts.push(framingDirective);
-      for (const f of [pf.narrativeBeat, pf.frameDescription, pf.positiveEnvironment, pf.positiveCharacterLocks, pf.lightingMood]) {
+      for (const f of [pf.narrativeBeat, pf.frameDescription, pf.positiveEnvironment, pf.positiveCharacterLocks, effectiveLight]) {
         if (typeof f === 'string' && f.trim().length > 0) parts.push(f);
       }
       positive = parts.join(', ');
     }
-    const rawNegative = pf.negative as string | undefined;
-    const negative    = sanitizeNegative(rawNegative, this.logger, shot.shotCode);
+
+    // Location injection: prepend the Location.description (looked up above
+    // via $queryRaw) onto the positive. Single source of truth for the cramped
+    // Soviet train kupe / corridor / vestibule prose — editing the Location
+    // row updates every shot tagged with it. Idempotent.
+    if (locationDescription && locationDescription.trim().length > 0) {
+      const desc = locationDescription.trim();
+      if (!positive.startsWith(desc)) {
+        positive = `${desc}, ${positive}`;
+      }
+    }
+
+    // Negative fallback: per-shot override beats project-wide default. Same
+    // logic — one edit in `Project.defaultNegative` updates every shot that
+    // hasn't overridden it.
+    const shotNegative    = pf.negative as string | undefined;
+    const projectDefault  = (shot.project as any)?.defaultNegative as string | undefined;
+    const rawNegative     = (shotNegative && shotNegative.trim().length > 0)
+      ? shotNegative
+      : projectDefault;
+    const negative = sanitizeNegative(rawNegative, this.logger, shot.shotCode);
 
     const params: SceneJobParams = {
       participants,

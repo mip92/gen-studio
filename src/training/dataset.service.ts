@@ -18,7 +18,15 @@ const FLORENCE_TASK = process.env.FLORENCE_TASK ?? 'DETAILED_CAPTION';
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
 
 export interface PrepareDatasetInput {
-  projectSlug:    string;
+  /**
+   * Phase 2: the dataset root is now passed in directly by the caller, computed
+   * via `datasetRootFor(profile)` in character-paths.util. This lets project-bound
+   * profiles use `data/<slug>/datasets/<profileCode>/` and library profiles use
+   * `data/_characters/<characterCode>/<profileCode>/datasets/`. Pass exactly one
+   * of `datasetRoot` (preferred) OR `projectSlug` (legacy fallback).
+   */
+  datasetRoot?:   string;
+  projectSlug?:   string;
   profileCode:    string;
   filenamePrefix: string;   // matches what ai_syndicate_v3 saved
   triggerToken:   string;
@@ -42,7 +50,10 @@ export class DatasetService {
    *   data/<slug>/lora/<profileCode>/img/<numRepeats>_<token>/<copies>
    */
   prepare(input: PrepareDatasetInput): PreparedDataset {
-    const rootDir   = path.join(APP_ROOT, 'data', input.projectSlug, 'datasets', input.profileCode);
+    const rootDir = input.datasetRoot
+      ?? (input.projectSlug
+        ? path.join(APP_ROOT, 'data', input.projectSlug, 'datasets', input.profileCode)
+        : (() => { throw new Error('prepare() requires datasetRoot OR projectSlug'); })());
     const imageDir  = path.join(rootDir, 'img');
     const subsetDir = path.join(imageDir, `${input.numRepeats}_${input.triggerToken}`);
     mkdirSync(subsetDir, { recursive: true });
@@ -240,15 +251,21 @@ function safeUnlink(filePath: string): void {
 }
 
 /**
- * Walk `data/<slug>/datasets/<prefix>/img/*` and return absolute paths of the
- * subset folders (e.g. `…/img/10_fatherbase_lora`). The slug is unknown so we
- * scan all top-level dirs under data/. Returns [] if nothing matches.
+ * Walk dataset subset folders for a profile across both layouts:
+ *   Project-bound: data/<slug>/datasets/<profileCode>/img/*
+ *   Library:       data/_characters/<charCode>/<profileCode>/datasets/img/*
+ *
+ * Returns absolute paths. The character/project lookup is keyed by profileCode
+ * alone (which is globally unique today), so we just scan both shapes.
  */
 function findDatasetSubsets(profileCode: string): string[] {
   const projectsRoot = path.join(APP_ROOT, 'data');
   if (!existsSync(projectsRoot)) return [];
   const subsets: string[] = [];
+
+  // Project-bound layout
   for (const slug of readdirSync(projectsRoot)) {
+    if (slug === '_characters') continue;
     const imgRoot = path.join(projectsRoot, slug, 'datasets', profileCode, 'img');
     if (!existsSync(imgRoot) || !statSync(imgRoot).isDirectory()) continue;
     for (const entry of readdirSync(imgRoot)) {
@@ -256,6 +273,20 @@ function findDatasetSubsets(profileCode: string): string[] {
       if (statSync(subset).isDirectory()) subsets.push(subset);
     }
   }
+
+  // Library layout: data/_characters/<charCode>/<profileCode>/datasets/img/*
+  const libRoot = path.join(projectsRoot, '_characters');
+  if (existsSync(libRoot) && statSync(libRoot).isDirectory()) {
+    for (const charCode of readdirSync(libRoot)) {
+      const imgRoot = path.join(libRoot, charCode, profileCode, 'datasets', 'img');
+      if (!existsSync(imgRoot) || !statSync(imgRoot).isDirectory()) continue;
+      for (const entry of readdirSync(imgRoot)) {
+        const subset = path.join(imgRoot, entry);
+        if (statSync(subset).isDirectory()) subsets.push(subset);
+      }
+    }
+  }
+
   return subsets;
 }
 

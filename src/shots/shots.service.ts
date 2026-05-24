@@ -93,7 +93,7 @@ export class ShotsService {
     });
     if (dup) throw new BadRequestException(`Shot code "${dto.shotCode}" already exists in project`);
 
-    return this.prisma.shot.create({
+    const created = await this.prisma.shot.create({
       data: {
         projectId:          project.id,
         sceneId:            dto.sceneId,
@@ -105,6 +105,13 @@ export class ShotsService {
       },
       include: { participants: { include: { character: true } } },
     });
+    // locationId is in the schema but the Prisma client may not have been
+    // regenerated yet. Apply via $queryRaw to be safe; UI can also use
+    // PATCH /shots/:id/location later.
+    if ((dto as any).locationId !== undefined) {
+      await this.prisma.$queryRaw`UPDATE shots SET "locationId" = ${(dto as any).locationId} WHERE id = ${created.id}`;
+    }
+    return created;
   }
 
   async update(shotId: string, dto: UpdateShotDto & { participants?: ParticipantInput[] }) {
@@ -132,7 +139,7 @@ export class ShotsService {
         }
       }
 
-      return tx.shot.update({
+      const updated = await tx.shot.update({
         where: { id: shotId },
         data: {
           shotCode:           dto.shotCode,
@@ -146,6 +153,12 @@ export class ShotsService {
         },
         include: { participants: { include: { character: true } }, scene: true },
       });
+      // locationId via raw SQL — Prisma client may not have been regenerated
+      // yet since the column was added mid-session.
+      if ((dto as any).locationId !== undefined) {
+        await tx.$queryRaw`UPDATE shots SET "locationId" = ${(dto as any).locationId} WHERE id = ${shotId}`;
+      }
+      return updated;
     });
   }
 

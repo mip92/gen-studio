@@ -14,6 +14,15 @@ export class ProfilesController {
     return this.chars.findProfileById(profileId);
   }
 
+  @Get(':profileId/summary')
+  @ApiOperation({
+    summary: 'Per-profile readiness summary (dataset count, LoRA, last jobs, phase)',
+    description: 'Project-independent. Drives the persona detail page (/characters/:profileId) without any project context.',
+  })
+  summary(@Param('profileId') profileId: string) {
+    return this.chars.profileSummary(profileId);
+  }
+
   @Patch(':profileId')
   @ApiOperation({ summary: 'Update editable profile fields (prompts, age, target, trigger)' })
   update(@Param('profileId') profileId: string, @Body() dto: UpdateProfileDto) {

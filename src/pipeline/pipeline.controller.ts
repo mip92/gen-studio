@@ -13,6 +13,14 @@ interface QueueRow {
   /** For training/dataset: the character code. For scene/video: scene title or sceneKey. */
   characterCode: string;
   projectSlug:   string;
+  /** Canonical project UUID. Frontend Link-builders prefer this over the slug
+   *  so the URL never carries a slug that the middleware has to redirect. */
+  projectId:     string | null;
+  /** Shot UUID — set for scene / video / video_upscale jobs and for shot-level
+   *  TTS jobs. Lets the queue UI link straight to /projects/<pid>/shots/<sid>/<tab>
+   *  without an extra lookup. Null when the job has no associated shot
+   *  (training / dataset / scene-level TTS / bgm). */
+  shotId:        string | null;
   triggerToken:  string | null;
   queuedAt:      Date;
   startedAt:     Date | null;
@@ -75,9 +83,28 @@ export class PipelineController {
     // page through history without losing context. Final sort/filter/paginate
     // happens after normalization so the result is one table.
     const TERMINAL_TAKE = 500;
-    const profileInclude = { profile: { include: { character: { include: { project: true } } } } };
+    // Include character.projectLinks too so library characters (Character.projectId = null)
+    // still surface a project slug in the queue row — we fall back to the first attached
+    // project. Without this the queue endpoint 500s on a library-character job because
+    // `character.project` is null. Phase 2 will drop `Character.projectId` entirely.
+    const profileInclude = {
+      profile: {
+        include: {
+          character: {
+            include: {
+              project:      true,
+              projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+            },
+          },
+        },
+      },
+    };
     const shotInclude    = { shot:    { include: { project: true, scene: true } } };
     const sceneInclude   = { scene:   { include: { project: true } } };
+    const ttsInclude     = {
+      scene: { include: { project: true } },
+      shot:  { include: { project: true, scene: true } },
+    };
     // AudioRenderJob → MusicSegment → NarrativeBlock → Project. Resolved at the
     // top of the chain so normalizeBgm can produce projectSlug + block label
     // without N+1 queries.
@@ -95,7 +122,7 @@ export class PipelineController {
         include: shotInclude,
         orderBy: { queuedAt: 'asc' },
       }),
-      this.prisma.tTSJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: sceneInclude, orderBy: { queuedAt: 'asc' } }),
+      this.prisma.tTSJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: ttsInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.audioRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: bgmInclude, orderBy: { queuedAt: 'asc' } }),
     ]);
 
@@ -110,7 +137,7 @@ export class PipelineController {
       // take-window when the underlying video rendered long ago.
       this.prisma.videoRender.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.videoRender.findMany({ where: { upscaleStatus: { in: TERMINAL } }, include: shotInclude, orderBy: { upscaleCompletedAt: 'desc' }, take: TERMINAL_TAKE }),
-      this.prisma.tTSJob.findMany({ where: { status: { in: TERMINAL } }, include: sceneInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
+      this.prisma.tTSJob.findMany({ where: { status: { in: TERMINAL } }, include: ttsInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.audioRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: bgmInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
     ]);
 
@@ -290,7 +317,18 @@ export class PipelineController {
     if (type === 'training') {
       const j = await this.prisma.trainingJob.findUnique({
         where: { id },
-        include: { profile: { include: { character: { include: { project: true } } } } },
+        include: {
+          profile: {
+            include: {
+              character: {
+                include: {
+                  project:      true,
+                  projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+                },
+              },
+            },
+          },
+        },
       });
       if (!j) throw new NotFoundException(`training job ${id} not found`);
       return normalizeTraining(j);
@@ -298,7 +336,18 @@ export class PipelineController {
     if (type === 'dataset') {
       const j = await this.prisma.datasetJob.findUnique({
         where: { id },
-        include: { profile: { include: { character: { include: { project: true } } } } },
+        include: {
+          profile: {
+            include: {
+              character: {
+                include: {
+                  project:      true,
+                  projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+                },
+              },
+            },
+          },
+        },
       });
       if (!j) throw new NotFoundException(`dataset job ${id} not found`);
       return normalizeDataset(j);
@@ -314,7 +363,10 @@ export class PipelineController {
     if (type === 'tts') {
       const j = await this.prisma.tTSJob.findUnique({
         where: { id },
-        include: { scene: { include: { project: true } } },
+        include: {
+          scene: { include: { project: true } },
+          shot:  { include: { project: true, scene: true } },
+        },
       });
       if (!j) throw new NotFoundException(`tts job ${id} not found`);
       return normalizeTTS(j);
@@ -336,9 +388,27 @@ export class PipelineController {
   }
 
   private async collectPendingOrdered(): Promise<QueueRow[]> {
-    const profileInclude = { profile: { include: { character: { include: { project: true } } } } };
+    // Include character.projectLinks too so library characters (Character.projectId = null)
+    // still surface a project slug in the queue row — we fall back to the first attached
+    // project. Without this the queue endpoint 500s on a library-character job because
+    // `character.project` is null. Phase 2 will drop `Character.projectId` entirely.
+    const profileInclude = {
+      profile: {
+        include: {
+          character: {
+            include: {
+              project:      true,
+              projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+            },
+          },
+        },
+      },
+    };
     const shotInclude    = { shot:    { include: { project: true, scene: true } } };
-    const sceneInclude   = { scene:   { include: { project: true } } };
+    const ttsInclude     = {
+      scene: { include: { project: true } },
+      shot:  { include: { project: true, scene: true } },
+    };
     const bgmInclude = { segment: { include: { block: { include: { project: true } } } } };
     const [tr, ds, sc, vr, vrU, tts, bgm] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
@@ -346,7 +416,7 @@ export class PipelineController {
       this.prisma.sceneRenderJob.findMany({ where: { status: 'pending' },        include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
       this.prisma.videoRender.findMany({    where: { status: 'pending' },        include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
       this.prisma.videoRender.findMany({    where: { upscaleStatus: 'pending' }, include: shotInclude,    orderBy: { upscaleQueuedAt: 'asc' } }),
-      this.prisma.tTSJob.findMany({         where: { status: 'pending' },        include: sceneInclude,   orderBy: { queuedAt: 'asc' } }),
+      this.prisma.tTSJob.findMany({         where: { status: 'pending' },        include: ttsInclude,     orderBy: { queuedAt: 'asc' } }),
       this.prisma.audioRenderJob.findMany({ where: { status: 'pending' },        include: bgmInclude,     orderBy: { queuedAt: 'asc' } }),
     ]);
     return [
@@ -406,7 +476,9 @@ function normalizeTraining(j: any): QueueRow {
     status:        j.status,
     profileCode:   j.profile.profileCode,
     characterCode: j.profile.character.code,
-    projectSlug:   j.profile.character.project.slug,
+    projectSlug:   j.profile.character.project?.slug ?? j.profile.character.projectLinks?.[0]?.project?.slug ?? null,
+    projectId:     j.profile.character.project?.id   ?? j.profile.character.projectLinks?.[0]?.project?.id   ?? null,
+    shotId:        null,
     triggerToken:  j.triggerToken ?? null,
     queuedAt:      j.queuedAt,
     startedAt:     j.startedAt ?? null,
@@ -424,7 +496,9 @@ function normalizeDataset(j: any): QueueRow {
     status:        j.status,
     profileCode:   j.profile.profileCode,
     characterCode: j.profile.character.code,
-    projectSlug:   j.profile.character.project.slug,
+    projectSlug:   j.profile.character.project?.slug ?? j.profile.character.projectLinks?.[0]?.project?.slug ?? null,
+    projectId:     j.profile.character.project?.id   ?? j.profile.character.projectLinks?.[0]?.project?.id   ?? null,
+    shotId:        null,
     triggerToken:  j.profile.triggerToken ?? null,
     queuedAt:      j.queuedAt,
     startedAt:     j.startedAt ?? null,
@@ -443,6 +517,8 @@ function normalizeScene(j: any): QueueRow {
     profileCode:   j.shot.shotCode,
     characterCode: j.shot.scene?.title ?? j.shot.scene?.sceneKey ?? '—',
     projectSlug:   j.shot.project.slug,
+    projectId:     j.shot.project.id,
+    shotId:        j.shot.id,
     triggerToken:  null,
     queuedAt:      j.queuedAt,
     startedAt:     j.startedAt ?? null,
@@ -461,6 +537,8 @@ function normalizeVideo(v: any): QueueRow {
     profileCode:   v.shot.shotCode,
     characterCode: v.shot.scene?.title ?? v.shot.scene?.sceneKey ?? '—',
     projectSlug:   v.shot.project.slug,
+    projectId:     v.shot.project.id,
+    shotId:        v.shot.id,
     triggerToken:  null,
     queuedAt:      v.queuedAt,
     startedAt:     v.startedAt ?? null,
@@ -479,6 +557,8 @@ function normalizeVideoUpscale(v: any): QueueRow {
     profileCode:   `${v.shot.shotCode} ↑FHD`,
     characterCode: v.shot.scene?.title ?? v.shot.scene?.sceneKey ?? '—',
     projectSlug:   v.shot.project.slug,
+    projectId:     v.shot.project.id,
+    shotId:        v.shot.id,
     triggerToken:  null,
     // Upscale FIFO timestamp. Legacy rows (no upscaleQueuedAt yet) fall back
     // to upscaleStartedAt, then to the main render's queuedAt — same precedence
@@ -493,13 +573,23 @@ function normalizeVideoUpscale(v: any): QueueRow {
 }
 
 function normalizeTTS(j: any): QueueRow {
+  // TTSJob has either a Shot (per-shot VO) or a Scene (legacy whole-scene VO).
+  // Pick the project + label from whichever side is populated; expose shotId
+  // when shot-level so the queue UI can deep-link to /shots/<id>/narration.
+  const isShotLevel = !!j.shot;
+  const project = isShotLevel ? j.shot.project : j.scene?.project;
+  const label   = isShotLevel
+    ? (j.shot.scene?.title ?? j.shot.scene?.sceneKey ?? j.shot.shotCode)
+    : (j.scene?.title ?? j.scene?.sceneKey ?? '—');
   return {
     type:          'tts',
     id:            j.id,
     status:        j.status,
-    profileCode:   `🔊 ${j.voice}`,
-    characterCode: j.scene?.title ?? j.scene?.sceneKey ?? '—',
-    projectSlug:   j.scene?.project?.slug ?? '—',
+    profileCode:   isShotLevel ? `🔊 ${j.shot.shotCode}` : `🔊 ${j.voice}`,
+    characterCode: label,
+    projectSlug:   project?.slug ?? '—',
+    projectId:     project?.id   ?? null,
+    shotId:        isShotLevel ? j.shot.id : null,
     triggerToken:  null,
     queuedAt:      j.queuedAt,
     startedAt:     j.startedAt ?? null,
@@ -521,6 +611,8 @@ function normalizeBgm(j: any): QueueRow {
     profileCode:   `🎵 ${j.segment?.block?.slug ?? '—'}`,
     characterCode: j.segment?.block?.title ?? j.segment?.block?.slug ?? '—',
     projectSlug:   j.segment?.block?.project?.slug ?? '—',
+    projectId:     j.segment?.block?.project?.id   ?? null,
+    shotId:        null,
     triggerToken:  null,
     queuedAt:      j.queuedAt,
     startedAt:     j.startedAt ?? null,

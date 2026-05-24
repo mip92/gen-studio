@@ -139,8 +139,13 @@ export class DatasetQueueService {
     const triggerToken = (profile.triggerToken && profile.triggerToken.trim().length > 0)
       ? profile.triggerToken.trim()
       : profile.profileCode.toLowerCase().replace(/[^a-z0-9]+/g, '') + '_lora';
+    // Phase 2: library characters use data/_characters/<charCode>/<profileCode>/datasets/
+    // instead of legacy data/<slug>/datasets/<profileCode>/.
+    const datasetRoot = profile.character.project
+      ? path.join(APP_ROOT, 'data', profile.character.project.slug, 'datasets', profile.profileCode)
+      : path.join(APP_ROOT, 'data', '_characters', profile.character.code, profile.profileCode, 'datasets');
     this.dataset.prepare({
-      projectSlug:    profile.character.project.slug,
+      datasetRoot,
       profileCode:    profile.profileCode,
       filenamePrefix: profile.profileCode,
       triggerToken,
@@ -195,13 +200,34 @@ export class DatasetQueueService {
   ) {
     const profile = await this.prisma.characterProfile.findUnique({
       where:   { id: profileId },
-      include: { character: { include: { project: true } } },
+      include: {
+        character: {
+          include: {
+            project: true,
+            // Phase 2: library characters borrow workflow templates from one of
+            // their attached projects (no project means no comfy/ folder of their
+            // own — that's a Phase 3 concern if it ever matters).
+            projectLinks: { include: { project: true } },
+          },
+        },
+      },
     });
     if (!profile) throw new Error(`Profile ${profileId} disappeared`);
 
-    const project  = profile.character.project;
+    const project = profile.character.project;
+    // For project-bound chars use their own project; for library chars borrow
+    // from the first attached project (alphabetical by slug for determinism).
+    const templateProject = project ?? profile.character.projectLinks
+      .map((pl) => pl.project)
+      .sort((a, b) => a.slug.localeCompare(b.slug))[0];
+    if (!templateProject) {
+      throw new Error(
+        `Library character ${profile.character.code} has no attached project — ` +
+        `attach it to a project before training so the workflow template can be borrowed.`,
+      );
+    }
     const strategy = this.workflows.get(DEFAULT_WORKFLOW_ID);
-    const template = this.workflows.loadTemplate(strategy, project.slug);
+    const template = this.workflows.loadTemplate(strategy, templateProject.slug);
 
     let comfyImageFilename: string | null = null;
 
@@ -229,7 +255,11 @@ export class DatasetQueueService {
       copyFileSync(picked, path.join(COMFY_INPUT, dest));
       comfyImageFilename = dest;
     } else {
-      const refDir = path.join(APP_ROOT, 'data', project.slug, 'reference', profile.profileCode);
+      // Library chars use `data/_characters/<charCode>/<profileCode>/reference/`,
+      // project-bound chars use the legacy `data/<slug>/reference/<profileCode>/`.
+      const refDir = project
+        ? path.join(APP_ROOT, 'data', project.slug, 'reference', profile.profileCode)
+        : path.join(APP_ROOT, 'data', '_characters', profile.character.code, profile.profileCode, 'reference');
       const own = findReferenceImage(refDir);
       if (own) {
         const dest = `ref_${profile.profileCode}${path.extname(own)}`;
