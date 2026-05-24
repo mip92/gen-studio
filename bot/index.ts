@@ -17,6 +17,16 @@ if (!Number.isFinite(ownerId) || ownerId <= 0) {
 
 const bot = new Bot(token);
 
+// ── Visible command menu (the "/" button left of the input on mobile) ──────
+// Telegram's mobile client puts these in a tap-to-list menu — the user doesn't
+// have to scroll chat history or remember command names. Updated on every
+// bot start so the list stays in sync with `registerActionsHandlers` etc.
+const VISIBLE_COMMANDS = [
+  { command: 'actions', description: 'Pending gates + approve/delete media' },
+  { command: 'queue',   description: 'Pipeline queue (filterable)' },
+  { command: 'start',   description: 'Help / command list' },
+];
+
 // Single-ID auth: drop every update that didn't originate from the configured
 // owner. Silent on purpose — strangers should get nothing back, not even a
 // "you're not authorized" message that confirms the bot exists.
@@ -41,7 +51,18 @@ bot.catch((err) => {
 });
 
 bot.start({
-  onStart: (me) => console.log(`[bot] @${me.username} started, owner=${ownerId}`),
+  onStart: async (me) => {
+    // Register the command list with Telegram on startup. Safe to call every
+    // time — Telegram dedupes by content. Also pin the "Menu" button to the
+    // commands sheet (default behaviour, but explicit beats implicit).
+    try {
+      await bot.api.setMyCommands(VISIBLE_COMMANDS);
+      await bot.api.setChatMenuButton({ menu_button: { type: 'commands' } });
+    } catch (e) {
+      console.warn('[bot] could not register commands menu:', e);
+    }
+    console.log(`[bot] @${me.username} started, owner=${ownerId}`);
+  },
 });
 
 const shutdown = async (sig: string) => {

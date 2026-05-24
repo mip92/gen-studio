@@ -1,44 +1,41 @@
 import type { Bot, Context } from 'grammy';
-import { InlineKeyboard, InputFile } from 'grammy';
+import { InlineKeyboard, InputFile, InputMediaPhoto } from 'grammy';
 import { existsSync } from 'fs';
 import * as path from 'path';
 import {
   ActionItem,
   ShotFull,
+  GateKey,
   fetchActions,
-  fetchShot,
+  fetchShotWithVideos,
   setChosenRender,
   setChosenVideo,
+  deleteRender,
+  deleteVideo,
+  startUpscale,
+  enqueueSceneRender,
+  startVideoRender,
 } from '../lib/actions-api';
 
-const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..');
+const APP_ROOT    = process.env.APP_ROOT    ?? path.resolve(__dirname, '..', '..');
+const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 
-/**
- * Gates that benefit from phone-side action:
- *   5 (approve_render)  — pick a candidate image to canonicalize
- *   7 (approve_video)   — pick a candidate video to canonicalize
- * Other gates (upload images, start dataset/training, render, create video,
- * upscale) get one-tap action buttons but no media preview — they're
- * triggered remotely, results land in the queue.
- */
-const APPROVE_GATES = new Set<ActionItem['gateKey']>(['approve_render', 'approve_video']);
-
-// ── Callback-data scheme ────────────────────────────────────────────────────
-//   "a:list"                  → re-render the actions list
-//   "a:apr-img:<shotId>"      → open per-shot image approval (sends media group + pick buttons)
-//   "a:apr-vid:<shotId>"      → open per-shot video approval
-//   "a:p-img:<shotId>:<idx>"  → pick image #idx (1-based) as chosenRender
-//   "a:p-vid:<shotId>:<idx>"  → pick video #idx as chosenVideoId
-//   "a:skip:<shotId>"         → clear chosenRender (leave for re-render)
-//   "a:run:<encodedAction>"   → fire-and-forget one of the gate's "action"
-//                                blocks (POST /training/profiles/..., etc.).
-//                                "encodedAction" is base64url of "<method>:<path>".
+// ── Callback-data scheme (each callback ≤ 64 bytes per Telegram limit) ─────
+//   "a:list"                       — re-render the actions list
+//   "a:open:<shotId>"              — open the shot's "what's here" view
+//   "a:p-img:<shotId>:<idx>"       — approve image #idx (1-based)
+//   "a:d-img:<shotId>:<idx>"       — delete image #idx from disk + DB
+//   "a:p-vid:<shotId>:<idx>"       — approve video #idx
+//   "a:d-vid:<shotId>:<idx>"       — delete video #idx
+//   "a:u-vid:<shotId>:<idx>"       — start FHD upscale on video #idx
+//   "a:r-scn:<shotId>"             — enqueue a fresh scene render
+//   "a:r-vid:<shotId>"             — start a video render (from chosenRender)
+//   "a:s-img:<shotId>"             — clear chosenRender
 //
-// UUID is 36 chars, so "a:p-img:<uuid>:<idx>" fits in <50 bytes < Telegram's 64-byte cap.
+// UUID is 36 chars → "a:p-img:<uuid>:<idx>" = ~48 bytes. Fits.
 
 export function registerActionsHandlers(bot: Bot): void {
   bot.command('actions', async (ctx) => {
-    await ctx.reply('🔄 Загружаю actions…');
     await sendActionsList(ctx);
   });
 
@@ -47,63 +44,97 @@ export function registerActionsHandlers(bot: Bot): void {
     await sendActionsList(ctx, { edit: true });
   });
 
-  bot.callbackQuery(/^a:apr-img:/, async (ctx) => {
+  bot.callbackQuery(/^a:open:/, async (ctx) => {
     if (!(await safeAnswer(ctx))) return;
     const shotId = ctx.callbackQuery.data!.split(':')[2];
-    await openImageApproval(ctx, shotId);
-  });
-
-  bot.callbackQuery(/^a:apr-vid:/, async (ctx) => {
-    if (!(await safeAnswer(ctx))) return;
-    const shotId = ctx.callbackQuery.data!.split(':')[2];
-    await openVideoApproval(ctx, shotId);
+    await openShotView(ctx, shotId);
   });
 
   bot.callbackQuery(/^a:p-img:/, async (ctx) => {
     const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
-    const idx = Number(idxStr);
-    try {
-      const shot = await fetchShot(shotId);
-      const renders = (shot.renderedImages ?? []) as Array<{ filename: string }>;
-      const pick = renders[idx - 1];
-      if (!pick) {
-        await safeAnswer(ctx, { text: 'Кадр не найден' });
-        return;
-      }
-      await setChosenRender(shotId, pick.filename);
-      await safeAnswer(ctx, { text: `✓ ${shot.shotCode} — выбран #${idx}` });
-      await ctx.reply(`✅ <b>${escapeHtml(shot.shotCode)}</b> — chosenRender = <code>${escapeHtml(pick.filename)}</code>`, {
-        parse_mode: 'HTML',
-      });
-    } catch (err) {
-      await safeAnswer(ctx, { text: 'Ошибка — см. чат' });
-      await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
-    }
+    await withShotIdx(ctx, shotId, Number(idxStr), 'img', async (shot, item) => {
+      const r = item as { filename: string };
+      await setChosenRender(shotId, r.filename);
+      await safeAnswer(ctx, { text: `✓ ${shot.shotCode} → #${idxStr}` });
+      // Right after approval, surface the obvious next step: i2v render
+      // from this image. Avoids forcing the user to scroll back to the
+      // shot card for the «🎬 Сделать видео» button.
+      const kb = new InlineKeyboard()
+        .text('🎬 Сделать видео из этого кадра', `a:r-vid:${shotId}`).row()
+        .text('🔄 Открыть шот', `a:open:${shotId}`);
+      await ctx.reply(
+        `✅ <b>${escapeHtml(shot.shotCode)}</b>\n` +
+        `chosenRender = <code>${escapeHtml(r.filename)}</code>`,
+        { parse_mode: 'HTML', reply_markup: kb },
+      );
+    });
+  });
+
+  bot.callbackQuery(/^a:d-img:/, async (ctx) => {
+    const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withShotIdx(ctx, shotId, Number(idxStr), 'img', async (shot, item) => {
+      const r = item as { filename: string };
+      await deleteRender(shotId, r.filename);
+      await safeAnswer(ctx, { text: `🗑 удалено #${idxStr}` });
+      await ctx.reply(`🗑 <b>${escapeHtml(shot.shotCode)}</b> — удалён <code>${escapeHtml(r.filename)}</code>`, { parse_mode: 'HTML' });
+    });
   });
 
   bot.callbackQuery(/^a:p-vid:/, async (ctx) => {
     const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
-    const idx = Number(idxStr);
+    await withShotIdx(ctx, shotId, Number(idxStr), 'vid', async (shot, item) => {
+      const v = item as { id: string };
+      await setChosenVideo(shotId, v.id);
+      await safeAnswer(ctx, { text: `✓ ${shot.shotCode} video #${idxStr}` });
+      await ctx.reply(`✅ <b>${escapeHtml(shot.shotCode)}</b>\nchosenVideo = <code>${escapeHtml(v.id)}</code>`, { parse_mode: 'HTML' });
+    });
+  });
+
+  bot.callbackQuery(/^a:d-vid:/, async (ctx) => {
+    const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withShotIdx(ctx, shotId, Number(idxStr), 'vid', async (shot, item) => {
+      const v = item as { id: string };
+      await deleteVideo(v.id);
+      await safeAnswer(ctx, { text: `🗑 видео #${idxStr} удалено` });
+      await ctx.reply(`🗑 <b>${escapeHtml(shot.shotCode)}</b> — удалено видео`, { parse_mode: 'HTML' });
+    });
+  });
+
+  bot.callbackQuery(/^a:u-vid:/, async (ctx) => {
+    const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withShotIdx(ctx, shotId, Number(idxStr), 'vid', async (shot, item) => {
+      const v = item as { id: string };
+      await startUpscale(v.id);
+      await safeAnswer(ctx, { text: `⬆️ upscale поставлен` });
+      await ctx.reply(`⬆️ <b>${escapeHtml(shot.shotCode)}</b> — FHD-upscale в очереди`, { parse_mode: 'HTML' });
+    });
+  });
+
+  bot.callbackQuery(/^a:r-scn:/, async (ctx) => {
+    const shotId = ctx.callbackQuery.data!.split(':')[2];
     try {
-      const shot = await fetchShot(shotId);
-      const videos = (shot.videoRenders ?? []).filter((v) => v.status === 'completed' && v.outputFilename);
-      const pick = videos[idx - 1];
-      if (!pick) {
-        await safeAnswer(ctx, { text: 'Видео не найдено' });
-        return;
-      }
-      await setChosenVideo(shotId, pick.id);
-      await safeAnswer(ctx, { text: `✓ ${shot.shotCode} — выбрано видео #${idx}` });
-      await ctx.reply(`✅ <b>${escapeHtml(shot.shotCode)}</b> — chosenVideo = <code>${escapeHtml(pick.id)}</code>`, {
-        parse_mode: 'HTML',
-      });
+      await enqueueSceneRender(shotId);
+      await safeAnswer(ctx, { text: '🎨 render в очереди' });
+      await ctx.reply(`🎨 Сцена для шота добавлена в очередь.`, { parse_mode: 'HTML' });
     } catch (err) {
-      await safeAnswer(ctx, { text: 'Ошибка — см. чат' });
+      await safeAnswer(ctx, { text: 'Ошибка' });
       await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
     }
   });
 
-  bot.callbackQuery(/^a:skip:/, async (ctx) => {
+  bot.callbackQuery(/^a:r-vid:/, async (ctx) => {
+    const shotId = ctx.callbackQuery.data!.split(':')[2];
+    try {
+      await startVideoRender(shotId);
+      await safeAnswer(ctx, { text: '🎬 video в очереди' });
+      await ctx.reply(`🎬 Видео для шота добавлено в очередь.`, { parse_mode: 'HTML' });
+    } catch (err) {
+      await safeAnswer(ctx, { text: 'Ошибка' });
+      await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+    }
+  });
+
+  bot.callbackQuery(/^a:s-img:/, async (ctx) => {
     const shotId = ctx.callbackQuery.data!.split(':')[2];
     try {
       await setChosenRender(shotId, null);
@@ -121,39 +152,37 @@ async function sendActionsList(ctx: Context, opts: { edit?: boolean } = {}): Pro
   try {
     const { items } = await fetchActions();
     if (items.length === 0) {
-      const text = '<b>Actions</b>\n\n<i>(всё чисто — нет ожидающих gate'
-                 + 'ов)</i>';
+      const text = '<b>Actions</b>\n\n<i>(всё чисто — нет ожидающих gate-ов)</i>';
       if (opts.edit) await ctx.editMessageText(text, { parse_mode: 'HTML' });
       else           await ctx.reply(text,             { parse_mode: 'HTML' });
       return;
     }
-    // Group by project for readability.
     const byProject = new Map<string, ActionItem[]>();
     for (const it of items) {
-      const key = it.project.slug;
-      if (!byProject.has(key)) byProject.set(key, []);
-      byProject.get(key)!.push(it);
+      const k = it.project.slug;
+      if (!byProject.has(k)) byProject.set(k, []);
+      byProject.get(k)!.push(it);
     }
 
     const lines: string[] = ['<b>Actions</b>'];
     const kb = new InlineKeyboard();
-    let buttonCount = 0;
-    const MAX_BUTTONS = 24; // ~6 rows × 4. Telegram caps cards at ~100 buttons but readability is the limit.
+    let buttonsAdded = 0;
+    const MAX_BUTTONS = 30;
 
     for (const [slug, group] of byProject) {
       lines.push(`\n<b>· ${escapeHtml(slug)}</b> — ${group.length} pending`);
-      for (const it of group.slice(0, 12)) {
+      for (const it of group.slice(0, 14)) {
         const tag    = gateTag(it.gateKey);
         const target = it.shot?.code ?? it.character?.code ?? it.profile?.code ?? '?';
-        lines.push(`  ${tag} ${escapeHtml(target)}`);
+        lines.push(`  ${tag} ${escapeHtml(target)} — ${gateLabel(it.gateKey)}`);
 
-        if (APPROVE_GATES.has(it.gateKey) && it.shot && buttonCount < MAX_BUTTONS) {
-          const cb = it.gateKey === 'approve_render'
-            ? `a:apr-img:${it.shot.id}`
-            : `a:apr-vid:${it.shot.id}`;
-          const label = `${tag} ${target}`.slice(0, 30);
-          kb.text(label, cb).row();
-          buttonCount++;
+        // Only shot-anchored items get an "Открыть" button; character-level
+        // (upload images / start dataset / start training) don't have a
+        // shot to open. They get triggered via the action.path the API
+        // already provides — we expose them as ▶ buttons too where useful.
+        if (it.shot && buttonsAdded < MAX_BUTTONS) {
+          kb.text(`${tag} ${target}`.slice(0, 30), `a:open:${it.shot.id}`).row();
+          buttonsAdded++;
         }
       }
     }
@@ -167,7 +196,7 @@ async function sendActionsList(ctx: Context, opts: { edit?: boolean } = {}): Pro
   }
 }
 
-function gateTag(g: ActionItem['gateKey']): string {
+function gateTag(g: GateKey): string {
   switch (g) {
     case 'upload_dataset_images': return '📤';
     case 'start_dataset':         return '🎲';
@@ -179,131 +208,157 @@ function gateTag(g: ActionItem['gateKey']): string {
     case 'upscale_video':         return '⬆️';
   }
 }
-
-// ── Image approval ──────────────────────────────────────────────────────────
-
-async function openImageApproval(ctx: Context, shotId: string): Promise<void> {
-  let shot: ShotFull;
-  try {
-    shot = await fetchShot(shotId);
-  } catch (err) {
-    await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
-    return;
+function gateLabel(g: GateKey): string {
+  switch (g) {
+    case 'upload_dataset_images': return 'нужны reference photo';
+    case 'start_dataset':         return 'нужен датасет';
+    case 'start_training':        return 'нужна LoRA';
+    case 'render_scene':          return 'нужен рендер';
+    case 'approve_render':        return 'выбрать кадр';
+    case 'create_video':          return 'нужно видео';
+    case 'approve_video':         return 'выбрать видео';
+    case 'upscale_video':         return 'нужен FHD-upscale';
   }
-  const renders = (shot.renderedImages ?? []);
-  if (renders.length === 0) {
-    await ctx.reply(`У <b>${escapeHtml(shot.shotCode)}</b> нет кадров на выбор.`, { parse_mode: 'HTML' });
-    return;
-  }
-  if (!shot.project) {
-    await ctx.reply('Не удалось определить project для шота — нечего слать.');
-    return;
-  }
-
-  // Build media group from disk. Each entry must be an InputFile (we read the
-  // file from data/<slug>/shots/<shotCode>/<filename>). Telegram limits a
-  // media group to 10 items — slice if more.
-  const slice = renders.slice(0, 10);
-  const media = slice.map((r, i) => ({
-    type:    'photo' as const,
-    media:   resolveRenderInput(shot.project!.slug, shot.shotCode, r.filename),
-    caption: i === 0 ? `<b>${escapeHtml(shot.shotCode)}</b> — выбери # ниже` : undefined,
-    parse_mode: 'HTML' as const,
-  })).filter((m) => m.media !== null) as Array<{ type: 'photo'; media: InputFile; caption?: string; parse_mode?: 'HTML' }>;
-
-  if (media.length === 0) {
-    await ctx.reply(`Файлы кадров не найдены на диске для <b>${escapeHtml(shot.shotCode)}</b>.`, { parse_mode: 'HTML' });
-    return;
-  }
-
-  try {
-    await ctx.replyWithMediaGroup(media);
-  } catch (err) {
-    await ctx.reply(`❌ MediaGroup failed: <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
-    return;
-  }
-
-  // Buttons: pick #1..N + skip.
-  const kb = new InlineKeyboard();
-  slice.forEach((_, i) => {
-    const idx = i + 1;
-    kb.text(`#${idx}`, `a:p-img:${shotId}:${idx}`);
-    if ((i + 1) % 5 === 0) kb.row();
-  });
-  if (slice.length % 5 !== 0) kb.row();
-  kb.text('✗ Сброс chosenRender', `a:skip:${shotId}`);
-
-  const chosen = shot.chosenRender
-    ? `текущий выбор: <code>${escapeHtml(shot.chosenRender)}</code>`
-    : '<i>chosenRender не задан</i>';
-  await ctx.reply(`<b>${escapeHtml(shot.shotCode)}</b> — ${chosen}\nТапни номер чтобы утвердить:`, {
-    parse_mode: 'HTML',
-    reply_markup: kb,
-  });
 }
 
-// ── Video approval ──────────────────────────────────────────────────────────
+// ── Open shot view ──────────────────────────────────────────────────────────
 
-async function openVideoApproval(ctx: Context, shotId: string): Promise<void> {
+async function openShotView(ctx: Context, shotId: string): Promise<void> {
   let shot: ShotFull;
   try {
-    shot = await fetchShot(shotId);
+    shot = await fetchShotWithVideos(shotId);
   } catch (err) {
     await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
     return;
   }
-  const videos = (shot.videoRenders ?? []).filter((v) => v.status === 'completed' && v.outputFilename);
-  if (videos.length === 0) {
-    await ctx.reply(`У <b>${escapeHtml(shot.shotCode)}</b> нет завершённых видео.`, { parse_mode: 'HTML' });
-    return;
-  }
-  if (!shot.project) {
-    await ctx.reply('Не удалось определить project для шота.');
-    return;
-  }
 
-  // Telegram bot upload cap is 50 MB per file. Wan2.2 5-sec 832×480 mp4s are
-  // typically 1-3 MB so we're fine. We send each video as its own message
-  // (sendMediaGroup with video supports up to 10 but mixing video+text in a
-  // group is awkward) and a separate buttons message at the end.
-  const slice = videos.slice(0, 5);
-  for (let i = 0; i < slice.length; i++) {
-    const v = slice[i];
-    const filePath = path.join(APP_ROOT, 'data', shot.project!.slug, 'shots', shot.shotCode, 'videos', v.outputFilename!);
-    if (!existsSync(filePath)) {
-      await ctx.reply(`#${i + 1}: файл не найден — <code>${escapeHtml(filePath)}</code>`, { parse_mode: 'HTML' });
-      continue;
-    }
-    try {
-      await ctx.replyWithVideo(new InputFile(filePath), {
-        caption: `<b>${escapeHtml(shot.shotCode)}</b> · видео #${i + 1}`,
-        parse_mode: 'HTML',
+  const renders = (shot.renderedImages ?? []);
+  const videos  = (shot.videoRenders   ?? []).filter((v) => v.status === 'completed' && v.outputFilename);
+
+  // Header card — context for the user before they see media.
+  const headerLines: string[] = [
+    `<b>${escapeHtml(shot.shotCode)}</b>`,
+  ];
+  const sn = (shot as any).narrationText as string | null | undefined;
+  if (sn && sn.trim().length) {
+    headerLines.push(`<i>«${escapeHtml(sn.trim().slice(0, 200))}»</i>`);
+  }
+  headerLines.push(
+    `\n🖼 кадров: ${renders.length}${shot.chosenRender ? ` (✓ выбран)` : ''}`,
+    `🎬 видео: ${videos.length}${shot.chosenVideoId ? ` (✓ выбрано)` : ''}`,
+  );
+  await ctx.reply(headerLines.join('\n'), { parse_mode: 'HTML' });
+
+  // ── Images ────────────────────────────────────────────────────────────────
+  if (renders.length > 0 && shot.project) {
+    const slice = renders.slice(0, 10);
+    const media: InputMediaPhoto[] = [];
+    slice.forEach((r, i) => {
+      const file = resolveRenderInput(shot.project!.slug, shot.shotCode, r.filename);
+      if (!file) return;
+      const isChosen = shot.chosenRender === r.filename;
+      media.push({
+        type:    'photo',
+        media:   file,
+        caption: `#${i + 1}${isChosen ? '  ✓ chosen' : ''}`,
       });
-    } catch (err) {
-      await ctx.reply(`#${i + 1}: send failed — <code>${escapeHtml(String(err).slice(0, 200))}</code>`, { parse_mode: 'HTML' });
+    });
+    if (media.length > 0) {
+      try { await ctx.replyWithMediaGroup(media); }
+      catch (err) {
+        await ctx.reply(`MediaGroup fail: <code>${escapeHtml(String(err).slice(0, 200))}</code>`, { parse_mode: 'HTML' });
+      }
     }
+
+    // Per-image action buttons. Prefix every label with 🖼 so the user can't
+    // confuse them with the video buttons that come next (both used to read
+    // "✅ #1" identically — a real source of mis-approvals).
+    const kb = new InlineKeyboard();
+    slice.forEach((_, i) => {
+      kb.text(`🖼 ✅ #${i + 1}`, `a:p-img:${shotId}:${i + 1}`)
+        .text(`🖼 🗑 #${i + 1}`, `a:d-img:${shotId}:${i + 1}`)
+        .row();
+    });
+    if (shot.chosenRender) kb.text('🖼 ✗ Сброс chosenRender', `a:s-img:${shotId}`).row();
+    kb.text('🎨 Дорендерить ещё', `a:r-scn:${shotId}`);
+
+    await ctx.reply(`<b>🖼 Картинки</b> — выбери / удали / дорендер:`, {
+      parse_mode: 'HTML', reply_markup: kb,
+    });
+  } else {
+    const kb = new InlineKeyboard().text('🎨 Запустить рендер сцены', `a:r-scn:${shotId}`);
+    await ctx.reply(`<i>Картинок нет.</i>`, { parse_mode: 'HTML', reply_markup: kb });
   }
 
-  const kb = new InlineKeyboard();
-  slice.forEach((_, i) => {
-    kb.text(`#${i + 1}`, `a:p-vid:${shotId}:${i + 1}`);
-    if ((i + 1) % 5 === 0) kb.row();
-  });
-  await ctx.reply(`<b>${escapeHtml(shot.shotCode)}</b> — тапни номер чтобы утвердить:`, {
-    parse_mode: 'HTML',
-    reply_markup: kb,
-  });
+  // ── Videos ────────────────────────────────────────────────────────────────
+  if (videos.length > 0 && shot.project) {
+    const slice = videos.slice(0, 5);
+    for (let i = 0; i < slice.length; i++) {
+      const v = slice[i];
+      const filePath = path.join(APP_ROOT, 'data', shot.project!.slug, 'shots', shot.shotCode, 'videos', v.outputFilename!);
+      if (!existsSync(filePath)) {
+        await ctx.reply(`#${i + 1}: файл не найден — <code>${escapeHtml(filePath)}</code>`, { parse_mode: 'HTML' });
+        continue;
+      }
+      const isChosen = shot.chosenVideoId === v.id;
+      const upscaled = v.upscaleStatus === 'completed';
+      const caption  = `#${i + 1}${isChosen ? '  ✓ chosen' : ''}${upscaled ? '  · FHD ✓' : ''}`;
+      try {
+        await ctx.replyWithVideo(new InputFile(filePath), { caption, parse_mode: 'HTML' });
+      } catch (err) {
+        await ctx.reply(`#${i + 1}: send failed — <code>${escapeHtml(String(err).slice(0, 200))}</code>`, { parse_mode: 'HTML' });
+      }
+    }
+
+    const kb = new InlineKeyboard();
+    slice.forEach((v, i) => {
+      kb.text(`🎬 ✅ #${i + 1}`, `a:p-vid:${shotId}:${i + 1}`)
+        .text(`🎬 🗑 #${i + 1}`, `a:d-vid:${shotId}:${i + 1}`);
+      if (v.upscaleStatus !== 'completed' && v.upscaleStatus !== 'running' && v.upscaleStatus !== 'pending') {
+        kb.text(`🎬 ⬆️ #${i + 1}`, `a:u-vid:${shotId}:${i + 1}`);
+      }
+      kb.row();
+    });
+    kb.text('🎬 Сделать ещё видео', `a:r-vid:${shotId}`);
+    await ctx.reply(`<b>🎬 Видео</b> — выбери / удали / FHD / дорендер:`, {
+      parse_mode: 'HTML', reply_markup: kb,
+    });
+  } else if (shot.chosenRender) {
+    const kb = new InlineKeyboard().text('🎬 Запустить видео', `a:r-vid:${shotId}`);
+    await ctx.reply(`<i>Видео нет.</i> chosenRender есть — можно делать i2v.`, { parse_mode: 'HTML', reply_markup: kb });
+  }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+async function withShotIdx(
+  ctx: Context,
+  shotId: string,
+  idx: number,
+  kind: 'img' | 'vid',
+  fn: (shot: ShotFull, item: unknown) => Promise<void>,
+): Promise<void> {
+  try {
+    const shot = await fetchShotWithVideos(shotId);
+    const list = kind === 'img'
+      ? (shot.renderedImages ?? [])
+      : (shot.videoRenders ?? []).filter((v) => v.status === 'completed' && v.outputFilename);
+    const item = list[idx - 1];
+    if (!item) {
+      await safeAnswer(ctx, { text: 'Не найдено' });
+      return;
+    }
+    await fn(shot, item);
+  } catch (err) {
+    await safeAnswer(ctx, { text: 'Ошибка' });
+    await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+  }
+}
+
 function resolveRenderInput(slug: string, shotCode: string, filename: string): InputFile | null {
-  // Image lives at data/<slug>/shots/<shotCode>/<filename>. If absent, try
-  // COMFY_OUTPUT (in-flight or legacy).
   const inShot   = path.join(APP_ROOT, 'data', slug, 'shots', shotCode, filename);
   if (existsSync(inShot)) return new InputFile(inShot);
-  const comfyOut = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
-  const inOutput = path.join(comfyOut, filename);
+  const inOutput = path.join(COMFY_OUTPUT, filename);
   if (existsSync(inOutput)) return new InputFile(inOutput);
   return null;
 }

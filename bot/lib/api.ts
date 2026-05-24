@@ -37,7 +37,7 @@ export interface QueueFilters {
 
 const API_BASE = process.env.GEN_STUDIO_API_BASE ?? 'http://127.0.0.1:4000';
 
-export async function fetchQueue(filters: QueueFilters, limit = 20): Promise<QueuePage> {
+export async function fetchQueue(filters: QueueFilters, page = 1, limit = 40): Promise<QueuePage> {
   const qs = new URLSearchParams();
   switch (filters.status) {
     case 'active':   qs.set('finished', 'false'); break;
@@ -49,6 +49,7 @@ export async function fetchQueue(filters: QueueFilters, limit = 20): Promise<Que
   qs.set('sort',  'queuedAt');
   qs.set('order', 'asc');
   qs.set('limit', String(limit));
+  qs.set('page',  String(page));
 
   const url = `${API_BASE}/pipeline/queue?${qs.toString()}`;
   const ctrl = new AbortController();
