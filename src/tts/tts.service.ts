@@ -302,28 +302,44 @@ export class TTSService {
       this.validateCommonInput(input);
     const engineCols = await this.resolveEngineColumns(shot.project, input);
 
-    // Queue placement. The pipeline tick dispatches the globally-earliest
-    // pending job across ALL types (video / scene / tts / dataset / …). So
-    // "front of queue" = take a queuedAt 1 second before the earliest pending
-    // job of ANY type → this becomes the next job dispatched (after whatever is
-    // already running; a running job can't be preempted). Default front=false
-    // keeps natural FIFO placement (end of queue).
+    // Queue placement. Single-slot queue: one job runs at a time and the
+    // running job CANNOT be preempted. So "front of queue" = SECOND position —
+    // strictly AFTER the currently-running job, BEFORE every pending job:
+    //   queuedAt = running.queuedAt + 1ms   (running < this < all pending)
+    // If nothing is running, it becomes the next job (1ms-... before the
+    // earliest pending). Default front=false keeps natural FIFO (end).
     let queuedAt: Date | undefined;
     if (input.front) {
-      const rows = await this.prisma.$queryRawUnsafe<Array<{ min: Date | null }>>(
-        `SELECT MIN(q) AS min FROM (
-           SELECT MIN("queuedAt") q FROM tts_jobs           WHERE status='pending'
-           UNION ALL SELECT MIN("queuedAt") FROM video_renders      WHERE status='pending'
-           UNION ALL SELECT MIN("queuedAt") FROM scene_render_jobs  WHERE status='pending'
-           UNION ALL SELECT MIN("queuedAt") FROM dataset_jobs       WHERE status='pending'
-           UNION ALL SELECT MIN("queuedAt") FROM training_jobs      WHERE status='pending'
-           UNION ALL SELECT MIN("queuedAt") FROM audio_render_jobs  WHERE status='pending'
-           UNION ALL SELECT MIN("queuedAt") FROM anchor_render_jobs WHERE status='pending'
-         ) t`,
+      const rows = await this.prisma.$queryRawUnsafe<Array<{ running: Date | null; pending: Date | null }>>(
+        `SELECT
+           (SELECT MAX(q) FROM (
+              SELECT MAX("queuedAt") q FROM tts_jobs           WHERE status='running'
+              UNION ALL SELECT MAX("queuedAt") FROM video_renders      WHERE status='running'
+              UNION ALL SELECT MAX("queuedAt") FROM scene_render_jobs  WHERE status='running'
+              UNION ALL SELECT MAX("queuedAt") FROM dataset_jobs       WHERE status='running'
+              UNION ALL SELECT MAX("queuedAt") FROM training_jobs      WHERE status='running'
+              UNION ALL SELECT MAX("queuedAt") FROM audio_render_jobs  WHERE status='running'
+              UNION ALL SELECT MAX("queuedAt") FROM anchor_render_jobs WHERE status='running'
+           ) r) AS running,
+           (SELECT MIN(q) FROM (
+              SELECT MIN("queuedAt") q FROM tts_jobs           WHERE status='pending'
+              UNION ALL SELECT MIN("queuedAt") FROM video_renders      WHERE status='pending'
+              UNION ALL SELECT MIN("queuedAt") FROM scene_render_jobs  WHERE status='pending'
+              UNION ALL SELECT MIN("queuedAt") FROM dataset_jobs       WHERE status='pending'
+              UNION ALL SELECT MIN("queuedAt") FROM training_jobs      WHERE status='pending'
+              UNION ALL SELECT MIN("queuedAt") FROM audio_render_jobs  WHERE status='pending'
+              UNION ALL SELECT MIN("queuedAt") FROM anchor_render_jobs WHERE status='pending'
+           ) p) AS pending`,
       );
-      const raw = rows?.[0]?.min ?? null;
-      const globalMin = raw ? new Date(raw as unknown as string) : null;
-      queuedAt = globalMin ? new Date(globalMin.getTime() - 1000) : new Date();
+      const running = rows?.[0]?.running ? new Date(rows[0].running as unknown as string) : null;
+      const pending = rows?.[0]?.pending ? new Date(rows[0].pending as unknown as string) : null;
+      if (running) {
+        queuedAt = new Date(running.getTime() + 1);          // right behind the running job (2nd)
+      } else if (pending) {
+        queuedAt = new Date(pending.getTime() - 1000);       // nothing running → run next
+      } else {
+        queuedAt = new Date();                               // empty queue
+      }
     }
 
     return this.prisma.tTSJob.create({
