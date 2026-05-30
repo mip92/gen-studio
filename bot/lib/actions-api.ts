@@ -13,16 +13,25 @@ export type GateKey =
   | 'approve_render'
   | 'create_video'
   | 'approve_video'
-  | 'upscale_video';
+  | 'upscale_video'
+  | 'approve_tts'
+  | 'approve_bgm';
 
 export interface ActionItem {
-  gate:    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8;
+  gate:    1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10;
   gateKey: GateKey;
   project: { id: string; slug: string; name: string };
   character?: { id: string; code: string; displayName: string | null };
   profile?:   { id: string; code: string };
   scene?:     { id: string; sceneKey: string; title: string | null };
   shot?:      { id: string; code: string };
+  segment?:   {
+    id:          string;
+    sortOrder:   number;
+    durationSec: number;
+    prompt:      string | null;
+    block:       { id: string; slug: string; title: string | null };
+  };
   link:       string;
   action?: {
     method: 'POST' | 'PATCH';
@@ -53,8 +62,45 @@ export interface ShotFull {
   renderedImages:     ShotRender[] | null;
   chosenRender:       string | null;
   chosenVideoId:      string | null;
+  narrationText:      string | null;
+  approvedTTSJobId:   string | null;
   videoRenders?:      VideoRow[];
+  ttsJobs?:           TtsJobRow[];
   project?:           { id: string; slug: string; name: string };
+}
+
+export interface TtsJobRow {
+  id:             string;
+  status:         string;
+  text:           string;
+  outputFilename: string | null;
+  voice:          string;
+  durationMs:     number | null;
+  createdAt:      string;
+}
+
+export interface BgmJobRow {
+  id:             string;
+  status:         string;
+  outputFilename: string | null;
+  queuedAt:       string;
+  completedAt:    string | null;
+}
+
+export interface BgmSegmentFull {
+  id:            string;
+  sortOrder:     number;
+  durationSec:   number;
+  prompt:        string | null;
+  approvedJobId: string | null;
+  block:         {
+    id:        string;
+    slug:      string;
+    title:     string | null;
+    projectId: string;
+    project:   { slug: string };
+  };
+  jobs:          BgmJobRow[];
 }
 
 export async function fetchActions(projectSlug?: string): Promise<{ items: ActionItem[] }> {
@@ -78,9 +124,77 @@ export async function listShotVideos(shotId: string): Promise<VideoRow[]> {
   return (await res.json()) as VideoRow[];
 }
 
+export async function listShotTTSJobs(shotId: string): Promise<TtsJobRow[]> {
+  const res = await fetchWithTimeout(`${API_BASE}/tts/shots/${shotId}/jobs`);
+  if (!res.ok) throw new Error(`GET /tts/shots/${shotId}/jobs → HTTP ${res.status}`);
+  return (await res.json()) as TtsJobRow[];
+}
+
 export async function fetchShotWithVideos(shotId: string): Promise<ShotFull> {
-  const [shot, videos] = await Promise.all([fetchShot(shotId), listShotVideos(shotId)]);
-  return { ...shot, videoRenders: videos };
+  const [shot, videos, tts] = await Promise.all([
+    fetchShot(shotId),
+    listShotVideos(shotId),
+    // TTS jobs are nice-to-have — if the endpoint hiccups we still want the
+    // shot view to render images/videos rather than failing the whole open.
+    listShotTTSJobs(shotId).catch(() => [] as TtsJobRow[]),
+  ]);
+  return { ...shot, videoRenders: videos, ttsJobs: tts };
+}
+
+export async function approveTTSJob(jobId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/tts/jobs/${jobId}/approve`, { method: 'POST' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`POST tts approve → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+export async function deleteTTSJob(jobId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/tts/jobs/${jobId}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`DELETE tts → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+export async function clearShotTTSApproval(shotId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/tts/shots/${shotId}/approve/clear`, { method: 'POST' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`POST tts clear → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+// ── BGM segment helpers ────────────────────────────────────────────────────
+
+export async function fetchSegment(segmentId: string): Promise<BgmSegmentFull> {
+  const res = await fetchWithTimeout(`${API_BASE}/bgm/segments/${segmentId}`);
+  if (!res.ok) throw new Error(`GET /bgm/segments/${segmentId} → HTTP ${res.status}`);
+  return (await res.json()) as BgmSegmentFull;
+}
+
+export async function approveBgmJob(segmentId: string, jobId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/bgm/segments/${segmentId}/approve/${jobId}`, { method: 'POST' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`POST bgm approve → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+export async function clearBgmApproval(segmentId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/bgm/segments/${segmentId}/approve`, { method: 'DELETE' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`DELETE bgm approve → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+export async function deleteBgmJob(jobId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/bgm/jobs/${jobId}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`DELETE bgm job → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
 }
 
 export async function setChosenRender(shotId: string, filename: string | null): Promise<void> {

@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, Get, NotFoundException, Param, P
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '../prisma/prisma.service';
 
-type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts' | 'bgm';
+type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts' | 'bgm' | 'anchor';
 
 interface QueueRow {
   type:          JobType;
@@ -110,7 +110,7 @@ export class PipelineController {
     // without N+1 queries.
     const bgmInclude     = { segment: { include: { block: { include: { project: true } } } } };
 
-    const [trA, dsA, scA, vrA, ttsA, bgmA] = await Promise.all([
+    const [trA, dsA, scA, vrA, ttsA, bgmA, anA] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.datasetJob.findMany({     where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.sceneRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
@@ -124,9 +124,10 @@ export class PipelineController {
       }),
       this.prisma.tTSJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: ttsInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.audioRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: bgmInclude, orderBy: { queuedAt: 'asc' } }),
+      (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
     ]);
 
-    const [trR, dsR, scR, vrR, vrUR, ttsR, bgmR] = await Promise.all([
+    const [trR, dsR, scR, vrR, vrUR, ttsR, bgmR, anR] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.datasetJob.findMany({     where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.sceneRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude,    orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
@@ -139,6 +140,7 @@ export class PipelineController {
       this.prisma.videoRender.findMany({ where: { upscaleStatus: { in: TERMINAL } }, include: shotInclude, orderBy: { upscaleCompletedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.tTSJob.findMany({ where: { status: { in: TERMINAL } }, include: ttsInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.audioRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: bgmInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
+      (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
     ]);
 
     // Each VideoRender row can contribute two queue rows (main + upscale).
@@ -158,12 +160,14 @@ export class PipelineController {
       ...videoActiveRows,
       ...ttsA.map(normalizeTTS),
       ...bgmA.map(normalizeBgm),
+      ...anA.map(normalizeAnchor),
       ...trR.map(normalizeTraining),
       ...dsR.map(normalizeDataset),
       ...scR.map(normalizeScene),
       ...videoRecentRows,
       ...ttsR.map(normalizeTTS),
       ...bgmR.map(normalizeBgm),
+      ...anR.map(normalizeAnchor),
     ];
 
     // ── 1b. Pending FIFO position ──────────────────────────────────────────
@@ -293,6 +297,15 @@ export class PipelineController {
         data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
       });
     }
+    if (type === 'anchor') {
+      const j = await (this.prisma as any).anchorRenderJob.findUnique({ where: { id } });
+      if (!j) throw new NotFoundException(`anchor job ${id} not found`);
+      if (TERMINAL.includes(j.status)) return j;
+      return (this.prisma as any).anchorRenderJob.update({
+        where: { id },
+        data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
+      });
+    }
     const job = await this.fetchOne(type, id);
     if (TERMINAL.includes(job.status)) return job;
     const data = { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' };
@@ -379,6 +392,25 @@ export class PipelineController {
       if (!j) throw new NotFoundException(`bgm job ${id} not found`);
       return normalizeBgm(j);
     }
+    if (type === 'anchor') {
+      const j = await (this.prisma as any).anchorRenderJob.findUnique({
+        where: { id },
+        include: {
+          profile: {
+            include: {
+              character: {
+                include: {
+                  project:      true,
+                  projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+                },
+              },
+            },
+          },
+        },
+      });
+      if (!j) throw new NotFoundException(`anchor job ${id} not found`);
+      return normalizeAnchor(j);
+    }
     const v = await this.prisma.videoRender.findUnique({
       where: { id },
       include: { shot: { include: { project: true, scene: true } } },
@@ -410,7 +442,7 @@ export class PipelineController {
       shot:  { include: { project: true, scene: true } },
     };
     const bgmInclude = { segment: { include: { block: { include: { project: true } } } } };
-    const [tr, ds, sc, vr, vrU, tts, bgm] = await Promise.all([
+    const [tr, ds, sc, vr, vrU, tts, bgm, an] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.datasetJob.findMany({     where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.sceneRenderJob.findMany({ where: { status: 'pending' },        include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
@@ -418,6 +450,7 @@ export class PipelineController {
       this.prisma.videoRender.findMany({    where: { upscaleStatus: 'pending' }, include: shotInclude,    orderBy: { upscaleQueuedAt: 'asc' } }),
       this.prisma.tTSJob.findMany({         where: { status: 'pending' },        include: ttsInclude,     orderBy: { queuedAt: 'asc' } }),
       this.prisma.audioRenderJob.findMany({ where: { status: 'pending' },        include: bgmInclude,     orderBy: { queuedAt: 'asc' } }),
+      (this.prisma as any).anchorRenderJob.findMany({ where: { status: 'pending' }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
     ]);
     return [
       ...tr.map(normalizeTraining),
@@ -427,6 +460,7 @@ export class PipelineController {
       ...vrU.map(normalizeVideoUpscale),
       ...tts.map(normalizeTTS),
       ...bgm.map(normalizeBgm),
+      ...an.map(normalizeAnchor),
     ].sort((a, b) => a.queuedAt.getTime() - b.queuedAt.getTime());
   }
 
@@ -438,6 +472,7 @@ export class PipelineController {
     // video_upscale uses its own FIFO field — see normalizeVideoUpscale.
     if (type === 'video_upscale') return this.prisma.videoRender.update({    where: { id }, data: { upscaleQueuedAt: queuedAt } });
     if (type === 'bgm')           return this.prisma.audioRenderJob.update({ where: { id }, data: { queuedAt } });
+    if (type === 'anchor')        return (this.prisma as any).anchorRenderJob.update({ where: { id }, data: { queuedAt } });
     return this.prisma.tTSJob.update({ where: { id }, data: { queuedAt } });
   }
 }
@@ -445,7 +480,7 @@ export class PipelineController {
 function isJobType(t: string): t is JobType {
   return t === 'training' || t === 'dataset' || t === 'scene'
       || t === 'video'    || t === 'video_upscale' || t === 'tts'
-      || t === 'bgm';
+      || t === 'bgm'      || t === 'anchor';
 }
 
 function cmp(a: QueueRow, b: QueueRow, field: SortField, order: 'asc' | 'desc'): number {
@@ -614,6 +649,30 @@ function normalizeBgm(j: any): QueueRow {
     projectId:     j.segment?.block?.project?.id   ?? null,
     shotId:        null,
     triggerToken:  null,
+    queuedAt:      j.queuedAt,
+    startedAt:     j.startedAt ?? null,
+    completedAt:   j.completedAt ?? null,
+    errorMessage:  j.errorMessage ?? null,
+    isFirstPending: false,
+    isLastPending:  false,
+  };
+}
+
+function normalizeAnchor(j: any): QueueRow {
+  // Anchor portrait render — cartoon character identity asset. Uses the same
+  // profile/character/project resolution chain as dataset/training jobs since
+  // it's a per-profile job. The 🎭 emoji surfaces in the queue UI as a quick
+  // visual differentiator from dataset/training rows for the same profile.
+  return {
+    type:          'anchor',
+    id:            j.id,
+    status:        j.status,
+    profileCode:   `🎭 ${j.profile?.profileCode ?? '—'}`,
+    characterCode: j.profile?.character?.code ?? '—',
+    projectSlug:   j.profile?.character?.project?.slug ?? j.profile?.character?.projectLinks?.[0]?.project?.slug ?? null,
+    projectId:     j.profile?.character?.project?.id   ?? j.profile?.character?.projectLinks?.[0]?.project?.id   ?? null,
+    shotId:        null,
+    triggerToken:  j.profile?.triggerToken ?? null,
     queuedAt:      j.queuedAt,
     startedAt:     j.startedAt ?? null,
     completedAt:   j.completedAt ?? null,

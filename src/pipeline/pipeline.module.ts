@@ -4,13 +4,14 @@ import { TrainingModule } from '../training/training.module';
 import { GenerationModule } from '../generation/generation.module';
 import { TTSModule } from '../tts/tts.module';
 import { BgmModule } from '../bgm/bgm.module';
+import { CharactersModule } from '../characters/characters.module';
 import { EngineModule } from './engine.module';
 import { PipelineQueueService } from './pipeline-queue.service';
 import { PipelineBootService } from './pipeline-boot.service';
 import { PipelineController } from './pipeline.controller';
 
 @Module({
-  imports:     [PrismaModule, EngineModule, TrainingModule, GenerationModule, TTSModule, BgmModule],
+  imports:     [PrismaModule, EngineModule, TrainingModule, GenerationModule, TTSModule, BgmModule, CharactersModule],
   controllers: [PipelineController],
   providers:   [PipelineQueueService, PipelineBootService],
 })

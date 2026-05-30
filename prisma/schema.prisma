@@ -51,6 +51,21 @@ model Project {
   /// "static". Should be a strong "freeze frame, no motion" directive.
   /// **Required** (NOT NULL + CHECK non-empty).
   defaultStaticMotionPrompt String
+  /// TTS engine to use for narration synthesis. 'silero' = CPU Silero V5 ru
+  /// (default; legacy projects); 'xtts2' = XTTS-v2 GPU voice cloning;
+  /// 'f5' = F5-TTS Russian GPU voice cloning. Null = treat as 'silero'.
+  /// Endpoints branch on this field.
+  ttsEngine               String?
+  /// Project-relative path to the single voice reference wav used by the
+  /// voice-clone engines (xtts2 / f5). Convention:
+  /// data/<slug>/tts/voice_reference.wav. Null = not uploaded yet (renders
+  /// fail with a clear error until set when ttsEngine is a voice-clone engine).
+  ttsVoiceRefPath         String?
+  /// Visual style of this project. Drives workflow routing + LoRA pipeline +
+  /// style-block injection into shot prompts. References visual_styles.id.
+  /// Default photoreal_cinematic for backwards compatibility with last_shift /
+  /// night_courier. See docs/VISUAL_STYLE_ARCHITECTURE.md.
+  visualStyle             String       @default("photoreal_cinematic")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -63,6 +78,7 @@ model Project {
   workflowRoutes    WorkflowRoute[]
   referenceAssets   ReferenceAsset[]
   narrativeBlocks   NarrativeBlock[]
+  ttsEmotionRefs    ProjectTTSEmotionRef[]
 
   @@map("projects")
 }
@@ -144,6 +160,7 @@ model CharacterProfile {
   datasetJobs      DatasetJob[]
   trainingJobs     TrainingJob[]
   shotParticipants ShotParticipant[]
+  anchorRenderJobs AnchorRenderJob[]
 
   @@unique([characterId, profileCode])
   @@map("character_profiles")
@@ -378,6 +395,10 @@ model WorkflowTemplate {
   templateKey String
   filePath    String
   description String?
+  /// Optional: this template is style-specific (e.g. graphic-novel cell-shaded
+  /// IP-Adapter workflow). Null = generic across styles (TTS, BGM, upscale).
+  /// References visual_styles.id.
+  visualStyle String?
   createdAt   DateTime @default(now())
 
   project    Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -557,15 +578,31 @@ model TTSJob {
   /// both null is a bug; service code enforces exactly-one-of.
   sceneId        String?
   shotId         String?
+  /// Engine snapshot at enqueue time. 'silero' = Silero V5 ru worker;
+  /// 'xtts2' = XTTS-v2 voice-clone worker; 'f5' = F5-TTS Russian voice-clone
+  /// worker. Null = legacy rows pre-dating the field; treat as 'silero'.
+  engine         String?
   /// Text snapshot at enqueue time. Editing narration text later does NOT
   /// retroactively change rendered audio — re-queue to regenerate.
   text           String
-  /// Silero speaker id. V5 voices: aidar | baya | kseniya | xenia | eugene.
-  /// V3/V4 additionally support: ruslan | random (random = new voice each call).
+  /// Silero speaker id (silero engine only). V5 voices: aidar | baya |
+  /// kseniya | xenia | eugene. V3/V4 add: ruslan | random.
+  /// Ignored by the voice-clone engines (xtts2 / f5).
   voice          String
   /// Which .pt model file under .silero_cache/ was used. Null = auto-pick by
   /// MODEL_FILENAMES precedence (V5_5 wins). Example: "v3_1_ru.pt", "v4_ru.pt".
   modelFilename  String?
+  /// Emotion preset, one of: neutral | happy | sad | angry | fear | disgust |
+  /// surprise | calm. Null = neutral. INERT today: both voice-clone engines
+  /// (xtts2, f5) ignore the categorical preset — tone comes from the speaker
+  /// clip. Kept as a snapshot/allow-list for a future categorical engine.
+  emotionPreset    String?
+  /// Emotion intensity [0.0–1.0]. Null = 0.5. INERT today (see emotionPreset).
+  emotionIntensity Float?
+  /// User-uploaded emotion reference name (matches ProjectTTSEmotionRef.name).
+  /// This is the knob that actually changes tone on xtts2/f5 (swaps the speaker
+  /// clip for the render). Overrides emotionPreset. Ignored for silero.
+  emotionRefName   String?
   /// Output sample rate: 8000 | 24000 | 48000 (Silero supports these three).
   sampleRate     Int
   /// Playback rate (1.0 = normal, <1 slower, >1 faster). Applied via
@@ -600,6 +637,33 @@ model TTSJob {
   @@index([shotId])
   @@index([status, queuedAt])
   @@map("tts_jobs")
+}
+
+// ─── Voice-clone emotion references (per-project library) ────────────────────
+//
+// Each project on a voice-clone engine (xtts2 / f5) has one voice reference
+// (Project.ttsVoiceRefPath) that defines WHO speaks, plus an arbitrary number
+// of named "emotion references" — short clips (~3–8s) of someone speaking
+// with the target prosody (tired, anxious, whispering, …). A shot's TTS job
+// can pick one by name; the worker uses it AS the speaker clip for that render
+// (these engines have no separate emotion path). Optional.
+
+model ProjectTTSEmotionRef {
+  id        String   @id @default(uuid())
+  projectId String
+  /// User-defined identifier, unique per project. Lowercase ASCII recommended
+  /// (e.g. "tired", "exhausted", "whisper"). Picked from a dropdown / typed
+  /// into autocomplete on the shot narration UI.
+  name      String
+  /// Project-relative wav path. Convention:
+  /// data/<slug>/tts/emotion_refs/<name>.wav.
+  filePath  String
+  createdAt DateTime @default(now())
+
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, name])
+  @@map("project_tts_emotion_refs")
 }
 
 // ─── BGM (ACE-Step v1.5 background music) ────────────────────────────────────
@@ -697,4 +761,52 @@ model AudioRenderJob {
   @@index([segmentId])
   @@index([status, queuedAt])
   @@map("audio_render_jobs")
+}
+
+/// Anchor portrait render jobs. Cartoon-style identity is locked via IP-Adapter
+/// on a single anchor PNG per character profile. This table tracks the queue
+/// of "render an anchor for this profile via ComfyUI" jobs the same way
+/// scene_render_jobs tracks shot renders. PipelineQueueService.tick() dispatches
+/// pending rows one at a time. See AnchorRenderService.
+model AnchorRenderJob {
+  id              String    @id @default(uuid())
+  profileId       String
+  status          String    @default("pending")
+  /// ComfyUI prompt_id once dispatched. Null until status moves from pending → running.
+  comfyPromptId   String?
+  /// Absolute on-disk path of the saved anchor PNG once completed.
+  outputPath      String?
+  errorMessage    String?
+  queuedAt        DateTime  @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  profile CharacterProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+  @@index([status, queuedAt])
+  @@map("anchor_render_jobs")
+}
+
+/// Visual-style registry. Each row defines a complete style: style-block tokens
+/// (prepended to shot prompts), default negative, identity-stack strategy
+/// (LoRA face-lock vs IP-Adapter vs IP-Adapter + style-LoRA), LoRA pipeline
+/// kind (character training vs none vs style-only), and references to workflow
+/// templates used for shots in this style. Project.visualStyle FKs here.
+/// See docs/VISUAL_STYLE_ARCHITECTURE.md.
+model VisualStyle {
+  id                     String   @id
+  displayName            String
+  styleBlock             String
+  defaultNegative        String
+  identityStack          String
+  loraPipeline           String
+  characterIpTemplateKey String?
+  environmentTemplateKey String?
+  datasetTemplateKey     String?
+  loraTrainTemplateKey   String?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @default(now()) @updatedAt
+
+  @@map("visual_styles")
 }

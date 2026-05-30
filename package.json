@@ -12,9 +12,7 @@
     "start:fresh": "npm run setup && npm run start:dev",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:studio": "prisma studio",
-    "bot":     "tsx bot/index.ts",
-    "bot:dev": "tsx watch bot/index.ts"
+    "prisma:studio": "prisma studio"
   },
   "dependencies": {
     "@nestjs/common": "^10.4.15",

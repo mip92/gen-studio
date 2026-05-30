@@ -131,6 +131,14 @@ def build_draft(manifest: dict) -> Path:
     script.add_track(draft.TrackType.audio, "narration")
 
     cursor_video_us = 0
+    # Independent audio cursor — tracks the earliest microsecond at which the
+    # next per-shot narration may start without overlapping the previous one
+    # on the shared "narration" lane. Per user spec: «вставляй по очереди,
+    # привязывай к началу шота если получается». Each narration anchors to
+    # its shot's start position when possible; if a previous narration ran
+    # past its shot and into this one, the current narration starts right
+    # after the previous instead. Sequential, never overlapping.
+    cursor_narration_us = 0
     total_clips     = 0
     total_tts       = 0
     total_bgm       = 0
@@ -164,32 +172,39 @@ def build_draft(manifest: dict) -> Path:
             script.add_segment(segment, track_name="main_video")
             all_video_segments.append(segment)
 
-            # Per-shot narration: lay the wav at this shot's exact timeline
-            # position. The Node-side duration_us is a text-length estimate; we
-            # probe the real wav here so pyJianYingDraft doesn't complain that
-            # our timerange exceeds the material length ("超出了素材时长").
+            # Per-shot narration: place sequentially on the narration lane.
+            # Anchor to shot start when possible; otherwise start after the
+            # previous narration finished. This means a long line bleeds past
+            # its own shot into the next one's slot, and the next narration
+            # then starts after the bleed instead of at its shot's start.
+            # That's the user-requested behaviour: «вставляй по очереди».
+            #
+            # Audio is NEVER truncated to fit the video shot — the full wav
+            # plays out. If a narration is shorter than its shot, silence
+            # fills the gap until the next shot's narration begins.
             shot_narr = sh.get("narration")
             if shot_narr and shot_narr.get("path"):
                 wav_path = shot_narr["path"].replace("\\", "/")
                 actual_us = _wav_duration_us(wav_path)
-                guess_us  = int(shot_narr.get("duration_us") or 0)
-                # Pick the SHORTER of: actual wav duration, the Node-side guess,
-                # and the shot's video duration. Never clip beyond what really
-                # exists in the wav file, and never overflow the video slot.
-                tts_dur = actual_us if actual_us > 0 else guess_us
-                if guess_us > 0:
-                    tts_dur = min(tts_dur, guess_us)
-                tts_dur = min(tts_dur, dur)
+                manifest_us = int(shot_narr.get("duration_us") or 0)
+                # Trust the on-disk probe; fall back to the manifest value
+                # (which is now TTSJob.durationMs from the Node side, not a
+                # text-length guess) only if the probe failed.
+                tts_dur = actual_us if actual_us > 0 else manifest_us
                 if tts_dur > 0:
+                    # Anchor to shot start unless the previous narration
+                    # overran into this shot's slot — then continue after it.
+                    audio_start_us = max(cursor_narration_us, cursor_video_us)
                     a_mat = draft.AudioMaterial(
                         wav_path,
                         material_name=f'{sh["shotCode"]}_narration',
                     )
                     a_seg = draft.AudioSegment(
                         material=a_mat,
-                        target_timerange=draft.Timerange(start=cursor_video_us, duration=tts_dur),
+                        target_timerange=draft.Timerange(start=audio_start_us, duration=tts_dur),
                     )
                     script.add_segment(a_seg, track_name="narration")
+                    cursor_narration_us = audio_start_us + tts_dur
                     total_tts += 1
                     any_shot_narration = True
 

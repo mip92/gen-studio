@@ -37,4 +37,17 @@ export class CreateProjectDto {
   @IsOptional()
   @IsString()
   scriptText?: string;
+
+  /**
+   * Visual style of this project. Drives workflow routing + LoRA pipeline +
+   * style-block injection into shot prompts. References visual_styles.id.
+   * Defaults to 'photoreal_cinematic' so projects created without explicit
+   * style keep last_shift / night_courier behaviour.
+   *
+   * Today: 'photoreal_cinematic' | 'graphic_novel_cell_shaded'.
+   * See docs/VISUAL_STYLE_ARCHITECTURE.md.
+   */
+  @IsOptional()
+  @IsString()
+  visualStyle?: string;
 }

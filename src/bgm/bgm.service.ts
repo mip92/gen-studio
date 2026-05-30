@@ -61,6 +61,26 @@ export class BgmService {
     });
   }
 
+  /** Single segment with its jobs (newest first) + parent block + project slug.
+   *  Used by the bot's segment-view to refresh approval state after a tap and
+   *  to resolve the on-disk flac path (which lives under <slug>/bgm/<blockSlug>/). */
+  async getSegment(segmentId: string) {
+    const segment = await this.prisma.musicSegment.findUnique({
+      where: { id: segmentId },
+      include: {
+        block: {
+          select: {
+            id: true, slug: true, title: true, projectId: true,
+            project: { select: { slug: true } },
+          },
+        },
+        jobs: { orderBy: { queuedAt: 'desc' } },
+      },
+    });
+    if (!segment) throw new NotFoundException(`Segment ${segmentId} not found`);
+    return segment;
+  }
+
   async getBlock(blockId: string) {
     const block = await this.prisma.narrativeBlock.findUnique({
       where:   { id: blockId },

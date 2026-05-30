@@ -368,13 +368,39 @@ export class SceneRenderService {
     `;
     const locationDescription = locationRows[0]?.description ?? null;
 
-    // ── 2. Resolve participant → trained CharacterProfile ────────────────────
-    // If the participant explicitly picks a profile (age variant), use it.
-    // Otherwise fall back to the first profile of the character that has a LoRA.
+    // ── 2. Resolve participant → CharacterProfile ────────────────────────────
+    // Photoreal path (Project.visualStyle = 'photoreal_cinematic'): requires
+    // trained LoRA per participant — throws if missing.
+    // Cartoon path (e.g. 'graphic_novel_cell_shaded' for bio_plus): identity
+    // lock is via IP-Adapter at 0.4 weight on a single anchor reference image,
+    // no LoRA training required. profile.loraPath stays NULL; profile.useIpAdapter
+    // is TRUE; reference image lives at data/<slug>/reference/<profileCode>_anchor.png.
+    const visualStyle: string = (shot.project as any).visualStyle ?? 'photoreal_cinematic';
+    const isCartoon = visualStyle !== 'photoreal_cinematic';
+
     const participants: SceneParticipant[] = [];
     for (const sp of shot.participants) {
       if (!sp.character) continue;            // unbound participant slot
 
+      if (isCartoon) {
+        // Cartoon path — no LoRA required, identity via IP-Adapter anchor + text.
+        const profile = sp.profile ?? sp.character.profiles[0];
+        if (!profile || !profile.triggerToken) {
+          throw new BadRequestException(
+            `Character "${sp.character.code}" has no profile or trigger token. Cartoon projects still need a CharacterProfile row for promptBase + triggerToken.`,
+          );
+        }
+        participants.push({
+          triggerToken:    profile.triggerToken!,
+          displayName:     sp.character.displayName ?? sp.character.code,
+          loraPath:        '',                              // sentinel — strategy ignores when style=cartoon
+          characterPrompt: profile.promptBase ?? '',
+          loraStrength:    input.loraStrength,
+        });
+        continue;
+      }
+
+      // Photoreal path — must have trained LoRA.
       const profile = sp.profile && sp.profile.loraPath && sp.profile.triggerToken
         ? sp.profile
         : sp.character.profiles.find((p) => p.loraPath && p.triggerToken);
@@ -397,8 +423,8 @@ export class SceneRenderService {
 
     // 0 participants is fine — uses environment strategy (no LoRA).
 
-    // ── 3. Pick strategy by participant count ────────────────────────────────
-    const strategy = this.scenes.pickByParticipantCount(participants.length);
+    // ── 3. Pick strategy by visual style + participant count ─────────────────
+    const strategy = this.scenes.pickByStyleAndParticipantCount(visualStyle, participants.length);
     const template = this.scenes.loadTemplate(strategy, shot.project.slug);
 
     // ── 4. Build params ──────────────────────────────────────────────────────
@@ -436,16 +462,26 @@ export class SceneRenderService {
       positive = parts.join(', ');
     }
 
-    // Location injection: prepend the Location.description (looked up above
-    // via $queryRaw) onto the positive. Single source of truth for the cramped
-    // Soviet train kupe / corridor / vestibule prose — editing the Location
-    // row updates every shot tagged with it. Idempotent.
+    // Location injection: APPEND the Location.description to the end of the
+    // positive. Order matters for CLIP-G conditioning — tokens nearest the
+    // start get the strongest weight, so character/face/action tokens stay
+    // first and the location prose comes last. Single source of truth for
+    // the train_kupe / corridor / vestibule prose; editing the Location row
+    // updates every shot tagged with it. Idempotent.
     if (locationDescription && locationDescription.trim().length > 0) {
       const desc = locationDescription.trim();
-      if (!positive.startsWith(desc)) {
-        positive = `${desc}, ${positive}`;
+      if (!positive.endsWith(desc)) {
+        positive = positive.trim().length > 0 ? `${positive}, ${desc}` : desc;
       }
     }
+
+    // Strip any weight syntax from the final positive — project rule: no
+    // per-token emphasis anywhere (positive OR negative). Logs each strip so
+    // we can trace whoever introduced the weight (user text, location prose,
+    // bug, etc.). Safety net only — DB content is also clean by convention.
+    positive = stripPromptWeights(positive, (tok, w) => {
+      this.logger.warn(`[${shot.shotCode}] stripped positive weight "(${tok}:${w})" — weights banned in prompts`);
+    });
 
     // Negative fallback: per-shot override beats project-wide default. Same
     // logic — one edit in `Project.defaultNegative` updates every shot that
@@ -577,11 +613,11 @@ function toComfyLoraName(absolutePath: string): string {
 // Past incident: a user/UI saved a 30-token negative full of weighted phrases
 // like `(red towel:2.0), (towel:1.8), (motion blur), (out of focus), (smudged)`
 // to every shot. Result: SDXL output had plastic skin, HDR oversaturation,
-// hyper-sharp grain — a "grubo" look. Weights >= 1.5 are destructive in SDXL
-// (normal range 1.0-1.3); over-sharp tokens push the model into anti-blur
-// overshoot. This guard caps weights and strips known-toxic sharpening tokens
+// hyper-sharp grain — a "grubo" look. Even "capped" weights (1.3) caused
+// drift on positive-prompt LoRA conditioning. Project rule (2026-05-24):
+// zero `(token:N)` syntax anywhere — flat prompts only. The sanitizer below
+// strips weights from negatives and removes known-toxic sharpening tokens
 // before the negative reaches the strategy / KSampler.
-const MAX_NEGATIVE_WEIGHT = 1.3;
 // Tokens that, on the negative side, paradoxically push toward over-sharpening
 // and plastic skin in SDXL. Keep this list narrow — only add tokens with
 // confirmed visible damage.
@@ -599,14 +635,14 @@ function sanitizeNegative(
   let cleaned = raw;
   const warnings: string[] = [];
 
-  // 1. Cap weights: replace (token:1.8) with (token:1.3) when weight > MAX.
-  cleaned = cleaned.replace(/\(([^():]+):([0-9]+(?:\.[0-9]+)?)\)/g, (_, token, w) => {
-    const weight = parseFloat(w);
-    if (weight > MAX_NEGATIVE_WEIGHT) {
-      warnings.push(`weight ${weight} on "${token.trim()}" capped to ${MAX_NEGATIVE_WEIGHT}`);
-      return `(${token}:${MAX_NEGATIVE_WEIGHT})`;
-    }
-    return `(${token}:${weight})`;
+  // 1. Strip ALL weight syntax — no (token:N) anywhere. Project rule: prompts
+  // stay plain, no per-token emphasis. Past incident: weights >= 1.5 cause
+  // plastic-skin/hyper-sharp damage in SDXL even when "capped". User-facing
+  // ban introduced 2026-05-24 after suspected face-drift on shots with rich
+  // location descriptions. The simpler invariant — zero weights — is easier
+  // to enforce and audit than per-engine weight tolerance.
+  cleaned = stripPromptWeights(cleaned, (tok, w) => {
+    warnings.push(`stripped weight "(${tok}:${w})" — weights banned in prompts`);
   });
 
   // 2. Strip toxic over-sharpening tokens (whole-word, comma-separated chunks).
@@ -622,5 +658,23 @@ function sanitizeNegative(
   if (warnings.length > 0) {
     logger.warn(`[${shotCode}] negative sanitized: ${warnings.join('; ')}`);
   }
+  return cleaned;
+}
+
+/** Strip any `(token:weight)` syntax from a prompt. Project rule: prompts
+ *  stay flat, no per-token emphasis (positive OR negative). The two patterns
+ *  we handle: `(red towel:1.8)` → `red towel`, and the rare double-paren
+ *  shortcut `((token))` → `token`. Called from positive + negative paths. */
+export function stripPromptWeights(
+  raw: string,
+  onStrip?: (token: string, weight: string) => void,
+): string {
+  // Drop the `:weight` part inside parens; keep the bare token.
+  let cleaned = raw.replace(/\(([^():]+):([0-9]+(?:\.[0-9]+)?)\)/g, (_, token, w) => {
+    onStrip?.(String(token).trim(), String(w));
+    return String(token).trim();
+  });
+  // Collapse `((token))` / `(token)` to bare token — these are emphasis shortcuts.
+  cleaned = cleaned.replace(/\(+\s*([^()]+?)\s*\)+/g, (_, token) => String(token).trim());
   return cleaned;
 }

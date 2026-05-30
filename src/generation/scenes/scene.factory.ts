@@ -10,14 +10,20 @@ import { EnvironmentHiresSceneStrategy } from './strategies/environment-hires.st
 import { SingleCharacterHiresSceneStrategy } from './strategies/single-character-hires.strategy';
 import { EnvironmentFluxSceneStrategy } from './strategies/environment-flux.strategy';
 import { EnvironmentFluxHiresSceneStrategy } from './strategies/environment-flux-hires.strategy';
+import { SingleCharacterGraphicNovelSceneStrategy } from './strategies/single-character-graphic-novel.strategy';
+import { DualCharacterGraphicNovelSceneStrategy } from './strategies/dual-character-graphic-novel.strategy';
+import { EnvironmentGraphicNovelSceneStrategy } from './strategies/environment-graphic-novel.strategy';
 
 const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..', '..');
+
+const DEFAULT_VISUAL_STYLE = 'photoreal_cinematic';
 
 @Injectable()
 export class SceneFactory {
   private readonly strategies = new Map<string, SceneStrategy>();
 
   constructor() {
+    // ── PHOTOREAL strategies (visualStyle undefined / 'photoreal_cinematic') ──
     // Default for 0-participant (no-LoRA) shots: Flux UltraReal v4 hires →
     // photoreal 1920×1080. Picked first by pickByParticipantCount(0).
     // For 1+ participants, NON-hires single-pass picks first — the SDXL hires
@@ -33,20 +39,65 @@ export class SceneFactory {
     this.register(new EnvironmentHiresSceneStrategy());
     this.register(new SingleCharacterHiresSceneStrategy());
 
-    // DualCharacterRegional was a 2-LoRA regional-prompting attempt that
-    // produced face-bleed and identity mixing. Replaced by SingleWithBack
+    // ── GRAPHIC NOVEL CELL-SHADED strategies ──────────────────────────────────
+    // For projects with Project.visualStyle = 'graphic_novel_cell_shaded'
+    // (e.g. bio_plus). Picked by pickByStyleAndParticipantCount(style, count).
+    // NO LoRA face-lock — IP-Adapter at 0.4 weight + comic-style LoRA only.
+    this.register(new SingleCharacterGraphicNovelSceneStrategy());
+    this.register(new DualCharacterGraphicNovelSceneStrategy());
+    this.register(new EnvironmentGraphicNovelSceneStrategy());
+
+    // PHOTOREAL DualCharacterRegional was a 2-LoRA regional-prompting attempt
+    // that produced face-bleed and identity mixing. Replaced by SingleWithBack
     // (one LoRA + second character text-only from behind). The strategy file
     // is kept on disk in case a future LoRA-Hooks revival makes 2-LoRA viable.
+    //
+    // The CARTOON DualCharacterGraphicNovel (registered above) is a DIFFERENT
+    // mechanism: regional TEXT conditioning (ConditioningSetArea), no character
+    // LoRA at all — so it does not have the 2-LoRA bleed problem. First version,
+    // under test.
   }
 
-  /** Pick a strategy that supports the given participant count. */
+  /**
+   * Legacy picker (photoreal only). Picks first strategy matching count.
+   * Kept for backwards compatibility with callers that haven't been updated
+   * to pass visualStyle yet.
+   *
+   * @deprecated Use pickByStyleAndParticipantCount(style, count) instead.
+   */
   pickByParticipantCount(count: number): SceneStrategy {
+    return this.pickByStyleAndParticipantCount(DEFAULT_VISUAL_STYLE, count);
+  }
+
+  /**
+   * Style-aware picker. Picks the first strategy whose visualStyle matches
+   * AND participantCount matches. If visualStyle is undefined or empty,
+   * falls back to 'photoreal_cinematic'. If no exact style match found,
+   * falls back to photoreal (so projects added before this method existed
+   * keep working).
+   */
+  pickByStyleAndParticipantCount(visualStyle: string | null | undefined, count: number): SceneStrategy {
+    const style = (visualStyle && visualStyle.trim().length > 0) ? visualStyle : DEFAULT_VISUAL_STYLE;
+
+    // First pass: exact style + count match
     for (const s of this.strategies.values()) {
-      if (s.participantCount === count) return s;
+      if (s.participantCount === count && (s.visualStyle ?? DEFAULT_VISUAL_STYLE) === style) {
+        return s;
+      }
     }
+
+    // Fallback: any strategy with no explicit visualStyle (treated as photoreal default)
+    if (style !== DEFAULT_VISUAL_STYLE) {
+      for (const s of this.strategies.values()) {
+        if (s.participantCount === count && s.visualStyle === undefined) {
+          return s;
+        }
+      }
+    }
+
     throw new NotFoundException(
-      `No scene strategy registered for ${count} participant(s). ` +
-      `Available counts: [${[...this.strategies.values()].map((s) => s.participantCount).join(', ')}]`,
+      `No scene strategy registered for style="${style}" with ${count} participant(s). ` +
+      `Available: ${[...this.strategies.values()].map((s) => `${s.id}(style=${s.visualStyle ?? 'photoreal_cinematic'}, p=${s.participantCount})`).join('; ')}`,
     );
   }
 
@@ -57,8 +108,8 @@ export class SceneFactory {
   }
 
   list() {
-    return [...this.strategies.values()].map(({ id, description, filename, participantCount }) => ({
-      id, description, filename, participantCount,
+    return [...this.strategies.values()].map(({ id, description, filename, participantCount, visualStyle }) => ({
+      id, description, filename, participantCount, visualStyle: visualStyle ?? DEFAULT_VISUAL_STYLE,
     }));
   }
 

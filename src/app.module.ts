@@ -16,6 +16,7 @@ import { ExportsModule } from './exports/exports.module';
 import { PipelineModule } from './pipeline/pipeline.module';
 import { ActionsModule } from './actions/actions.module';
 import { LocationsModule } from './locations/locations.module';
+import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { LocationsModule } from './locations/locations.module';
     PipelineModule,
     ActionsModule,
     LocationsModule,
+    TelegramBotModule,
   ],
 })
 export class AppModule {}

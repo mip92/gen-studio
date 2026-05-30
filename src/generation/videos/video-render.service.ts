@@ -18,6 +18,7 @@ import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService } from '../../comfy/comfy.service';
 import { StartVideoInput, VideoRenderParams } from './video-job.types';
+import { stripPromptWeights } from '../scenes/scene-render.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
@@ -148,15 +149,27 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       // When both empty, the workflow JSON's hardcoded fallback stays.
       const pf      = (v.shot.promptFields ?? {}) as Record<string, unknown>;
       const project = v.shot.project as any;
-      const motionNegative =
+      const rawMotionNegative =
         (typeof pf.motionNegative === 'string' && pf.motionNegative.trim().length > 0)
           ? (pf.motionNegative as string)
           : (typeof project.defaultVideoNegative === 'string' && project.defaultVideoNegative.trim().length > 0
               ? project.defaultVideoNegative as string
               : undefined);
+      // Strip any weight syntax from BOTH motion prompts before they reach
+      // the i2v workflow. Project rule: zero `(token:N)` anywhere.
+      const motionPrompt = stripPromptWeights(
+        this.composeMotionPrompt(v.motionPrompt, v.shot, project),
+        (tok, w) => this.logger.warn(`[${v.shot.shotCode}] stripped motionPrompt weight "(${tok}:${w})"`),
+      );
+      const motionNegative = rawMotionNegative
+        ? stripPromptWeights(
+            rawMotionNegative,
+            (tok, w) => this.logger.warn(`[${v.shot.shotCode}] stripped motionNegative weight "(${tok}:${w})"`),
+          )
+        : undefined;
       const workflow = this.patch(template, {
         sourceImage:    inputBasename,
-        motionPrompt:   this.composeMotionPrompt(v.motionPrompt, v.shot, project),
+        motionPrompt,
         motionNegative,
         seed:           params.seed,
         width:          params.width,

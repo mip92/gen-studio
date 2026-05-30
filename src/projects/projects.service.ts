@@ -41,6 +41,8 @@ export class ProjectsService {
           defaultVideoNegative:      dto.defaultVideoNegative,
           defaultMotionPrompt:       dto.defaultMotionPrompt,
           defaultStaticMotionPrompt: dto.defaultStaticMotionPrompt,
+          // Visual style — falls back to DB default 'photoreal_cinematic' if omitted.
+          ...(dto.visualStyle ? { visualStyle: dto.visualStyle } : {}),
         } as any),
       },
     });
@@ -69,9 +71,29 @@ export class ProjectsService {
           defaultVideoNegative:      (dto as any).defaultVideoNegative,
           defaultMotionPrompt:       (dto as any).defaultMotionPrompt,
           defaultStaticMotionPrompt: (dto as any).defaultStaticMotionPrompt,
+          // Allow changing visualStyle post-creation. Affects future renders
+          // only (already-rendered shots keep their existing image data).
+          ...(dto.visualStyle ? { visualStyle: dto.visualStyle } : {}),
         } as any),
       },
     });
+  }
+
+  /**
+   * List available visual styles (registry). Used by UI to populate the
+   * project-creation dropdown.
+   */
+  async listVisualStyles() {
+    return this.prisma.$queryRaw<Array<{
+      id: string;
+      displayName: string;
+      identityStack: string;
+      loraPipeline: string;
+    }>>`
+      SELECT id, "displayName", "identityStack", "loraPipeline"
+      FROM visual_styles
+      ORDER BY "createdAt" ASC
+    `;
   }
 
   async remove(id: string) {

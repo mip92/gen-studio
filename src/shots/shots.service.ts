@@ -22,7 +22,10 @@ const SHOT_FULL_INCLUDE = {
     },
   },
   scene:   true,
-  project: { select: { id: true, slug: true, name: true } },
+  // visualStyle is REQUIRED by the frontend (ShotDetail) to branch cartoon vs
+  // photoreal — without it isCartoon defaults false and cartoon shots wrongly
+  // demand a LoRA. Mutation responses must carry it just like findById.
+  project: { select: { id: true, slug: true, name: true, visualStyle: true } },
   // Used by the Telegram bot's approval flow and the videos tab — full list
   // of completed/in-flight VideoRender rows for this shot. No `orderBy as
   // const` because Prisma's input-types reject it under TypeScript strict.
@@ -62,6 +65,7 @@ export class ShotsService {
       include: {
         participants: { include: { character: true, profile: true } },
         scene:        true,
+        project:      { select: { id: true, slug: true, name: true, visualStyle: true } },
       },
     });
     if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);

@@ -194,7 +194,9 @@ export class CharactersService {
     return this.prisma.character.findMany({
       include: {
         profiles:     true,
-        projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+        // visualStyle exposed so UI character cards can pick the right
+        // identity-pipeline badge (LoRA for photoreal, anchor for cartoon)
+        projectLinks: { include: { project: { select: { id: true, slug: true, name: true, visualStyle: true } } } },
       },
       orderBy: { code: 'asc' },
     });
@@ -284,7 +286,9 @@ export class CharactersService {
       where:   { id: characterId },
       include: {
         profiles:     true,
-        projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+        // visualStyle exposed so UI character cards can pick the right
+        // identity-pipeline badge (LoRA for photoreal, anchor for cartoon)
+        projectLinks: { include: { project: { select: { id: true, slug: true, name: true, visualStyle: true } } } },
       },
     });
     if (!character) throw new NotFoundException(`Character ${characterId} not found`);

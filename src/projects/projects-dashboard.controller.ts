@@ -364,8 +364,15 @@ export class ProjectsDashboardController {
     // before returning so the next /scenes call reads precomputed values.
     const ttsDurationBackfills: Array<{ jobId: string; durationMs: number }> = [];
 
+    // Project.visualStyle drives whether participants need a trained LoRA
+    // (photoreal pipeline) or just promptBase+triggerToken (cartoon / anchor
+    // pipeline). Exposed in the response so the frontend can label gating
+    // states correctly. Default keeps legacy projects on photoreal.
+    const visualStyle: string = (project as { visualStyle?: string }).visualStyle ?? 'photoreal_cinematic';
+    const isCartoon = visualStyle !== 'photoreal_cinematic';
+
     const response = {
-      project: { id: project.id, slug: project.slug, name: project.name },
+      project: { id: project.id, slug: project.slug, name: project.name, visualStyle },
       scenes: project.scenes.map((s) => ({
         id:              s.id,
         sceneKey:        s.sceneKey,
@@ -382,13 +389,24 @@ export class ProjectsDashboardController {
           };
           const renders = (sh.renderedImages as Array<{ filename: string }> | null) ?? [];
 
-          // Resolve which profile (LoRA) is going to be used per-participant.
+          // Resolve which profile is going to be used per-participant.
+          // Photoreal: needs a trained LoRA (loraPath) + triggerToken.
+          // Cartoon: identity comes from promptBase + triggerToken (anchor PNG
+          // is optional unless the workflow wires IP-Adapter). The same
+          // `loraReady` field name carries the "identity ready" semantic for
+          // both styles — frontend gating reads it as "render is allowed".
           const participants = sh.participants.map((p) => {
             // Explicit profile (chosen by user) → use it.
-            // Else fallback to the character's first profile with a trained LoRA.
+            // Else fallback: cartoon picks any profile with promptBase+triggerToken;
+            // photoreal picks the first profile with a trained LoRA.
             const explicit = p.profile;
-            const fallback = p.character?.profiles?.find((pp) => pp.loraPath && pp.triggerToken) ?? null;
+            const fallback = isCartoon
+              ? (p.character?.profiles?.find((pp) => pp.promptBase && pp.triggerToken) ?? null)
+              : (p.character?.profiles?.find((pp) => pp.loraPath  && pp.triggerToken) ?? null);
             const used     = explicit ?? fallback;
+            const ready = isCartoon
+              ? !!(used?.promptBase && used?.triggerToken)
+              : !!(used?.loraPath   && used?.triggerToken);
             return {
               id:           p.id,
               label:        p.label,
@@ -398,7 +416,7 @@ export class ProjectsDashboardController {
               profileId:            used?.id          ?? null,
               profileCode:          used?.profileCode ?? null,
               profileAgeLabel:      used?.ageLabel    ?? null,
-              loraReady:            !!(used?.loraPath && used?.triggerToken),
+              loraReady:            ready,
               chosenExplicitly:     !!explicit,
             };
           });

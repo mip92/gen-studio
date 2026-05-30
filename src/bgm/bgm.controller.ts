@@ -86,6 +86,17 @@ export class BgmController {
 
   // ── Segments ──────────────────────────────────────────────────────────────
 
+  @Get('segments/:segmentId')
+  @ApiOperation({
+    summary: 'Get a single MusicSegment with parent block reference + render jobs',
+    description: 'Lightweight single-segment view used by the Telegram bot to '
+              + 'refresh approval state after a tap. Use /bgm/projects/:id/blocks '
+              + 'for the full project tree.',
+  })
+  getSegment(@Param('segmentId') segmentId: string) {
+    return this.bgm.getSegment(segmentId);
+  }
+
   @Post('segments')
   @ApiOperation({ summary: 'Create a single MusicSegment manually under a block' })
   createSegment(@Body() body: CreateSegmentInput) {

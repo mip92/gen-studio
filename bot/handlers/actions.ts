@@ -1,11 +1,14 @@
 import type { Bot, Context } from 'grammy';
-import { InlineKeyboard, InputFile, InputMediaPhoto } from 'grammy';
+import { InlineKeyboard, InputFile } from 'grammy';
+import type { InputMediaPhoto } from 'grammy/types';
 import { existsSync } from 'fs';
 import * as path from 'path';
 import {
   ActionItem,
   ShotFull,
   GateKey,
+  TtsJobRow,
+  BgmSegmentFull,
   fetchActions,
   fetchShotWithVideos,
   setChosenRender,
@@ -15,6 +18,13 @@ import {
   startUpscale,
   enqueueSceneRender,
   startVideoRender,
+  approveTTSJob,
+  deleteTTSJob,
+  clearShotTTSApproval,
+  fetchSegment,
+  approveBgmJob,
+  deleteBgmJob,
+  clearBgmApproval,
 } from '../lib/actions-api';
 
 const APP_ROOT    = process.env.APP_ROOT    ?? path.resolve(__dirname, '..', '..');
@@ -23,6 +33,7 @@ const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 // ── Callback-data scheme (each callback ≤ 64 bytes per Telegram limit) ─────
 //   "a:list"                       — re-render the actions list
 //   "a:open:<shotId>"              — open the shot's "what's here" view
+//   "a:open-seg:<segmentId>"       — open the BGM segment's "what's here" view
 //   "a:p-img:<shotId>:<idx>"       — approve image #idx (1-based)
 //   "a:d-img:<shotId>:<idx>"       — delete image #idx from disk + DB
 //   "a:p-vid:<shotId>:<idx>"       — approve video #idx
@@ -31,6 +42,12 @@ const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 //   "a:r-scn:<shotId>"             — enqueue a fresh scene render
 //   "a:r-vid:<shotId>"             — start a video render (from chosenRender)
 //   "a:s-img:<shotId>"             — clear chosenRender
+//   "a:p-tts:<shotId>:<idx>"       — approve shot-TTS job #idx (completed only)
+//   "a:d-tts:<shotId>:<idx>"       — delete shot-TTS job #idx
+//   "a:s-tts:<shotId>"             — clear shot.approvedTTSJobId
+//   "a:p-bgm:<segmentId>:<idx>"    — approve BGM job #idx for the segment
+//   "a:d-bgm:<segmentId>:<idx>"    — delete BGM job #idx
+//   "a:s-bgm:<segmentId>"          — clear segment.approvedJobId
 //
 // UUID is 36 chars → "a:p-img:<uuid>:<idx>" = ~48 bytes. Fits.
 
@@ -144,6 +161,80 @@ export function registerActionsHandlers(bot: Bot): void {
       await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
     }
   });
+
+  // ── TTS approve / delete / clear ────────────────────────────────────────
+
+  bot.callbackQuery(/^a:p-tts:/, async (ctx) => {
+    const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withShotTts(ctx, shotId, Number(idxStr), async (shot, job) => {
+      await approveTTSJob(job.id);
+      await safeAnswer(ctx, { text: `✓ TTS #${idxStr} approved` });
+      await ctx.reply(
+        `🎙✅ <b>${escapeHtml(shot.shotCode)}</b>\napprovedTTSJobId = <code>${escapeHtml(job.id)}</code>`,
+        { parse_mode: 'HTML' },
+      );
+    });
+  });
+
+  bot.callbackQuery(/^a:d-tts:/, async (ctx) => {
+    const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withShotTts(ctx, shotId, Number(idxStr), async (shot, job) => {
+      await deleteTTSJob(job.id);
+      await safeAnswer(ctx, { text: `🗑 TTS #${idxStr} удалён` });
+      await ctx.reply(`🎙🗑 <b>${escapeHtml(shot.shotCode)}</b> — TTS-дубль удалён`, { parse_mode: 'HTML' });
+    });
+  });
+
+  bot.callbackQuery(/^a:s-tts:/, async (ctx) => {
+    const shotId = ctx.callbackQuery.data!.split(':')[2];
+    try {
+      await clearShotTTSApproval(shotId);
+      await safeAnswer(ctx, { text: '✗ approval сброшен' });
+    } catch (err) {
+      await safeAnswer(ctx, { text: 'Ошибка' });
+      await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+    }
+  });
+
+  // ── BGM open / approve / delete / clear ─────────────────────────────────
+
+  bot.callbackQuery(/^a:open-seg:/, async (ctx) => {
+    if (!(await safeAnswer(ctx))) return;
+    const segmentId = ctx.callbackQuery.data!.split(':')[2];
+    await openSegmentView(ctx, segmentId);
+  });
+
+  bot.callbackQuery(/^a:p-bgm:/, async (ctx) => {
+    const [, , segmentId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withSegmentJob(ctx, segmentId, Number(idxStr), async (seg, job) => {
+      await approveBgmJob(segmentId, job.id);
+      await safeAnswer(ctx, { text: `✓ BGM #${idxStr} approved` });
+      await ctx.reply(
+        `🎵✅ <b>${escapeHtml(seg.block.slug)}/${seg.sortOrder + 1}</b>\napprovedJobId = <code>${escapeHtml(job.id)}</code>`,
+        { parse_mode: 'HTML' },
+      );
+    });
+  });
+
+  bot.callbackQuery(/^a:d-bgm:/, async (ctx) => {
+    const [, , segmentId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withSegmentJob(ctx, segmentId, Number(idxStr), async (seg, job) => {
+      await deleteBgmJob(job.id);
+      await safeAnswer(ctx, { text: `🗑 BGM #${idxStr} удалён` });
+      await ctx.reply(`🎵🗑 <b>${escapeHtml(seg.block.slug)}/${seg.sortOrder + 1}</b> — дубль удалён`, { parse_mode: 'HTML' });
+    });
+  });
+
+  bot.callbackQuery(/^a:s-bgm:/, async (ctx) => {
+    const segmentId = ctx.callbackQuery.data!.split(':')[2];
+    try {
+      await clearBgmApproval(segmentId);
+      await safeAnswer(ctx, { text: '✗ approval сброшен' });
+    } catch (err) {
+      await safeAnswer(ctx, { text: 'Ошибка' });
+      await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+    }
+  });
 }
 
 // ── Actions list ────────────────────────────────────────────────────────────
@@ -173,15 +264,25 @@ async function sendActionsList(ctx: Context, opts: { edit?: boolean } = {}): Pro
       lines.push(`\n<b>· ${escapeHtml(slug)}</b> — ${group.length} pending`);
       for (const it of group.slice(0, 14)) {
         const tag    = gateTag(it.gateKey);
-        const target = it.shot?.code ?? it.character?.code ?? it.profile?.code ?? '?';
+        const target = it.shot?.code
+                    ?? it.character?.code
+                    ?? it.profile?.code
+                    ?? (it.segment ? `${it.segment.block.slug}/${it.segment.sortOrder + 1}` : null)
+                    ?? it.scene?.sceneKey
+                    ?? '?';
         lines.push(`  ${tag} ${escapeHtml(target)} — ${gateLabel(it.gateKey)}`);
 
-        // Only shot-anchored items get an "Открыть" button; character-level
-        // (upload images / start dataset / start training) don't have a
-        // shot to open. They get triggered via the action.path the API
-        // already provides — we expose them as ▶ buttons too where useful.
-        if (it.shot && buttonsAdded < MAX_BUTTONS) {
+        if (buttonsAdded >= MAX_BUTTONS) continue;
+        // Shot-anchored items (gates 4–9 with a shot) → open shot view, which
+        // surfaces images + videos + TTS in one card.
+        // Segment-anchored items (gate 10 BGM) → open segment view.
+        // Character / scene-only items are listed without a button — the user
+        // jumps to the UI via the link in the message.
+        if (it.shot) {
           kb.text(`${tag} ${target}`.slice(0, 30), `a:open:${it.shot.id}`).row();
+          buttonsAdded++;
+        } else if (it.segment) {
+          kb.text(`${tag} ${target}`.slice(0, 30), `a:open-seg:${it.segment.id}`).row();
           buttonsAdded++;
         }
       }
@@ -206,6 +307,8 @@ function gateTag(g: GateKey): string {
     case 'create_video':          return '🎬';
     case 'approve_video':         return '✅';
     case 'upscale_video':         return '⬆️';
+    case 'approve_tts':           return '🎙';
+    case 'approve_bgm':           return '🎵';
   }
 }
 function gateLabel(g: GateKey): string {
@@ -218,6 +321,8 @@ function gateLabel(g: GateKey): string {
     case 'create_video':          return 'нужно видео';
     case 'approve_video':         return 'выбрать видео';
     case 'upscale_video':         return 'нужен FHD-upscale';
+    case 'approve_tts':           return 'выбрать дубль озвучки';
+    case 'approve_bgm':           return 'выбрать дубль BGM';
   }
 }
 
@@ -239,9 +344,8 @@ async function openShotView(ctx: Context, shotId: string): Promise<void> {
   const headerLines: string[] = [
     `<b>${escapeHtml(shot.shotCode)}</b>`,
   ];
-  const sn = (shot as any).narrationText as string | null | undefined;
-  if (sn && sn.trim().length) {
-    headerLines.push(`<i>«${escapeHtml(sn.trim().slice(0, 200))}»</i>`);
+  if (shot.narrationText && shot.narrationText.trim().length) {
+    headerLines.push(`<i>«${escapeHtml(shot.narrationText.trim().slice(0, 200))}»</i>`);
   }
   headerLines.push(
     `\n🖼 кадров: ${renders.length}${shot.chosenRender ? ` (✓ выбран)` : ''}`,
@@ -327,6 +431,123 @@ async function openShotView(ctx: Context, shotId: string): Promise<void> {
     const kb = new InlineKeyboard().text('🎬 Запустить видео', `a:r-vid:${shotId}`);
     await ctx.reply(`<i>Видео нет.</i> chosenRender есть — можно делать i2v.`, { parse_mode: 'HTML', reply_markup: kb });
   }
+
+  // ── Shot TTS dubs ─────────────────────────────────────────────────────────
+  const completedTts = (shot.ttsJobs ?? []).filter((j) => j.status === 'completed' && j.outputFilename);
+  if (completedTts.length > 0 && shot.project) {
+    const slice = completedTts.slice(0, 5);
+    for (let i = 0; i < slice.length; i++) {
+      const j = slice[i];
+      const filePath = path.join(
+        APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, j.outputFilename!,
+      );
+      if (!existsSync(filePath)) {
+        await ctx.reply(
+          `🎙 #${i + 1}: файл не найден — <code>${escapeHtml(filePath)}</code>`,
+          { parse_mode: 'HTML' },
+        );
+        continue;
+      }
+      const isChosen = shot.approvedTTSJobId === j.id;
+      const dur      = j.durationMs ? ` · ${(j.durationMs / 1000).toFixed(1)}s` : '';
+      const caption  = `🎙 #${i + 1}${isChosen ? '  ✓ approved' : ''}${dur}`;
+      try {
+        await ctx.replyWithAudio(new InputFile(filePath), {
+          caption, parse_mode: 'HTML',
+          title:     `${shot.shotCode} TTS #${i + 1}`,
+          performer: j.voice,
+        });
+      } catch (err) {
+        await ctx.reply(
+          `🎙 #${i + 1}: send failed — <code>${escapeHtml(String(err).slice(0, 200))}</code>`,
+          { parse_mode: 'HTML' },
+        );
+      }
+    }
+    const kb = new InlineKeyboard();
+    slice.forEach((_, i) => {
+      kb.text(`🎙 ✅ #${i + 1}`, `a:p-tts:${shotId}:${i + 1}`)
+        .text(`🎙 🗑 #${i + 1}`, `a:d-tts:${shotId}:${i + 1}`)
+        .row();
+    });
+    if (shot.approvedTTSJobId) kb.text('🎙 ✗ Сбросить approval', `a:s-tts:${shotId}`).row();
+    await ctx.reply(`<b>🎙 Озвучка</b> — выбери / удали:`, {
+      parse_mode: 'HTML', reply_markup: kb,
+    });
+  } else if (shot.narrationText) {
+    await ctx.reply(
+      `<i>🎙 Дублей озвучки нет.</i> Текст есть — поставить TTS в очередь из UI.`,
+      { parse_mode: 'HTML' },
+    );
+  }
+}
+
+// ── Open BGM segment view ───────────────────────────────────────────────────
+
+async function openSegmentView(ctx: Context, segmentId: string): Promise<void> {
+  let seg: BgmSegmentFull;
+  try {
+    seg = await fetchSegment(segmentId);
+  } catch (err) {
+    await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+    return;
+  }
+
+  const projectSlug = seg.block.project?.slug ?? null;
+
+  const header: string[] = [
+    `<b>🎵 ${escapeHtml(seg.block.slug)} / сегмент ${seg.sortOrder + 1}</b>`,
+  ];
+  if (seg.prompt) header.push(`<i>«${escapeHtml(seg.prompt.slice(0, 200))}»</i>`);
+  header.push(`длительность: ${seg.durationSec}s`);
+  header.push(`дублей: ${seg.jobs.length}${seg.approvedJobId ? ` (✓ approved)` : ''}`);
+  await ctx.reply(header.join('\n'), { parse_mode: 'HTML' });
+
+  const completed = seg.jobs.filter((j) => j.status === 'completed' && j.outputFilename);
+  if (completed.length === 0) {
+    await ctx.reply(`<i>Готовых дублей нет.</i>`, { parse_mode: 'HTML' });
+    return;
+  }
+
+  const slice = completed.slice(0, 5);
+  for (let i = 0; i < slice.length; i++) {
+    const j = slice[i];
+    const filePath = projectSlug
+      ? path.join(APP_ROOT, 'data', projectSlug, 'bgm', seg.block.slug, j.outputFilename!)
+      : null;
+    if (!filePath || !existsSync(filePath)) {
+      await ctx.reply(
+        `🎵 #${i + 1}: файл не найден — <code>${escapeHtml(filePath ?? '(no slug)')}</code>`,
+        { parse_mode: 'HTML' },
+      );
+      continue;
+    }
+    const isChosen = seg.approvedJobId === j.id;
+    const caption  = `🎵 #${i + 1}${isChosen ? '  ✓ approved' : ''}`;
+    try {
+      await ctx.replyWithAudio(new InputFile(filePath), {
+        caption, parse_mode: 'HTML',
+        title:     `${seg.block.slug}/${seg.sortOrder + 1} take ${i + 1}`,
+        performer: 'BGM',
+      });
+    } catch (err) {
+      await ctx.reply(
+        `🎵 #${i + 1}: send failed — <code>${escapeHtml(String(err).slice(0, 200))}</code>`,
+        { parse_mode: 'HTML' },
+      );
+    }
+  }
+
+  const kb = new InlineKeyboard();
+  slice.forEach((_, i) => {
+    kb.text(`🎵 ✅ #${i + 1}`, `a:p-bgm:${segmentId}:${i + 1}`)
+      .text(`🎵 🗑 #${i + 1}`, `a:d-bgm:${segmentId}:${i + 1}`)
+      .row();
+  });
+  if (seg.approvedJobId) kb.text('🎵 ✗ Сбросить approval', `a:s-bgm:${segmentId}`).row();
+  await ctx.reply(`<b>🎵 BGM</b> — выбери / удали:`, {
+    parse_mode: 'HTML', reply_markup: kb,
+  });
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -349,6 +570,42 @@ async function withShotIdx(
       return;
     }
     await fn(shot, item);
+  } catch (err) {
+    await safeAnswer(ctx, { text: 'Ошибка' });
+    await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+  }
+}
+
+async function withShotTts(
+  ctx: Context,
+  shotId: string,
+  idx: number,
+  fn: (shot: ShotFull, job: TtsJobRow) => Promise<void>,
+): Promise<void> {
+  try {
+    const shot = await fetchShotWithVideos(shotId);
+    const list = (shot.ttsJobs ?? []).filter((j) => j.status === 'completed' && j.outputFilename);
+    const job  = list[idx - 1];
+    if (!job) { await safeAnswer(ctx, { text: 'TTS не найден' }); return; }
+    await fn(shot, job);
+  } catch (err) {
+    await safeAnswer(ctx, { text: 'Ошибка' });
+    await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+  }
+}
+
+async function withSegmentJob(
+  ctx: Context,
+  segmentId: string,
+  idx: number,
+  fn: (seg: BgmSegmentFull, job: BgmSegmentFull['jobs'][number]) => Promise<void>,
+): Promise<void> {
+  try {
+    const seg = await fetchSegment(segmentId);
+    const list = seg.jobs.filter((j) => j.status === 'completed' && j.outputFilename);
+    const job  = list[idx - 1];
+    if (!job) { await safeAnswer(ctx, { text: 'BGM не найден' }); return; }
+    await fn(seg, job);
   } catch (err) {
     await safeAnswer(ctx, { text: 'Ошибка' });
     await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });

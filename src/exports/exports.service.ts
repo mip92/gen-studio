@@ -287,20 +287,26 @@ export class ExportsService {
         timelineCursorUs += duration_us;
 
         // Per-shot narration: if the shot has an approved TTSJob with a
-        // rendered wav on disk, attach it. The python exporter clips audio
-        // to the shot's video duration so it never bleeds into the next shot.
+        // rendered wav on disk, attach it. We pass the REAL wav duration here
+        // (from TTSJob.durationMs, populated by TTSService on completion) so
+        // the python exporter can place narrations sequentially without
+        // truncating audio that runs longer than its shot. Per user spec:
+        // «вставляй по очереди, привязывай к началу шота если получается».
         let shotNarration: ManifestShot['narration'] = null;
         const approvedId  = (shot as { approvedTTSJobId?: string | null }).approvedTTSJobId ?? null;
-        const ttsJobs     = (shot as { ttsJobs?: Array<{ id: string; outputFilename: string | null; text: string }> }).ttsJobs ?? [];
+        const ttsJobs     = (shot as { ttsJobs?: Array<{ id: string; outputFilename: string | null; text: string; durationMs: number | null }> }).ttsJobs ?? [];
         const approvedTts = approvedId ? ttsJobs.find((t) => t.id === approvedId) : null;
         if (approvedTts?.outputFilename) {
           const wavPath = path.join(dataRoot, 'shots', shot.shotCode, approvedTts.outputFilename);
           if (existsSync(wavPath)) {
-            // Estimate duration from text length (≈15 chars/sec at our default
-            // rate). Capped at the shot's video duration so the wav can't
-            // overlap the next shot on the audio track.
-            const guessUs = Math.max(800_000, Math.round((approvedTts.text.length / 15) * 1_000_000));
-            shotNarration = { path: wavPath, duration_us: Math.min(guessUs, duration_us) };
+            // Prefer the probed durationMs (TTSService writes it on
+            // completion). Fall back to text-length estimate for legacy rows
+            // that pre-date the durationMs column. NO cap by video duration —
+            // python places narrations sequentially on the audio lane.
+            const trueWavUs = approvedTts.durationMs != null && approvedTts.durationMs > 0
+              ? approvedTts.durationMs * 1000
+              : Math.max(800_000, Math.round((approvedTts.text.length / 15) * 1_000_000));
+            shotNarration = { path: wavPath, duration_us: trueWavUs };
           } else {
             this.logger.warn(`shot ${shot.shotCode}: approved TTS wav missing on disk (${wavPath}) — skipping audio`);
           }

@@ -7,13 +7,41 @@ import { probeWavDurationMs } from './wav-duration';
 
 const APP_ROOT      = process.env.APP_ROOT      ?? path.resolve(__dirname, '..', '..', '..');
 const KOHYA_DIR     = process.env.KOHYA_DIR     ?? 'E:\\kohya_ss';
-// Reuse the kohya venv — it already has torch + soundfile, which is everything
-// Silero needs. Override with TTS_PYTHON if a different env is preferred.
+// Reuse the kohya venv — already has torch + soundfile (for Silero) and the
+// CUDA build needed for the voice-clone engines (XTTS-v2, F5). Override with
+// TTS_PYTHON if a different env is preferred.
 const PYTHON_BIN    = process.env.TTS_PYTHON    ?? process.env.PYTHON_BIN
                     ?? path.join(KOHYA_DIR, 'venv', 'Scripts', 'python.exe');
-const TTS_SCRIPT    = path.join(APP_ROOT, 'scripts', 'tts_silero.py');
+const TTS_SCRIPT       = path.join(APP_ROOT, 'scripts', 'tts_silero.py');
+const TTS_XTTS2_SCRIPT = path.join(APP_ROOT, 'scripts', 'tts_xtts2.py');
+const TTS_F5_SCRIPT    = path.join(APP_ROOT, 'scripts', 'tts_f5.py');
 const SILERO_CACHE  = process.env.SILERO_CACHE_DIR
                     ?? path.join(APP_ROOT, '.silero_cache');
+
+/** Engines the service knows how to dispatch. Source of truth is the
+ *  Python worker scripts; this constant exists to validate the
+ *  Project.ttsEngine column and the per-job engine snapshot. */
+export const TTS_ENGINES = ['silero', 'xtts2', 'f5'] as const;
+export type TTSEngine = (typeof TTS_ENGINES)[number];
+
+/** Emotion labels accepted on the per-job API. IMPORTANT: both voice-clone
+ *  engines (xtts2, f5) IGNORE the categorical preset/intensity at inference —
+ *  tone comes only from the speaker reference clip. So `emotionPreset` /
+ *  `emotionIntensity` are inert traceability metadata; the only knob that
+ *  actually changes tone is `emotionRefName`, which swaps the speaker_wav for
+ *  one render. Kept as a validated allow-list in case a future engine honours
+ *  categorical emotion. */
+export const XTTS2_EMOTIONS = [
+  'neutral', 'happy', 'sad', 'angry', 'fear', 'disgust', 'surprise', 'calm',
+] as const;
+export type XTTS2Emotion = (typeof XTTS2_EMOTIONS)[number];
+
+/** Resolve the engine for a project. Null/unknown → 'silero' (legacy default
+ *  so existing projects keep working without a migration touch). */
+function projectEngine(project: { ttsEngine?: string | null }): TTSEngine {
+  const e = project.ttsEngine ?? 'silero';
+  return (TTS_ENGINES as readonly string[]).includes(e) ? (e as TTSEngine) : 'silero';
+}
 
 /** Voices baked into V5 .pt files (V5, V5_4, V5_5 all share this set). */
 const VOICES_V5 = ['aidar', 'baya', 'kseniya', 'xenia', 'eugene', 'random'] as const;
@@ -48,6 +76,14 @@ export interface StartTTSInput {
   modelFilename?: string;
   /** Extra silence (seconds) inserted after every sentence boundary. 0 = off. */
   sentencePauseSec?: number;
+  /** Voice-clone (xtts2/f5) only: categorical emotion. Inert metadata today —
+   *  see XTTS2_EMOTIONS. Ignored when engine = silero. */
+  emotionPreset?:    XTTS2Emotion;
+  /** Voice-clone (xtts2/f5) only: strength [0.0, 1.0]. Inert today. Default 0.5. */
+  emotionIntensity?: number;
+  /** Voice-clone (xtts2/f5) only: name of a project-level emotion ref. This is
+   *  the knob that actually changes tone (swaps the speaker clip). */
+  emotionRefName?:   string;
 }
 
 export interface StartShotTTSInput {
@@ -59,6 +95,12 @@ export interface StartShotTTSInput {
   rate?:        number;
   modelFilename?: string;
   sentencePauseSec?: number;
+  emotionPreset?:    XTTS2Emotion;
+  emotionIntensity?: number;
+  emotionRefName?:   string;
+  /** Jump to the FRONT of the TTS queue instead of the back. Default false =
+   *  natural FIFO (end of queue). */
+  front?:            boolean;
 }
 
 /** Static map of which voices each known Silero version supports. The Python
@@ -101,21 +143,19 @@ export class TTSService {
       .sort((a, b) => a.filename.localeCompare(b.filename));
   }
 
-  /** Queue a new TTS job. Returns the created row (status='pending'). */
-  async start(input: StartTTSInput) {
-    const scene = await this.prisma.scene.findUnique({
-      where:   { id: input.sceneId },
-      include: { project: true },
-    });
-    if (!scene) throw new NotFoundException(`Scene ${input.sceneId} not found`);
-
-    const text = (input.text ?? scene.narrationText ?? '').trim();
-    if (!text) {
-      throw new BadRequestException(
-        `Scene ${scene.sceneKey} has no narration text. Pass {text} or set Scene.narrationText first.`,
-      );
-    }
-
+  /**
+   * Validate + normalize the engine-agnostic job knobs shared by scene and
+   * shot TTS (voice / sample rate / rate / sentence pause / silero model file).
+   * Throws BadRequestException on any out-of-range value. Used by both
+   * `start()` and `startForShot()` so the two paths can never drift.
+   */
+  private validateCommonInput(input: {
+    voice?:            Voice;
+    sampleRate?:       SampleRate;
+    rate?:             number;
+    sentencePauseSec?: number;
+    modelFilename?:    string;
+  }): { voice: Voice; sampleRate: SampleRate; rate: number; sentencePauseSec: number; modelFilename: string | null } {
     const voice      = input.voice      ?? DEFAULT_VOICE;
     const sampleRate = input.sampleRate ?? DEFAULT_SAMPLE_RATE;
     const rate       = input.rate       ?? DEFAULT_RATE;
@@ -132,7 +172,6 @@ export class TTSService {
     if (sentencePauseSec < MIN_SENTENCE_PAUSE || sentencePauseSec > MAX_SENTENCE_PAUSE) {
       throw new BadRequestException(`sentencePauseSec must be in [${MIN_SENTENCE_PAUSE}, ${MAX_SENTENCE_PAUSE}]`);
     }
-
     // Validate modelFilename exists on disk if supplied. Path traversal guard:
     // reject anything that isn't a bare .pt basename in our cache dir.
     let modelFilename: string | null = null;
@@ -147,6 +186,83 @@ export class TTSService {
       }
       modelFilename = cleaned;
     }
+    return { voice, sampleRate, rate, sentencePauseSec, modelFilename };
+  }
+
+  /**
+   * Resolve engine-specific columns for a new TTSJob row. For 'silero' this
+   * is a no-op (returns just `engine: 'silero'`). For the voice-clone engines
+   * (xtts2 | f5) it requires a project voice reference, validates the emotion
+   * params, and looks up `emotionRefName` against the project's ref library,
+   * then returns the snapshot columns.
+   *
+   * Throws BadRequestException for invalid params / missing voice-ref /
+   * unknown emotion ref name.
+   */
+  private async resolveEngineColumns(
+    project: { id: string; ttsEngine?: string | null; ttsVoiceRefPath?: string | null },
+    input:  { emotionPreset?: string; emotionIntensity?: number; emotionRefName?: string },
+  ): Promise<{
+    engine:           TTSEngine;
+    emotionPreset:    string | null;
+    emotionIntensity: number | null;
+    emotionRefName:   string | null;
+  }> {
+    const engine = projectEngine(project);
+    if (engine === 'silero') {
+      return { engine, emotionPreset: null, emotionIntensity: null, emotionRefName: null };
+    }
+    // Voice-clone engines (xtts2 | f5) require a project voice reference.
+    if (!project.ttsVoiceRefPath) {
+      throw new BadRequestException(
+        `Project has ttsEngine='${engine}' but no voice reference uploaded. ` +
+        `Upload one via POST /projects/${project.id}/tts/voice-reference first.`,
+      );
+    }
+    const preset = (input.emotionPreset ?? 'neutral').toLowerCase();
+    if (!(XTTS2_EMOTIONS as readonly string[]).includes(preset)) {
+      throw new BadRequestException(
+        `emotionPreset must be one of: ${XTTS2_EMOTIONS.join(', ')} (got: ${preset})`,
+      );
+    }
+    const intensity = input.emotionIntensity ?? 0.5;
+    if (intensity < 0 || intensity > 1) {
+      throw new BadRequestException(`emotionIntensity must be in [0.0, 1.0] (got: ${intensity})`);
+    }
+    let emotionRefName: string | null = null;
+    if (input.emotionRefName) {
+      const refRow = await this.prisma.projectTTSEmotionRef.findUnique({
+        where: { projectId_name: { projectId: project.id, name: input.emotionRefName } },
+      });
+      if (!refRow) {
+        throw new BadRequestException(
+          `Project has no emotion ref named "${input.emotionRefName}". ` +
+          `Upload one via POST /projects/${project.id}/tts/emotion-refs/${input.emotionRefName}.`,
+        );
+      }
+      emotionRefName = input.emotionRefName;
+    }
+    return { engine, emotionPreset: preset, emotionIntensity: intensity, emotionRefName };
+  }
+
+  /** Queue a new TTS job. Returns the created row (status='pending'). */
+  async start(input: StartTTSInput) {
+    const scene = await this.prisma.scene.findUnique({
+      where:   { id: input.sceneId },
+      include: { project: true },
+    });
+    if (!scene) throw new NotFoundException(`Scene ${input.sceneId} not found`);
+
+    const text = (input.text ?? scene.narrationText ?? '').trim();
+    if (!text) {
+      throw new BadRequestException(
+        `Scene ${scene.sceneKey} has no narration text. Pass {text} or set Scene.narrationText first.`,
+      );
+    }
+
+    const { voice, sampleRate, rate, sentencePauseSec, modelFilename } =
+      this.validateCommonInput(input);
+    const engineCols = await this.resolveEngineColumns(scene.project, input);
 
     return this.prisma.tTSJob.create({
       data: {
@@ -158,6 +274,7 @@ export class TTSService {
         sentencePauseSec,
         modelFilename,
         status:  'pending',
+        ...engineCols,
       },
     });
   }
@@ -181,34 +298,21 @@ export class TTSService {
       );
     }
 
-    const voice      = input.voice      ?? DEFAULT_VOICE;
-    const sampleRate = input.sampleRate ?? DEFAULT_SAMPLE_RATE;
-    const rate       = input.rate       ?? DEFAULT_RATE;
-    if (!ALLOWED_VOICES.includes(voice)) {
-      throw new BadRequestException(`voice must be one of: ${ALLOWED_VOICES.join(', ')}`);
-    }
-    if (!ALLOWED_SAMPLE_RATES.includes(sampleRate)) {
-      throw new BadRequestException(`sampleRate must be one of: ${ALLOWED_SAMPLE_RATES.join(', ')}`);
-    }
-    if (rate < MIN_RATE || rate > MAX_RATE) {
-      throw new BadRequestException(`rate must be in [${MIN_RATE}, ${MAX_RATE}]`);
-    }
-    const sentencePauseSec = input.sentencePauseSec ?? 0;
-    if (sentencePauseSec < MIN_SENTENCE_PAUSE || sentencePauseSec > MAX_SENTENCE_PAUSE) {
-      throw new BadRequestException(`sentencePauseSec must be in [${MIN_SENTENCE_PAUSE}, ${MAX_SENTENCE_PAUSE}]`);
-    }
+    const { voice, sampleRate, rate, sentencePauseSec, modelFilename } =
+      this.validateCommonInput(input);
+    const engineCols = await this.resolveEngineColumns(shot.project, input);
 
-    let modelFilename: string | null = null;
-    if (input.modelFilename) {
-      const cleaned = input.modelFilename.trim();
-      if (cleaned !== path.basename(cleaned) || !cleaned.toLowerCase().endsWith('.pt')) {
-        throw new BadRequestException(`modelFilename must be a bare .pt basename (got: ${cleaned})`);
-      }
-      const fp = path.join(SILERO_CACHE, cleaned);
-      if (!existsSync(fp)) {
-        throw new BadRequestException(`Silero model not found in cache: ${cleaned}`);
-      }
-      modelFilename = cleaned;
+    // Queue placement. The TTS picker (findNextPending) orders pending jobs by
+    // queuedAt asc, so "front of queue" = take a queuedAt 1s before the current
+    // earliest pending job. Default (front=false) keeps natural FIFO (end).
+    let queuedAt: Date | undefined;
+    if (input.front) {
+      const head = await this.prisma.tTSJob.findFirst({
+        where:   { status: 'pending' },
+        orderBy: { queuedAt: 'asc' },
+        select:  { queuedAt: true },
+      });
+      queuedAt = head ? new Date(head.queuedAt.getTime() - 1000) : new Date();
     }
 
     return this.prisma.tTSJob.create({
@@ -221,6 +325,8 @@ export class TTSService {
         sentencePauseSec,
         modelFilename,
         status:  'pending',
+        ...(queuedAt ? { queuedAt } : {}),
+        ...engineCols,
       },
     });
   }
@@ -316,18 +422,29 @@ export class TTSService {
       await this.fail(job.id, `python bin missing: ${PYTHON_BIN} (set TTS_PYTHON env)`);
       return;
     }
-    if (!existsSync(TTS_SCRIPT)) {
-      await this.fail(job.id, `tts_silero.py missing: ${TTS_SCRIPT}`);
+
+    // Engine snapshot — null/unknown on legacy rows means 'silero'.
+    const engine: TTSEngine = (TTS_ENGINES as readonly string[]).includes(job.engine ?? '')
+      ? (job.engine as TTSEngine) : 'silero';
+    const script = engine === 'f5'    ? TTS_F5_SCRIPT
+                 : engine === 'xtts2' ? TTS_XTTS2_SCRIPT
+                 :                      TTS_SCRIPT;
+    if (!existsSync(script)) {
+      await this.fail(job.id, `worker script missing: ${script}`);
       return;
     }
 
     // Resolve output dir — scene-level jobs write under data/<slug>/scenes/<sceneKey>/,
-    // shot-level jobs under data/<slug>/shots/<shotCode>/.
+    // shot-level jobs under data/<slug>/shots/<shotCode>/. The owning project
+    // is also captured here for engine-specific lookups below.
     let outDir: string;
+    let projectRow: { id: string; slug: string; ttsVoiceRefPath?: string | null } | null = null;
     if (job.shotId && job.shot) {
       outDir = path.join(APP_ROOT, 'data', job.shot.project.slug, 'shots', job.shot.shotCode);
+      projectRow = job.shot.project;
     } else if (job.sceneId && job.scene) {
       outDir = path.join(APP_ROOT, 'data', job.scene.project.slug, 'scenes', job.scene.sceneKey);
+      projectRow = job.scene.project;
     } else {
       await this.fail(job.id, `TTS job ${job.id} has neither shotId nor sceneId resolved`);
       return;
@@ -341,38 +458,101 @@ export class TTSService {
     writeFileSync(textPath, job.text, { encoding: 'utf-8' });
 
     // Output filename is keyed by job id so each row owns a distinct wav on
-    // disk. Earlier we keyed by voice+sr (+model tag), but that caused two
-    // separate completed jobs with identical params to share one wav; deleting
-    // one then orphaned the other with a missing-file ENOENT on playback.
-    // Including a model tag makes the filename self-describing for debugging.
-    const modelTag    = job.modelFilename
-      ? '_' + path.basename(job.modelFilename).replace(/\.pt$/i, '')
-      : '';
-    const outFilename = `narration_${job.id}_${job.voice}_${job.sampleRate}${modelTag}.wav`;
-    const outPath     = path.join(outDir, outFilename);
+    // disk. Engine tag in the filename is for easier debugging — silero rows
+    // include voice/model, xtts2 rows include 'xtts2' + emotion.
+    let outFilename: string;
+    if (engine === 'silero') {
+      const modelTag = job.modelFilename
+        ? '_' + path.basename(job.modelFilename).replace(/\.pt$/i, '')
+        : '';
+      outFilename = `narration_${job.id}_${job.voice}_${job.sampleRate}${modelTag}.wav`;
+    } else {
+      // Voice-clone engines (xtts2 | f5): tag by engine + emotion.
+      const emoTag = job.emotionRefName ? job.emotionRefName : (job.emotionPreset ?? 'neutral');
+      outFilename = `narration_${job.id}_${engine}_${emoTag}_${job.sampleRate}.wav`;
+    }
+    const outPath = path.join(outDir, outFilename);
 
     await this.prisma.tTSJob.update({
       where: { id: job.id },
       data:  { status: 'running', startedAt: new Date() },
     });
 
-    const argv = [
-      '-X', 'utf8',
-      TTS_SCRIPT,
-      '--text-file',           textPath,
-      '--out',                 outPath,
-      '--voice',               job.voice,
-      '--sample-rate',         String(job.sampleRate),
-      '--rate',                String(job.rate ?? 1.0),
-      '--sentence-pause-sec',  String(job.sentencePauseSec ?? 0),
-    ];
-    // Per-job model override — passed via env so the python script's existing
-    // SILERO_MODEL_PATH lookup picks it up without needing extra CLI flags.
+    // Build argv per engine. Silero stays exactly as it was — XTTS-v2 swaps
+    // --voice for --voice-ref (from project.ttsVoiceRefPath) plus optional
+    // --emotion-ref (a project-level named clip). Same Python bin + stdout
+    // `OK <path>` contract applies.
     const subEnv: NodeJS.ProcessEnv = { ...process.env, PYTHONIOENCODING: 'utf-8' };
-    if (job.modelFilename) {
-      subEnv.SILERO_MODEL_PATH = path.join(SILERO_CACHE, job.modelFilename);
+    let argv: string[];
+    if (engine !== 'silero') {
+      // Voice-clone path shared by xtts2 + f5 — same argv, only the worker
+      // script differs (resolved above). f5 accepts and ignores the emotion
+      // preset/intensity flags, and honours --emotion-ref as a speaker swap.
+      if (!projectRow?.ttsVoiceRefPath) {
+        await this.fail(job.id, `project ${projectRow?.slug ?? '?'} has no voice reference uploaded`);
+        return;
+      }
+      const voiceRef = path.isAbsolute(projectRow.ttsVoiceRefPath)
+        ? projectRow.ttsVoiceRefPath
+        : path.join(APP_ROOT, projectRow.ttsVoiceRefPath);
+      if (!existsSync(voiceRef)) {
+        await this.fail(job.id, `voice reference file missing on disk: ${voiceRef}`);
+        return;
+      }
+      argv = [
+        '-X', 'utf8',
+        script,
+        '--text-file',         textPath,
+        '--out',               outPath,
+        '--voice-ref',         voiceRef,
+        '--sample-rate',       String(job.sampleRate),
+        // XTTS-v2 has no categorical emotion — we pass the preset along
+        // for traceability; the worker logs it and ignores it.
+        '--emotion-preset',    job.emotionPreset ?? 'neutral',
+        '--emotion-intensity', String(job.emotionIntensity ?? 0.5),
+      ];
+      // f5 honours the silero-style speed + sentence-pause knobs; the xtts2
+      // worker doesn't define these flags, so pass them to f5 only.
+      if (engine === 'f5') {
+        argv.push('--speed', String(job.rate ?? 1.0));
+        if ((job.sentencePauseSec ?? 0) > 0) {
+          argv.push('--sentence-pause-sec', String(job.sentencePauseSec));
+        }
+      }
+      if (job.emotionRefName) {
+        const refRow = await this.prisma.projectTTSEmotionRef.findUnique({
+          where: { projectId_name: { projectId: projectRow.id, name: job.emotionRefName } },
+        });
+        if (!refRow) {
+          await this.fail(job.id, `emotion ref "${job.emotionRefName}" not found in project`);
+          return;
+        }
+        const refPath = path.isAbsolute(refRow.filePath)
+          ? refRow.filePath
+          : path.join(APP_ROOT, refRow.filePath);
+        if (!existsSync(refPath)) {
+          await this.fail(job.id, `emotion ref file missing on disk: ${refPath}`);
+          return;
+        }
+        argv.push('--emotion-ref', refPath);
+      }
+      this.logger.log(`Launching ${engine} TTS: ${PYTHON_BIN} ${argv.join(' ')}`);
+    } else {
+      argv = [
+        '-X', 'utf8',
+        TTS_SCRIPT,
+        '--text-file',           textPath,
+        '--out',                 outPath,
+        '--voice',               job.voice,
+        '--sample-rate',         String(job.sampleRate),
+        '--rate',                String(job.rate ?? 1.0),
+        '--sentence-pause-sec',  String(job.sentencePauseSec ?? 0),
+      ];
+      if (job.modelFilename) {
+        subEnv.SILERO_MODEL_PATH = path.join(SILERO_CACHE, job.modelFilename);
+      }
+      this.logger.log(`Launching silero TTS: ${PYTHON_BIN} ${argv.join(' ')}${job.modelFilename ? ` (model=${job.modelFilename})` : ''}`);
     }
-    this.logger.log(`Launching silero TTS: ${PYTHON_BIN} ${argv.join(' ')}${job.modelFilename ? ` (model=${job.modelFilename})` : ''}`);
 
     const proc = spawn(PYTHON_BIN, argv, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -385,10 +565,10 @@ export class TTSService {
       // Keep only the last ~4KB so a verbose model-load log doesn't blow up the
       // row's errorMessage on failure.
       stderrTail = (stderrTail + s).slice(-4000);
-      this.logger.debug(`silero[${job.id}]: ${s.trimEnd()}`);
+      this.logger.debug(`${engine}[${job.id}]: ${s.trimEnd()}`);
     });
     proc.stdout.on('data', (chunk: Buffer) => {
-      this.logger.debug(`silero[${job.id}]: ${chunk.toString().trimEnd()}`);
+      this.logger.debug(`${engine}[${job.id}]: ${chunk.toString().trimEnd()}`);
     });
 
     const exitCode = await new Promise<number>((resolve) => {
@@ -397,7 +577,7 @@ export class TTSService {
     });
 
     // Cleanup the staged text file regardless of outcome.
-    try { require('fs').unlinkSync(textPath); } catch { /* best-effort */ }
+    try { unlinkSync(textPath); } catch { /* best-effort */ }
 
     if (exitCode !== 0 || !existsSync(outPath)) {
       await this.fail(job.id, stderrTail.trim() || `python exited with code ${exitCode}`);
@@ -593,11 +773,20 @@ export class TTSService {
   ): Promise<{ queued: number; skipped: number; total: number }> {
     const mode  = opts.mode  ?? 'missing';
     const voice = opts.voice ?? DEFAULT_VOICE;
+    if (!ALLOWED_VOICES.includes(voice)) {
+      throw new BadRequestException(`voice must be one of: ${ALLOWED_VOICES.join(', ')}`);
+    }
     const scene = await this.prisma.scene.findUnique({
       where:   { id: sceneId },
-      include: { shots: { orderBy: { shotCode: 'asc' } } },
+      include: { project: true, shots: { orderBy: { shotCode: 'asc' } } },
     });
     if (!scene) throw new NotFoundException(`Scene ${sceneId} not found`);
+
+    // Resolve the project engine ONCE (same project for every shot). Without
+    // this, bulk-queued rows get engine=null and dispatch as silero — so a
+    // project on xtts2/f5 would silently get the wrong voice. Throws here if a
+    // voice-clone engine is selected with no voice reference uploaded.
+    const engineCols = await this.resolveEngineColumns(scene.project, {});
 
     let queued  = 0;
     let skipped = 0;
@@ -621,6 +810,7 @@ export class TTSService {
           sentencePauseSec: 0,
           modelFilename:    null,
           status:           'pending',
+          ...engineCols,
         },
       });
       queued++;

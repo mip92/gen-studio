@@ -37,3 +37,11 @@ data/*/comfy/*.bak
 # Locally-downloaded Silero TTS model checkpoint (~140MB, user drops manually
 # per scripts/tts_silero.py instructions; way over GitHub's per-file limit).
 .silero_cache/
+
+# heavy local artifacts (added during cleanup 2026-05-30)
+/checkpoints/
+/bin/
+/.coqui_tts_cache/
+/.hf_cache/
+/.torch_cache/
+data/*/tts/

@@ -18,6 +18,7 @@ async function bootstrap() {
     }),
   );
   app.enableCors();
+  app.enableShutdownHooks();
 
   const config = new DocumentBuilder()
     .setTitle('Gen Studio API')

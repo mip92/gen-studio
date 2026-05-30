@@ -8,6 +8,7 @@ import { VideoRenderService } from '../generation/videos/video-render.service';
 import { TrainingService } from '../training/training.service';
 import { TTSService } from '../tts/tts.service';
 import { BgmRenderService } from '../bgm/bgm-render.service';
+import { AnchorRenderService } from '../characters/anchor-render.service';
 import { EngineService } from './engine.service';
 
 const POLL_MS = 5_000;
@@ -43,6 +44,7 @@ export class PipelineQueueService {
     private readonly training: TrainingService,
     private readonly tts:      TTSService,
     private readonly bgm:      BgmRenderService,
+    private readonly anchors:  AnchorRenderService,
     private readonly engine:   EngineService,
   ) {}
 
@@ -70,6 +72,7 @@ export class PipelineQueueService {
     await this.datasets.promoteBlocked();
     await this.datasets.pollRunning();
     await this.scenes.pollRunning();
+    await this.anchors.pollRunning();
     await this.detectHungJobs();
 
     // ── 2. Anything still running? ─────────────────────────────────────────
@@ -94,10 +97,16 @@ export class PipelineQueueService {
     const bgmActive = await this.prisma.audioRenderJob.count({
       where: { status: 'running' },
     });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0) return;
+    // Anchor portrait renders share the same single-slot serialisation as
+    // every other GPU job. Cast keeps the build green until Prisma client is
+    // regenerated to know about anchor_render_jobs.
+    const anchorActive = await (this.prisma as any).anchorRenderJob.count({
+      where: { status: 'running' },
+    });
+    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0) return;
 
     // ── 3. Pick oldest pending across all queues ───────────────────────────
-    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextTTS, nextBgm] = await Promise.all([
+    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextTTS, nextBgm, nextAnchor] = await Promise.all([
       this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
       this.datasets.findNextPending(),
       this.scenes.findNextPending(),
@@ -105,9 +114,10 @@ export class PipelineQueueService {
       this.videos.findNextPendingUpscale(),
       this.tts.findNextPending(),
       this.bgm.findNextPending(),
+      this.anchors.findNextPending(),
     ]);
 
-    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts' | 'bgm'; id: string; ts: number };
+    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts' | 'bgm' | 'anchor'; id: string; ts: number };
     const candidates: Pick[] = [];
     if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
@@ -123,6 +133,7 @@ export class PipelineQueueService {
     });
     if (nextTTS)      candidates.push({ type: 'tts',      id: nextTTS.id,      ts: nextTTS.queuedAt.getTime() });
     if (nextBgm)      candidates.push({ type: 'bgm',      id: nextBgm.id,      ts: nextBgm.queuedAt.getTime() });
+    if (nextAnchor)   candidates.push({ type: 'anchor',   id: nextAnchor.id,   ts: nextAnchor.queuedAt.getTime() });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
@@ -134,7 +145,18 @@ export class PipelineQueueService {
     else if (winner.type === 'video')         await this.dispatchVideo(winner.id);
     else if (winner.type === 'video_upscale') await this.dispatchVideoUpscale(winner.id);
     else if (winner.type === 'tts')           await this.dispatchTTS(winner.id);
-    else                                       await this.dispatchBgm(winner.id);
+    else if (winner.type === 'bgm')           await this.dispatchBgm(winner.id);
+    else                                       await this.dispatchAnchor(winner.id);
+  }
+
+  /**
+   * Dispatch an anchor portrait render. Auto-starts ComfyUI if needed (cold
+   * start ~30-60s) — same arbitration as scene/dataset/video/bgm jobs.
+   */
+  private async dispatchAnchor(jobId: string): Promise<void> {
+    if (!(await this.ensureComfyAlive('anchor', jobId))) return;
+    this.logger.log(`Dispatching anchor render ${jobId} via ComfyUI`);
+    await this.anchors.dispatchPending(jobId);
   }
 
   /**
@@ -203,7 +225,7 @@ export class PipelineQueueService {
    * caller skips dispatch — the next pending pickup happens on the next tick.
    */
   private async ensureComfyAlive(
-    jobType: 'dataset' | 'scene' | 'video' | 'video_upscale' | 'bgm',
+    jobType: 'dataset' | 'scene' | 'video' | 'video_upscale' | 'bgm' | 'anchor',
     jobId: string,
   ): Promise<boolean> {
     if (await this.engine.isComfyAlive()) return true;
@@ -234,6 +256,11 @@ export class PipelineQueueService {
         await this.prisma.videoRender.update({
           where: { id: jobId },
           data:  { upscaleStatus: 'failed', upscaleErrorMessage: errMsg, upscaleCompletedAt: ts },
+        });
+      } else if (jobType === 'anchor') {
+        await (this.prisma as any).anchorRenderJob.update({
+          where: { id: jobId },
+          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
         });
       } else {
         await this.prisma.audioRenderJob.update({
