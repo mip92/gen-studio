@@ -302,17 +302,28 @@ export class TTSService {
       this.validateCommonInput(input);
     const engineCols = await this.resolveEngineColumns(shot.project, input);
 
-    // Queue placement. The TTS picker (findNextPending) orders pending jobs by
-    // queuedAt asc, so "front of queue" = take a queuedAt 1s before the current
-    // earliest pending job. Default (front=false) keeps natural FIFO (end).
+    // Queue placement. The pipeline tick dispatches the globally-earliest
+    // pending job across ALL types (video / scene / tts / dataset / …). So
+    // "front of queue" = take a queuedAt 1 second before the earliest pending
+    // job of ANY type → this becomes the next job dispatched (after whatever is
+    // already running; a running job can't be preempted). Default front=false
+    // keeps natural FIFO placement (end of queue).
     let queuedAt: Date | undefined;
     if (input.front) {
-      const head = await this.prisma.tTSJob.findFirst({
-        where:   { status: 'pending' },
-        orderBy: { queuedAt: 'asc' },
-        select:  { queuedAt: true },
-      });
-      queuedAt = head ? new Date(head.queuedAt.getTime() - 1000) : new Date();
+      const rows = await this.prisma.$queryRawUnsafe<Array<{ min: Date | null }>>(
+        `SELECT MIN(q) AS min FROM (
+           SELECT MIN("queuedAt") q FROM tts_jobs           WHERE status='pending'
+           UNION ALL SELECT MIN("queuedAt") FROM video_renders      WHERE status='pending'
+           UNION ALL SELECT MIN("queuedAt") FROM scene_render_jobs  WHERE status='pending'
+           UNION ALL SELECT MIN("queuedAt") FROM dataset_jobs       WHERE status='pending'
+           UNION ALL SELECT MIN("queuedAt") FROM training_jobs      WHERE status='pending'
+           UNION ALL SELECT MIN("queuedAt") FROM audio_render_jobs  WHERE status='pending'
+           UNION ALL SELECT MIN("queuedAt") FROM anchor_render_jobs WHERE status='pending'
+         ) t`,
+      );
+      const raw = rows?.[0]?.min ?? null;
+      const globalMin = raw ? new Date(raw as unknown as string) : null;
+      queuedAt = globalMin ? new Date(globalMin.getTime() - 1000) : new Date();
     }
 
     return this.prisma.tTSJob.create({
