@@ -17,6 +17,21 @@ export interface StartVideoInput {
   fps?:          number;
   /** How many renders to queue with the same motion prompt + size, different seeds. Default 1, max 8. */
   count?:        number;
+  /**
+   * Which i2v workflow to use:
+   *  - 'auto' (default) — resolve per shot: a comic-style (non-photoreal)
+   *    project + a static shot (promptFields.camera.movement starts with
+   *    'static') → 'cfg', otherwise → 'fast'. Static shots are exactly where
+   *    the negative matters (toy must not move, no drinking), so they get the
+   *    slow workflow automatically with zero extra clicks.
+   *  - 'fast' — lightx2v 4-step distilled LoRA, cfg=1.0. Fast (~30s), but at
+   *    cfg=1 the negative prompt has ZERO effect (CFG formula collapses to the
+   *    positive branch). Motion is steered by the positive prompt alone.
+   *  - 'cfg' — full Wan2.2 dual-expert, no speed LoRA, 20 steps, cfg=4.0. ~5×
+   *    slower, but the negative prompt actually fires — use it for shots where
+   *    suppressing unwanted motion matters.
+   */
+  mode?:         'auto' | 'fast' | 'cfg';
 }
 
 export interface VideoRenderParams {

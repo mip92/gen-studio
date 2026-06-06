@@ -66,6 +66,17 @@ model Project {
   /// Default photoreal_cinematic for backwards compatibility with last_shift /
   /// night_courier. See docs/VISUAL_STYLE_ARCHITECTURE.md.
   visualStyle             String       @default("photoreal_cinematic")
+  /// How shot durations are timed on the CapCut export timeline.
+  /// "clip"      = (legacy, default) each animated shot occupies exactly its
+  ///               rendered clip length (length/fps); static shots fall back to
+  ///               narration-or-default. Keeps last_shift / bio_plus exports
+  ///               byte-identical.
+  /// "narration" = every shot is held for the length of its voiceover. Animated
+  ///               clips are slowed (CapCut speed) to fill the VO; static frames
+  ///               are held with a slow Ken-Burns move. This is the long-form
+  ///               (~45 min) model where only the first minutes are animated and
+  ///               the rest are stills. See exports.service + export_capcut.py.
+  exportTiming            String       @default("clip")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -266,6 +277,16 @@ model Shot {
   /// canonical motion clip. No FK so the row stays self-consistent if the video
   /// is hard-deleted; the setChosenVideo service validates membership.
   chosenVideoId      String?
+  /// Final-cut render mode for this shot.
+  /// "animated" = (default) the shot is rendered to a Wan2.2 i2v clip and FHD-
+  ///              upscaled; the CapCut export lays the mp4 on the timeline.
+  ///              Export readiness requires a chosen video + completed upscale.
+  /// "static"   = the shot ships as its still PNG (chosenRender) only — no video
+  ///              render, no upscale. The CapCut export lays the image on the
+  ///              timeline and adds a slow Ken-Burns move (zoom/pan/rotate). Used
+  ///              for the long-form model where only the first minutes are
+  ///              animated. Export readiness requires only a chosenRender PNG.
+  renderMode         String   @default("animated")
   /// Latest in-flight ComfyUI prompt_id for this shot (cleared once result is recorded).
   activeRenderPromptId String?
   /// Per-shot narration text (Russian, ~5s of voiceover per shot). When set,

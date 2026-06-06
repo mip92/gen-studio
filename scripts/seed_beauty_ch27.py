@@ -1,0 +1,47 @@
+# -*- coding: utf-8 -*-
+"""Seed CH27 — Старость, жизнь прошла мимо (2nd person). Idempotent."""
+from _seed_beauty_act_engine import seed_act
+MOOD = "cold grey old-age light, the bitter sum of a life, hollow"
+SHOTS = [
+ ("CH27_SH01", None, "old_flat",
+  "wide establishing of the dim old apartment, the curtained window, a frail figure by it",
+  "WS","high","push_in","old_now",True,False,
+  "годы идут, и ты совсем состарилась."),
+ ("CH27_SH02", "HEROINE_OLD", "old_flat",
+  "medium close-up of the heroine by the window, an old mask-face under grey hair",
+  "MCU","eye","static","old_now",False,True,
+  "лицо-маска и старость поверх неё, страшнее не придумаешь."),
+ ("CH27_SH03", None, "old_flat",
+  "extreme close-up of old spotted hands holding the compact with a child's face from long ago inside",
+  "ECU","top_down","static","old_now",True,False,
+  "руки в пятнах, а в пудренице будто та же девочка из детства."),
+ ("CH27_SH04", "HEROINE_OLD", "old_flat",
+  "close-up of the heroine remembering how it all began",
+  "CU","eye","static","old_now",False,False,
+  "ты вспоминаешь, как всё началось, ой какая красавица."),
+ ("CH27_SH05", None, "old_flat",
+  "medium shot of a wall of faded photographs spanning her whole life",
+  "MS","eye","pan","old_now",True,False,
+  "на стене вся твоя жизнь, и на каждом фото ты смотришь в зеркало."),
+ ("CH27_SH06", None, "old_flat",
+  "extreme close-up of a wedding photo where she gazes at her own reflection, not at her family",
+  "ECU","eye","static","old_now",True,True,
+  "вот свадьба, вот дочь, а ты везде вполоборота, на своё отражение."),
+ ("CH27_SH07", "HEROINE_OLD", "old_flat",
+  "close-up of the heroine's hollow understanding face",
+  "CU","eye","static","old_now",False,False,
+  "ты прожила жизнь в зеркале, а жизнь прошла мимо, за спиной."),
+ ("CH27_SH08", None, "old_flat",
+  "medium shot of an empty chair and a bare table, no family around",
+  "MS","eye","static","old_now",True,False,
+  "ни мужа, ни дочери, ни внуков рядом."),
+ ("CH27_SH09", "HEROINE_OLD", "old_flat",
+  "close-up of the heroine alone",
+  "CU","eye","static","old_now",False,True,
+  "красивая, значит счастливая, тебе врали с самой колыбели."),
+ ("CH27_SH10", None, "park",
+  "wide B-roll of a bleak grey winter park outside, time spent",
+  "WS","high","static","old_now",True,False,""),
+]
+if __name__ == "__main__":
+    seed_act(27, "old_grey", MOOD, "static", "CH27 Old age", SHOTS)

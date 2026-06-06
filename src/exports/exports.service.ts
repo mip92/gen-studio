@@ -21,7 +21,7 @@ const EXPORT_FPS    = 30;
 interface ShotReadinessIssue {
   shotCode:  string;
   shotId:    string;
-  reason:    'no_chosen_video' | 'no_upscale';
+  reason:    'no_chosen_video' | 'no_upscale' | 'no_chosen_render';
 }
 interface SceneReadinessIssue {
   sceneKey:  string;
@@ -39,8 +39,22 @@ export interface ExportReadiness {
 
 interface ManifestShot  {
   shotCode:    string;
+  /** Media on the main video lane: an mp4 (animated shot) or a still PNG
+   *  (static shot — see `kind`). */
   path:        string;
+  /** Playback length of this shot on the timeline, microseconds. */
   duration_us: number;
+  /** Media kind. Omitted (undefined) means "video" — keeps the manifest for
+   *  legacy clip-timed projects byte-identical, so their exports never change.
+   *  "image" means `path` is a still PNG that the python exporter holds for
+   *  `duration_us` and animates with a slow Ken-Burns move. */
+  kind?:       'image';
+  /** Native source length of the mp4, microseconds. Emitted ONLY when the
+   *  exporter must slow the clip to fill the voiceover (exportTiming
+   *  "narration"): python sets a source_timerange so pyJianYingDraft computes
+   *  speed = source_us / duration_us (< 1.0 → slow-motion). When absent the
+   *  python path is unchanged (speed 1.0, clip plays at its native length). */
+  source_us?:  number;
   /** Per-shot narration wav (shot-level TTS). When set, the python exporter
    *  lays the wav on the audio track at this shot's video timeline position
    *  instead of the legacy scene-level narration block. */
@@ -64,6 +78,11 @@ interface ManifestScene {
  */
 interface ManifestMusic {
   blockSlug:   string;
+  /** Act this cue belongs to, derived from the block's earliest covered shot's
+   *  shotCode prefix (e.g. "A1", "C", "CD"). The CapCut exporter groups one
+   *  audio lane per act — all of an act's cues share a lane, the next act gets
+   *  a fresh lane. Falls back to blockSlug when no shot resolves. */
+  act:         string;
   segmentId:   string;
   jobId:       string;
   /** Absolute path to the rendered flac under data/<slug>/bgm/<blockSlug>/. */
@@ -98,6 +117,13 @@ interface Manifest {
    *  the project has no NarrativeBlocks, no approved AudioRenderJobs, or all
    *  approved jobs lost their flac on disk — none of these is fatal. */
   music_tracks:        ManifestMusic[];
+  /** Shot-boundary transition preset, read from project.settings.transitionPreset.
+   *  "default" (legacy) = cycle the curated 8 free non-overlap CapCut transitions
+   *  across every boundary in rotation. "comic" = stylized comic look: 漫画撕纸
+   *  (Comic Tear) 90% / 便利贴 (Sticker) 5% / 故障拼贴 (Glitch Collage) 5%,
+   *  distributed across boundaries at random positions. See export_capcut.py for
+   *  the per-preset transition tables. */
+  transition_preset:   'default' | 'comic';
 }
 
 @Injectable()
@@ -144,6 +170,15 @@ export class ExportsService {
       }
       for (const shot of scene.shots) {
         totalShots++;
+        // Static shots ship as their still PNG — they need a chosen render but
+        // NO video / upscale. Animated shots (default) need a chosen video that
+        // has finished its FHD upscale.
+        if (shot.renderMode === 'static') {
+          if (!shot.chosenRender) {
+            missingShots.push({ shotCode: shot.shotCode, shotId: shot.id, reason: 'no_chosen_render' });
+          }
+          continue;
+        }
         const chosen = shot.chosenVideoId
           ? shot.videoRenders.find((v) => v.id === shot.chosenVideoId) ?? null
           : null;
@@ -184,8 +219,9 @@ export class ExportsService {
     if (!readiness.ready) {
       throw new BadRequestException(
         `Project ${project.slug} is not ready to export: `
-        + `${readiness.missingShots.length} shot(s) without FHD, `
-        + `${readiness.missingScenes.length} scene(s) without approved TTS.`,
+        + `${readiness.missingShots.length} shot(s) not render-ready `
+        + `(animated need a chosen video + FHD upscale; static need a chosen render), `
+        + `${readiness.missingScenes.length} empty scene(s).`,
       );
     }
 
@@ -254,6 +290,19 @@ export class ExportsService {
       orderBy: { sortOrder: 'asc' },
     });
 
+    const project = await this.prisma.project.findUnique({ where: { id: projectId } });
+    const exportTiming = project?.exportTiming === 'narration' ? 'narration' : 'clip';
+    // Transition preset lives in the settings JSON (same place as styleLora) so
+    // it needs no schema column. Anything other than the literal "comic" falls
+    // back to the legacy rotation, so old projects export byte-identically.
+    const settings = (project?.settings ?? null) as unknown as { transitionPreset?: unknown } | null;
+    const transitionPreset: 'default' | 'comic' =
+      settings?.transitionPreset === 'comic' ? 'comic' : 'default';
+    // VO-driven timing constants (only used when exportTiming === 'narration').
+    const TAIL_US     = 500_000;    // breathing pause held after the VO line ends
+    const MIN_SHOT_US = 2_500_000;  // floor so a one-word line isn't a flash
+    const NO_VO_US    = 4_000_000;  // static shot that has no narration
+
     const dataRoot = path.join(APP_ROOT, 'data', projectSlug);
     const out: ManifestScene[] = [];
     /**
@@ -262,6 +311,14 @@ export class ExportsService {
      * start position without re-traversing the storyboard.
      */
     const shotIdToStartUs = new Map<string, number>();
+    /** shotId → act key, parsed from the shotCode prefix before "_SH"
+     *  ("A1_SH22" → "A1", "C_SH06" → "C", "CD_SH06" → "CD"). Drives per-act
+     *  BGM lane grouping in the CapCut exporter. */
+    const shotIdToAct = new Map<string, string>();
+    const actOf = (shotCode: string): string => {
+      const m = /^(.+?)_SH/i.exec(shotCode ?? '');
+      return m ? m[1] : (shotCode || 'misc');
+    };
     let timelineCursorUs = 0;
 
     for (const scene of scenes) {
@@ -271,27 +328,13 @@ export class ExportsService {
 
       const shotEntries: ManifestShot[] = [];
       for (const shot of shots) {
-        const video = shot.videoRenders.find((v) => v.id === shot.chosenVideoId);
-        if (!video || !video.upscaledFilename) continue; // gated upstream
-        const fp = path.join(dataRoot, 'shots', shot.shotCode, 'videos_fhd', video.upscaledFilename);
-        if (!existsSync(fp)) {
-          throw new BadRequestException(`FHD mp4 missing for shot ${shot.shotCode}: ${fp}`);
-        }
-        const params = (video.params ?? {}) as { fps?: number; length?: number };
-        // length = frame count at FPS; FHD upscale preserves frame count.
-        // Duration in microseconds.
-        const fpsP    = params.fps    ?? 16;
-        const lengthP = params.length ?? 81;
-        const duration_us = Math.round((lengthP / fpsP) * 1_000_000);
-        shotIdToStartUs.set(shot.id, timelineCursorUs);
-        timelineCursorUs += duration_us;
-
-        // Per-shot narration: if the shot has an approved TTSJob with a
-        // rendered wav on disk, attach it. We pass the REAL wav duration here
-        // (from TTSJob.durationMs, populated by TTSService on completion) so
-        // the python exporter can place narrations sequentially without
-        // truncating audio that runs longer than its shot. Per user spec:
-        // «вставляй по очереди, привязывай к началу шота если получается».
+        // ── Per-shot narration: resolve once, used for BOTH the audio lane and
+        // (in narration timing) the shot's hold duration. We pass the REAL wav
+        // duration (from TTSJob.durationMs, populated by TTSService on
+        // completion); python places narrations sequentially on the audio lane
+        // without truncating audio that runs longer than its shot. Per user
+        // spec: «вставляй по очереди, привязывай к началу шота если получается».
+        let narrationUs: number | null = null;
         let shotNarration: ManifestShot['narration'] = null;
         const approvedId  = (shot as { approvedTTSJobId?: string | null }).approvedTTSJobId ?? null;
         const ttsJobs     = (shot as { ttsJobs?: Array<{ id: string; outputFilename: string | null; text: string; durationMs: number | null }> }).ttsJobs ?? [];
@@ -299,24 +342,99 @@ export class ExportsService {
         if (approvedTts?.outputFilename) {
           const wavPath = path.join(dataRoot, 'shots', shot.shotCode, approvedTts.outputFilename);
           if (existsSync(wavPath)) {
-            // Prefer the probed durationMs (TTSService writes it on
-            // completion). Fall back to text-length estimate for legacy rows
-            // that pre-date the durationMs column. NO cap by video duration —
-            // python places narrations sequentially on the audio lane.
+            // Prefer the probed durationMs; fall back to a text-length estimate
+            // for legacy rows that pre-date the durationMs column.
             const trueWavUs = approvedTts.durationMs != null && approvedTts.durationMs > 0
               ? approvedTts.durationMs * 1000
               : Math.max(800_000, Math.round((approvedTts.text.length / 15) * 1_000_000));
+            narrationUs   = trueWavUs;
             shotNarration = { path: wavPath, duration_us: trueWavUs };
           } else {
             this.logger.warn(`shot ${shot.shotCode}: approved TTS wav missing on disk (${wavPath}) — skipping audio`);
           }
         }
 
+        // ── Resolve media + native length per render mode ──
+        let mediaPath: string;
+        let kind: 'image' | undefined;
+        let sourceUs: number | undefined;   // native clip length (animated only)
+        if ((shot as { renderMode?: string }).renderMode === 'static') {
+          // Static shot ships its chosen still PNG — no video, no upscale.
+          if (!shot.chosenRender) continue; // gated upstream (no_chosen_render)
+          mediaPath = path.join(dataRoot, 'shots', shot.shotCode, shot.chosenRender);
+          if (!existsSync(mediaPath)) {
+            throw new BadRequestException(`Chosen render PNG missing for shot ${shot.shotCode}: ${mediaPath}`);
+          }
+          kind = 'image';
+        } else {
+          const video = shot.videoRenders.find((v) => v.id === shot.chosenVideoId);
+          if (!video || !video.upscaledFilename) continue; // gated upstream
+          mediaPath = path.join(dataRoot, 'shots', shot.shotCode, 'videos_fhd', video.upscaledFilename);
+          if (!existsSync(mediaPath)) {
+            throw new BadRequestException(`FHD mp4 missing for shot ${shot.shotCode}: ${mediaPath}`);
+          }
+          // length = frame count at FPS; FHD upscale preserves frame count.
+          const params  = (video.params ?? {}) as { fps?: number; length?: number };
+          const fpsP    = params.fps    ?? 16;
+          const lengthP = params.length ?? 81;
+          sourceUs = Math.round((lengthP / fpsP) * 1_000_000);
+        }
+
+        // ── Timeline hold duration ──
+        let duration_us: number;
+        if (exportTiming === 'narration') {
+          // Hold every shot for its voiceover. Animated clips get slowed to fit
+          // (sourceUs emitted below → python computes speed); static frames are
+          // held while a slow Ken-Burns move plays.
+          duration_us = narrationUs != null
+            ? narrationUs + TAIL_US
+            : (kind === 'image' ? NO_VO_US : (sourceUs ?? NO_VO_US));
+          duration_us = Math.max(duration_us, MIN_SHOT_US);
+        } else {
+          // Legacy clip timing: animated shot = native clip length (unchanged);
+          // static shot (rare in clip-timed projects) = VO length or default.
+          duration_us = kind === 'image'
+            ? (narrationUs != null ? narrationUs + TAIL_US : NO_VO_US)
+            : (sourceUs ?? NO_VO_US);
+        }
+
+        // ── Floor: a video clip must never be shorter than its voiceover ──
+        // Per user spec («звук как правило дольше чем картинка → замедлять видео
+        // до длины звуковой дорожки плюс пол секунды»): when the VO runs longer
+        // than the native clip, stretch the shot to (VO + 0.5s breathing tail)
+        // so the python exporter slows the clip to fill it (speed = native /
+        // duration < 1) instead of letting the audio bleed into the next shot.
+        // Applies in BOTH timing modes but only ever *lengthens* a shot — a VO
+        // shorter than the clip leaves the clip at its native length (no trim,
+        // no slow). Animated shots only; static frames are Ken-Burns-held for
+        // their full duration already. In narration timing this is a no-op
+        // (duration is already VO + TAIL), so gaz/message are unaffected.
+        if (kind === undefined && narrationUs != null) {
+          duration_us = Math.max(duration_us, narrationUs + TAIL_US);
+        }
+
+        shotIdToStartUs.set(shot.id, timelineCursorUs);
+        shotIdToAct.set(shot.id, actOf(shot.shotCode));
+        timelineCursorUs += duration_us;
+
+        // Emit source_us whenever an animated clip's timeline duration differs
+        // from its native length, so python sets a source_timerange and remaps
+        // speed: duration > native → slow-mo (the VO-fill floor above, in either
+        // timing mode); duration < native → trim (narration timing's shorter-VO
+        // case). When they match (clip timing with VO ≤ clip, or no VO) it's
+        // omitted and the clip plays at native speed 1.0 — byte-identical to the
+        // legacy path, so untouched shots in existing exports don't change.
+        const emitSourceUs = kind === undefined
+          && sourceUs !== undefined
+          && sourceUs !== duration_us;
+
         shotEntries.push({
-          shotCode:    shot.shotCode,
-          path:        fp,
+          shotCode:  shot.shotCode,
+          path:      mediaPath,
           duration_us,
-          narration:   shotNarration,
+          ...(kind ? { kind } : {}),
+          ...(emitSourceUs ? { source_us: sourceUs } : {}),
+          narration: shotNarration,
         });
       }
 
@@ -373,9 +491,17 @@ export class ExportsService {
       // (not the first shotId) makes the export robust against shotIds arrays
       // saved in some non-storyboard order.
       let blockStartUs = Infinity;
+      // Act of the earliest covered shot — the lane key. Keeping the whole
+      // block on one act-lane keeps its cues together (musically one mood) and
+      // gives the user "one lane per act". A block spanning two acts lands on
+      // the act of its first shot.
+      let blockAct: string | null = null;
       for (const sid of shotIds) {
         const v = shotIdToStartUs.get(sid);
-        if (v !== undefined && v < blockStartUs) blockStartUs = v;
+        if (v !== undefined && v < blockStartUs) {
+          blockStartUs = v;
+          blockAct = shotIdToAct.get(sid) ?? null;
+        }
       }
       if (!Number.isFinite(blockStartUs)) {
         this.logger.warn(
@@ -414,6 +540,7 @@ export class ExportsService {
         const renderSec = jobParams?.renderSec ?? seg.durationSec;
         musicTracks.push({
           blockSlug:          block.slug,
+          act:                blockAct ?? block.slug,
           segmentId:          seg.id,
           jobId:              job.id,
           path:               fp,
@@ -422,6 +549,29 @@ export class ExportsService {
           render_duration_us: renderSec * 1_000_000,
         });
         cursor += durUs;
+      }
+    }
+    // ── Anchor music to the first scene ─────────────────────────────────
+    // The earliest BGM cue begins at timeline 0 even when its NarrativeBlock's
+    // first covered shot sits after an un-scored cold-open / breather (e.g.
+    // bio_plus opens on C_SH00, a breather no block covers). We pull ONLY the
+    // single earliest cue earlier — later cues are untouched, no silence is
+    // added, nothing is shifted — so the rest of the music stays synced to its
+    // shots. The python exporter recomputes this cue's played length from the
+    // next cue in its act-lane (capped by the flac), so it simply plays over
+    // the opening. No-op if a cue already starts at 0. Per user spec:
+    // «музыка должна начинаться с первой сцены».
+    if (musicTracks.length > 0) {
+      let earliest = musicTracks[0];
+      for (const mt of musicTracks) {
+        if (mt.start_us < earliest.start_us) earliest = mt;
+      }
+      if (earliest.start_us > 0) {
+        this.logger.log(
+          `anchoring earliest BGM cue (${earliest.blockSlug}/${earliest.segmentId.slice(0, 8)}) `
+          + `from ${earliest.start_us}us → 0 so music starts at the first scene`,
+        );
+        earliest.start_us = 0;
       }
     }
     this.logger.log(`built ${musicTracks.length} music_tracks across ${blocks.length} block(s)`);
@@ -449,6 +599,7 @@ export class ExportsService {
       fps:                EXPORT_FPS,
       scenes:             out,
       music_tracks:       musicTracks,
+      transition_preset:  transitionPreset,
     };
   }
 }

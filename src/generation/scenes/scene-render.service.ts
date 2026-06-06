@@ -509,6 +509,27 @@ export class SceneRenderService {
 
     const workflow = strategy.buildPrompt(template, params);
 
+    // ── 4b. Per-project style-LoRA override (cartoon only) ───────────────────
+    // The graphic-novel workflows bake the comic style-LoRA at node "2"
+    // (a LoraLoader, identical node id across the single/dual/environment
+    // templates). When `project.settings.styleLora` is set we swap `lora_name`
+    // (and optional strengths) at render time, so a project can pick a
+    // different comic LoRA without editing the JSON template.
+    //
+    // Guarded on isCartoon: in the PHOTOREAL workflows node "2" is the CHARACTER
+    // LoRA, so we must never touch it there. Absent/null settings → the JSON
+    // default LoRA is used unchanged (keeps gaz / bio_plus working as before).
+    if (isCartoon) {
+      const styleLora = normalizeStyleLora((shot.project as any).settings);
+      const node2 = (workflow as any)['2']?.inputs;
+      if (styleLora && node2) {
+        node2.lora_name = styleLora.name;
+        if (styleLora.strengthModel !== undefined) node2.strength_model = styleLora.strengthModel;
+        if (styleLora.strengthClip  !== undefined) node2.strength_clip  = styleLora.strengthClip;
+        this.logger.log(`[${shot.shotCode}] style LoRA override → ${styleLora.name}`);
+      }
+    }
+
     // ── 5. Dry-run or queue ──────────────────────────────────────────────────
     const baseResult = {
       shotId:       shot.id,
@@ -543,6 +564,33 @@ function safeUnlink(p: string): void {
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Read `project.settings.styleLora` into a normalized override or null.
+ * Accepts either a bare ComfyUI lora_name string (e.g. "style\\X.safetensors")
+ * or an object { name, strengthModel?, strengthClip? }. Returns null when
+ * absent/blank so the caller falls back to the JSON-baked default LoRA.
+ */
+export function normalizeStyleLora(
+  settings: unknown,
+): { name: string; strengthModel?: number; strengthClip?: number } | null {
+  const s = (settings as { styleLora?: unknown } | null | undefined)?.styleLora;
+  if (!s) return null;
+  if (typeof s === 'string') {
+    return s.trim().length > 0 ? { name: s.trim() } : null;
+  }
+  if (typeof s === 'object') {
+    const o = s as { name?: unknown; strengthModel?: unknown; strengthClip?: unknown };
+    if (typeof o.name === 'string' && o.name.trim().length > 0) {
+      return {
+        name:          o.name.trim(),
+        strengthModel: typeof o.strengthModel === 'number' ? o.strengthModel : undefined,
+        strengthClip:  typeof o.strengthClip  === 'number' ? o.strengthClip  : undefined,
+      };
+    }
+  }
+  return null;
 }
 
 /**

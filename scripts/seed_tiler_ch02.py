@@ -1,0 +1,61 @@
+# -*- coding: utf-8 -*-
+"""Seed CH02 — Наследство мастерской. v2: enriched VO + atmosphere. Idempotent."""
+from _seed_tiler_act_engine import seed_act
+
+MOOD = "warm turquoise and ochre light, reverent handmade heritage glow, soft golden dust"
+
+SHOTS = [
+    ("CH02_SH01", None, "samarkand",
+     "wide establishing of the great turquoise ribbed domes and tiled portals of Samarkand glowing against a violet dusk sky, no people",
+     "EWS", "low", "push_in", "rishtan_day", True, True,
+     "нас, риштанских мастеров, тысячу лет звали украшать храмы, мечети, дворцы великих."),
+    ("CH02_SH02", "OTETS", "rishtan",
+     "an old white-bearded master crouching at his wood kiln, carefully lifting out a freshly fired turquoise glazed bowl with a cloth",
+     "MCU", "eye", "static", "rishtan_day", False, False,
+     "отец доставал из печи пиалу, держал её на просвет и долго молчал."),
+    ("CH02_SH03", "OTETS", "rishtan",
+     "extreme close-up of the old master's hands cradling the glowing turquoise bowl, studying the glaze",
+     "ECU", "top_down", "static", "rishtan_day", False, True,
+     "глазурь должна быть цвета неба после дождя, говорил он, иначе грош ей цена, и разбивал брак об землю."),
+    ("CH02_SH04", None, "samarkand",
+     "close-up detail of intricate cobalt and turquoise majolica mosaic on a Samarkand portal, geometric stars, no people",
+     "CU", "eye", "pan", "rishtan_day", True, False,
+     "этой самой бирюзой деды одевали купола, что стоят уже по шесть веков и не выцвели."),
+    ("CH02_SH04A", None, "samarkand",
+     "wide shot of pigeons wheeling over the turquoise domes of Samarkand in the evening light, no people",
+     "WS", "low", "static", "rishtan_day", True, False,
+     "я мальчишкой стоял под ними, задрав голову, и думал, вот это и есть навсегда."),
+    ("CH02_SH05", "OTETS", "rishtan",
+     "the old master standing behind a small boy at the worktable, guiding the child's small hands as they press pigment along a tile",
+     "MS", "high", "static", "rishtan_day", False, False,
+     "отец водил моей рукой по плитке, снова и снова, пока я не запомнил каждый изгиб вслепую."),
+    ("CH02_SH06", None, "rishtan",
+     "extreme close-up of a small child's hands under a weathered adult's hands, drawing a brush of glaze along a tile groove",
+     "ECU", "top_down", "static", "rishtan_day", False, False, ""),
+    ("CH02_SH07", "OTETS", "rishtan",
+     "the old master holding up one special antique turquoise tile to the light, speaking earnestly to his son",
+     "MCU", "low", "push_in", "rishtan_day", False, False,
+     "одну старую плитку отец берёг пуще глаза, говорил, в ней весь наш род, от деда к деду."),
+    ("CH02_SH08", "OTETS", "rishtan",
+     "extreme close-up of a single worn antique turquoise tile resting in the old master's open palm",
+     "ECU", "top_down", "static", "rishtan_day", False, True,
+     "однажды она станет твоей, сказал он мне, и слово своё сдержал, отдал перед самым отъездом."),
+    ("CH02_SH09", None, "samarkand",
+     "wide shot of restoration scaffolding against an ancient medrese facade of faded tilework, no people",
+     "WS", "low", "static", "rishtan_day", True, False,
+     "дед всю жизнь чинил старые медресе, подбирал бирюзу по одному осколку, неделями искал нужный оттенок."),
+    ("CH02_SH10", "BAKHTI", "rishtan",
+     "the adult master standing alone in the dusk courtyard, turning the inherited tile slowly over in his hands, thoughtful",
+     "MS", "eye", "static", "rishtan_golden", False, False,
+     "а я, выходит, первый в роду пошёл украшать не храм и не дом людям, а чужую гордыню за морем."),
+    ("CH02_SH11", None, "rishtan",
+     "close-up of the chipped turquoise tile being wrapped in a cloth, warm low light, no faces",
+     "CU", "top_down", "push_in", "rishtan_golden", True, False,
+     "вот этот отцовский осколок я и берёг всю дорогу, как самое последнее."),
+    ("CH02_SH12", None, "samarkand",
+     "silhouette of the Samarkand domes fading into deep night with the first stars, no people",
+     "EWS", "eye", "static", "rishtan_day", True, False, ""),
+]
+
+if __name__ == "__main__":
+    seed_act(2, "rishtan_turquoise", MOOD, "animated", "CH02 Heritage", SHOTS)

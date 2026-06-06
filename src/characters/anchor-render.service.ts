@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, unlin
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { ComfyService } from '../comfy/comfy.service';
+import { normalizeStyleLora } from '../generation/scenes/scene-render.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? 'E:\\ComfyUI\\gen-studio';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
@@ -170,6 +171,21 @@ export class AnchorRenderService {
     }
 
     const wf = JSON.parse(readFileSync(workflowPath, 'utf-8')) as Record<string, any>;
+
+    // One style LoRA per PROJECT, across the whole pipeline. The anchor workflow
+    // bakes Graphic_Novel in its LoraLoader (node 2); if the project picked a
+    // different comic LoRA via settings.styleLora (the same override scene-render
+    // applies), swap it here too — otherwise the character anchors would be drawn
+    // with one comic LoRA while the scenes use another (two LoRAs in one project).
+    const styleLora = normalizeStyleLora((project as any).settings);
+    const node2 = wf['2']?.inputs;
+    if (styleLora && node2) {
+      node2.lora_name = styleLora.name;
+      if (styleLora.strengthModel !== undefined) node2.strength_model = styleLora.strengthModel;
+      if (styleLora.strengthClip  !== undefined) node2.strength_clip  = styleLora.strengthClip;
+      this.logger.log(`Anchor ${profile.profileCode}: style LoRA override → ${styleLora.name}`);
+    }
+
     const positive = [STYLE_PREFIX, PORTRAIT_COMPOSITION, profile.promptBase].join(', ');
     const negative = (profile.negative && profile.negative.trim().length > 0)
       ? profile.negative

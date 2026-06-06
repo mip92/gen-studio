@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Res } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
-import { IsArray, IsOptional, IsString, IsUUID, ValidateNested } from 'class-validator';
+import { IsArray, IsNumber, IsOptional, IsString, IsUUID, ValidateNested } from 'class-validator';
 import { Response } from 'express';
 import { createReadStream, statSync } from 'fs';
 import * as path from 'path';
@@ -26,6 +26,13 @@ class UpdateShotBody extends UpdateShotDto {
   participants?: ParticipantInput[];
 }
 
+class AnimatedPrefixBody {
+  /** How many minutes from the start of the film stay fully animated; the rest
+   *  becomes static (Ken-Burns stills). */
+  @IsNumber()
+  minutes!: number;
+}
+
 @ApiTags('Shots')
 @Controller('projects/:projectId/shots')
 export class ShotsController {
@@ -43,6 +50,17 @@ export class ShotsController {
   @ApiOperation({ summary: 'Create a new shot in a scene of this project' })
   create(@Param('projectId') projectId: string, @Body() dto: CreateShotDto) {
     return this.shotsService.create(projectId, dto);
+  }
+
+  @Post('render-mode/animated-prefix')
+  @ApiOperation({
+    summary: 'Bulk: first N minutes (play order) = animated, the rest = static',
+  })
+  setAnimatedPrefix(
+    @Param('projectId') projectId: string,
+    @Body() body: AnimatedPrefixBody,
+  ) {
+    return this.shotsService.setAnimatedPrefix(projectId, body.minutes);
   }
 
   @Get(':shotId')

@@ -63,6 +63,22 @@ const MAX_RATE                        = 2.0;
 const MIN_SENTENCE_PAUSE = 0;
 const MAX_SENTENCE_PAUSE = 30;
 
+// F5-TTS Russian renders a touch fast and runs sentences together, so f5
+// projects sound right out of the box with a slightly slowed rate + a 1s
+// pause between sentences. These are only DEFAULTS — an explicit per-render
+// rate/sentencePauseSec still wins. silero/xtts2 keep the 1.0 / 0 defaults.
+const F5_DEFAULT_RATE           = 0.95;
+const F5_DEFAULT_SENTENCE_PAUSE = 1.0;
+
+/** Default playback rate when the caller didn't specify one — engine-aware. */
+function defaultRateFor(engine: TTSEngine): number {
+  return engine === 'f5' ? F5_DEFAULT_RATE : DEFAULT_RATE;
+}
+/** Default sentence pause (seconds) when not specified — engine-aware. */
+function defaultSentencePauseFor(engine: TTSEngine): number {
+  return engine === 'f5' ? F5_DEFAULT_SENTENCE_PAUSE : 0;
+}
+
 export interface StartTTSInput {
   sceneId:      string;
   /** If omitted, scene.narrationText is used. */
@@ -155,10 +171,10 @@ export class TTSService {
     rate?:             number;
     sentencePauseSec?: number;
     modelFilename?:    string;
-  }): { voice: Voice; sampleRate: SampleRate; rate: number; sentencePauseSec: number; modelFilename: string | null } {
+  }, engine: TTSEngine): { voice: Voice; sampleRate: SampleRate; rate: number; sentencePauseSec: number; modelFilename: string | null } {
     const voice      = input.voice      ?? DEFAULT_VOICE;
     const sampleRate = input.sampleRate ?? DEFAULT_SAMPLE_RATE;
-    const rate       = input.rate       ?? DEFAULT_RATE;
+    const rate       = input.rate       ?? defaultRateFor(engine);
     if (!ALLOWED_VOICES.includes(voice)) {
       throw new BadRequestException(`voice must be one of: ${ALLOWED_VOICES.join(', ')}`);
     }
@@ -168,7 +184,7 @@ export class TTSService {
     if (rate < MIN_RATE || rate > MAX_RATE) {
       throw new BadRequestException(`rate must be in [${MIN_RATE}, ${MAX_RATE}]`);
     }
-    const sentencePauseSec = input.sentencePauseSec ?? 0;
+    const sentencePauseSec = input.sentencePauseSec ?? defaultSentencePauseFor(engine);
     if (sentencePauseSec < MIN_SENTENCE_PAUSE || sentencePauseSec > MAX_SENTENCE_PAUSE) {
       throw new BadRequestException(`sentencePauseSec must be in [${MIN_SENTENCE_PAUSE}, ${MAX_SENTENCE_PAUSE}]`);
     }
@@ -261,7 +277,7 @@ export class TTSService {
     }
 
     const { voice, sampleRate, rate, sentencePauseSec, modelFilename } =
-      this.validateCommonInput(input);
+      this.validateCommonInput(input, projectEngine(scene.project));
     const engineCols = await this.resolveEngineColumns(scene.project, input);
 
     return this.prisma.tTSJob.create({
@@ -299,7 +315,7 @@ export class TTSService {
     }
 
     const { voice, sampleRate, rate, sentencePauseSec, modelFilename } =
-      this.validateCommonInput(input);
+      this.validateCommonInput(input, projectEngine(shot.project));
     const engineCols = await this.resolveEngineColumns(shot.project, input);
 
     // Queue placement. Single-slot queue: one job runs at a time and the
@@ -833,8 +849,8 @@ export class TTSService {
           text,
           voice,
           sampleRate:       DEFAULT_SAMPLE_RATE,
-          rate:             DEFAULT_RATE,
-          sentencePauseSec: 0,
+          rate:             defaultRateFor(engineCols.engine),
+          sentencePauseSec: defaultSentencePauseFor(engineCols.engine),
           modelFilename:    null,
           status:           'pending',
           ...engineCols,

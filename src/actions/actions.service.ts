@@ -153,7 +153,7 @@ export class ActionsService {
     // anchor PNG, so gates 1-3 are replaced by a single gate: generate_anchor.
     const projectFull = await this.prisma.project.findUnique({
       where: { id: project.id },
-      select: { id: true, slug: true, name: true },
+      select: { id: true, slug: true, name: true, visualStyle: true },
     });
     const visualStyle: string = (projectFull as any)?.visualStyle ?? 'photoreal_cinematic';
     const isCartoonProject = visualStyle !== 'photoreal_cinematic';
@@ -265,7 +265,7 @@ export class ActionsService {
       where: { projectId: project.id },
       include: {
         scene:        { select: { id: true, sceneKey: true, title: true, sortOrder: true } },
-        participants: { include: { profile: { select: { id: true, loraPath: true, useIpAdapter: true } } } },
+        participants: { include: { profile: { select: { id: true, profileCode: true, loraPath: true, useIpAdapter: true } } } },
         renderJobs:   { select: { id: true, status: true, completedAt: true } },
         videoRenders: {
           select: {
@@ -276,6 +276,16 @@ export class ActionsService {
       },
       orderBy: [{ scene: { sortOrder: 'asc' } }, { shotCode: 'asc' } ],
     });
+
+    // Cartoon shots need the character's anchor PNG before a scene render is
+    // useful — without it the IP-Adapter has no face to lock and the render
+    // hallucinates identity. So gate 4 (render_scene) is withheld until the
+    // anchor exists; the bottleneck then surfaces under the character's
+    // generate_anchor gate instead. Photoreal projects ignore this (LoRA-gated).
+    const projForStyle = await this.prisma.project.findUnique({
+      where: { id: project.id }, select: { visualStyle: true },
+    });
+    const isCartoonProject = ((projForStyle?.visualStyle ?? 'photoreal_cinematic') !== 'photoreal_cinematic');
 
     for (const shot of shots) {
       const scene = shot.scene
@@ -296,7 +306,8 @@ export class ActionsService {
           continue;
         }
 
-        if (!renderInFlight && this.isLoraReady(shot.participants)) {
+        if (!renderInFlight && this.isLoraReady(shot.participants)
+            && this.anchorsReadyForShot(shot.participants, project.slug, isCartoonProject)) {
           out.push(this.shotItem(4, 'render_scene', project, shot, scene, {
             link: `/projects/${project.id}/shots/${shot.id}/render`,
           }));
@@ -305,6 +316,13 @@ export class ActionsService {
       }
 
       // From here: chosenRender is set.
+      // Static shots ship the still PNG only — no Wan video, no upscale. Skip
+      // ALL video gates (create/approve/upscale) so neither the /actions page
+      // nor the Telegram bot (both read this same gate list) ever offer video
+      // generation for a shot the user marked renderMode='static'. The chosen
+      // render PNG is the finished deliverable for these shots.
+      if (shot.renderMode === 'static') continue;
+
       // Gate 6 — create video. No chosenVideoId, no in-flight video render.
       if (!shot.chosenVideoId) {
         const completedVideos = shot.videoRenders.filter(
@@ -352,6 +370,26 @@ export class ActionsService {
       if (!p.profile) continue; // text-only participant
       if (p.profile.useIpAdapter) continue;
       if (!p.profile.loraPath) return false;
+    }
+    return true;
+  }
+
+  /** Cartoon-only gate: every participant profile (IP-Adapter identity) must
+   *  have its `<profileCode>_anchor.png` on disk before a scene render is
+   *  offered — otherwise the render has no face to lock and hallucinates.
+   *  Photoreal projects return true (they're LoRA-gated by isLoraReady). */
+  private anchorsReadyForShot(
+    participants: Array<{ profile: { profileCode: string; useIpAdapter: boolean } | null }>,
+    slug: string,
+    isCartoon: boolean,
+  ): boolean {
+    if (!isCartoon) return true;
+    const root = process.env.APP_ROOT ?? 'E:\\ComfyUI\\gen-studio';
+    for (const p of participants) {
+      if (!p.profile) continue;              // text-only participant
+      if (!p.profile.useIpAdapter) continue; // non-IP profile — not anchor-gated here
+      const anchorPath = `${root}\\data\\${slug}\\reference\\${p.profile.profileCode}_anchor.png`;
+      if (!hasAnchorOnDisk(anchorPath)) return false;
     }
     return true;
   }

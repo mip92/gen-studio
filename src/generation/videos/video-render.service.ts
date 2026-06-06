@@ -25,6 +25,13 @@ const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 const POLL_MS      = 4000;
 const WORKFLOW_FILENAME = 'video_wan22_i2v_api.json';
+// Alternative "quality" i2v workflow: full Wan2.2 dual-expert, no lightx2v
+// speed LoRA, 20 steps @ cfg=4.0 → the negative prompt actually fires. ~5×
+// slower than the fast 4-step default. Selected via StartVideoInput.mode='cfg'.
+const CFG_WORKFLOW_FILENAME = 'video_wan22_i2v_cfg_api.json';
+// Allowlist of i2v workflow files the service is permitted to load — guards
+// loadTemplate against a row carrying an unexpected workflowFilename value.
+const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME]);
 const UPSCALE_WORKFLOW_FILENAME = 'video_upscale_4x_api.json';
 
 // Wan2.2 i2v defaults — 768×432 = exact 16:9, both dims divisible by 16.
@@ -64,6 +71,17 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       include: { project: true },
     });
     if (!shot) throw new NotFoundException(`Shot ${input.shotId} not found`);
+    // Static shots ship their still PNG only — they are never animated to a
+    // Wan i2v clip. Refuse video generation outright so a stray /actions click,
+    // Telegram tap, or direct API call can't queue video on a shot the user
+    // deliberately marked renderMode='static'. Already-rendered videos are left
+    // untouched; this only blocks NEW renders.
+    if (shot.renderMode === 'static') {
+      throw new BadRequestException(
+        `Shot ${shot.shotCode} is renderMode='static' (no-video) — video generation is disabled for it. `
+        + `Switch it to 'animated' first if you actually want a clip.`,
+      );
+    }
     if (!shot.chosenRender) {
       throw new BadRequestException(
         `Shot ${shot.shotCode} has no chosen render. Approve a render before starting a video.`,
@@ -78,6 +96,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     }
 
     const count = Math.max(1, Math.min(8, input.count ?? 1));
+    const workflowFilename = this.resolveWorkflowFilename(input.mode, shot);
 
     // Create N pending rows. Actual ComfyUI dispatch happens in PipelineQueueService.tick()
     // which serializes video renders against scene renders, training and dataset jobs.
@@ -92,7 +111,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
           sourceImageFilename: shot.chosenRender!,
           motionPrompt:        input.motionPrompt?.trim() || '',
           status:              'pending',
-          workflowFilename:    WORKFLOW_FILENAME,
+          workflowFilename:    workflowFilename,
           params: {
             seed,
             width:  input.width  ?? DEFAULT_WIDTH,
@@ -124,6 +143,22 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     if (!v) throw new Error(`VideoRender ${videoId} not found`);
     if (v.status !== 'pending') return;
 
+    // Defence in depth: never render video for a renderMode='static' shot, even
+    // if a pending row slipped in before the start() guard existed. Mark it
+    // 'skipped' (a terminal status that nextPending never re-selects and
+    // sweepFailedRows never deletes) so it neither renders nor loops, and NO
+    // file is touched — static shots keep their still PNG as the deliverable.
+    if (v.shot.renderMode === 'static') {
+      this.logger.warn(
+        `dispatchPending video ${v.id}: shot ${v.shot.shotCode} is renderMode='static' — skipping (no video for static shots)`,
+      );
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  { status: 'skipped', errorMessage: "shot is renderMode='static'; video generation disabled" },
+      });
+      return;
+    }
+
     const sourcePath = path.join(
       APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, v.sourceImageFilename,
     );
@@ -144,7 +179,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
 
     try {
       const params = v.params as { seed: number; width: number; height: number; length: number; fps: number };
-      const template = this.loadTemplate(v.shot.project.slug);
+      const template = this.loadTemplate(v.shot.project.slug, v.workflowFilename);
       // Resolve motion negative from DB: per-shot override > project default.
       // When both empty, the workflow JSON's hardcoded fallback stays.
       const pf      = (v.shot.promptFields ?? {}) as Record<string, unknown>;
@@ -270,8 +305,38 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
 
   // ── Workflow loading + patching ────────────────────────────────────────────
 
-  private loadTemplate(projectSlug: string): Record<string, any> {
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', WORKFLOW_FILENAME);
+  /**
+   * Resolve the i2v workflow file for a render. Explicit 'fast'/'cfg' wins.
+   * 'auto' (or undefined) picks cfg ONLY for a static shot on a comic-style
+   * (non-photoreal) project — those are the shots where the negative prompt
+   * needs to bite (toy must not move, no drinking). Everything else stays on
+   * the fast 4-step workflow. Falls back to fast if the cfg file isn't present
+   * for the project (loadTemplate re-checks existence on disk).
+   */
+  private resolveWorkflowFilename(
+    mode: 'auto' | 'fast' | 'cfg' | undefined,
+    shot: { promptFields: any; project: { slug: string; visualStyle?: string | null } },
+  ): string {
+    if (mode === 'cfg')  return CFG_WORKFLOW_FILENAME;
+    if (mode === 'fast') return WORKFLOW_FILENAME;
+    // auto
+    const pf       = (shot.promptFields ?? {}) as Record<string, unknown>;
+    const cam      = (pf.camera as Record<string, unknown> | undefined) ?? {};
+    const movement = typeof cam.movement === 'string' ? cam.movement.trim() : '';
+    const isStatic = /^static/i.test(movement);
+    const isComic  = (shot.project.visualStyle ?? 'photoreal_cinematic') !== 'photoreal_cinematic';
+    const cfgPath  = path.join(APP_ROOT, 'data', shot.project.slug, 'comfy', CFG_WORKFLOW_FILENAME);
+    if (isComic && isStatic && existsSync(cfgPath)) return CFG_WORKFLOW_FILENAME;
+    return WORKFLOW_FILENAME;
+  }
+
+  private loadTemplate(projectSlug: string, workflowFilename?: string | null): Record<string, any> {
+    // Only ever load a known i2v workflow file; fall back to the fast default
+    // if the row carries an empty/unrecognised name.
+    const filename = workflowFilename && ALLOWED_WORKFLOWS.has(workflowFilename)
+      ? workflowFilename
+      : WORKFLOW_FILENAME;
+    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', filename);
     if (!existsSync(filePath)) {
       throw new NotFoundException(`Video workflow not found: ${filePath}`);
     }

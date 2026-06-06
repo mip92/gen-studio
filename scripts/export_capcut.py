@@ -18,12 +18,18 @@ Manifest schema (see ExportsService.buildManifest for the writer):
   "width":              1920,
   "height":             1080,
   "fps":                30,
+  "transition_preset":  "default" | "comic",   # shot-boundary transition style
   "scenes": [
     {
       "sceneKey":   "S01",
       "narration":  { "path": "...wav", "duration_us": 12345678 } | null,
       "shots": [
+        # animated shot, legacy clip timing (no kind/source_us):
         { "shotCode": "S01_SH01", "path": "...mp4", "duration_us": 5062500 },
+        # animated shot slowed to the VO (narration timing):
+        { "shotCode": "S01_SH02", "path": "...mp4", "duration_us": 11000000, "source_us": 5062500 },
+        # static shot — still PNG held + Ken Burns:
+        { "shotCode": "S01_SH03", "path": "...png", "duration_us": 9000000, "kind": "image" },
         ...
       ]
     }
@@ -44,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import shutil
 import sys
 import time
@@ -106,6 +113,126 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _capcut_effect_path(capcut_drafts_root: str, resource_id: str):
+    """Locate the local cache folder of a downloaded CapCut transition effect.
+
+    CapCut stores each effect it has ever applied under
+    `<User Data>/Cache/effect/<resource_id>/<md5hash>/`. A transition material
+    only RENDERS (and survives final export) when its `path` points at that
+    folder — the minimal material pyJianYingDraft writes omits it, which is why
+    library-injected transitions showed up in the editor but did nothing.
+
+    `capcut_drafts_root` is `<User Data>/Projects/com.lveditor.draft`, so the
+    cache root is two levels up + `Cache/effect`. Returns a forward-slash path
+    string, or None when the effect hasn't been downloaded on this machine
+    (user must apply it once in CapCut so it lands in the cache)."""
+    try:
+        user_data = Path(capcut_drafts_root).parent.parent  # …/Projects/… → …/User Data
+        eff_dir = user_data / "Cache" / "effect" / str(resource_id)
+        if not eff_dir.is_dir():
+            return None
+        # The effect package is a subfolder named by its md5; skip the *_tmp
+        # download-scratch entries CapCut leaves alongside it.
+        for child in sorted(eff_dir.iterdir()):
+            if child.is_dir() and not child.name.endswith('_tmp'):
+                return str(child).replace('\\', '/')
+    except Exception as e:  # noqa: BLE001
+        _log(f'effect-cache lookup failed for {resource_id}: {e!r}')
+    return None
+
+
+class _RawTransition:
+    """A shot-boundary transition written as a raw CapCut material dict.
+
+    Mirrors EXACTLY what CapCut emits when you add a transition by hand
+    (verified against a working hand-authored draft): full field set incl.
+    `source_platform`, `category_id`, `third_resource_id`, and the on-disk
+    `path` to the downloaded effect. Used for modern transitions (e.g.
+    «Разрыв с угла», effect_id 7548348919240019261) that aren't in
+    pyJianYingDraft's bundled `TransitionType` table at all.
+
+    Duck-types the lib's `Transition`: it exposes `global_id` + `export_json()`,
+    so it drops straight into `script.materials.transitions` and is referenced
+    from a segment's `extra_material_refs` like any native transition."""
+
+    def __init__(self, name: str, effect_id: str, resource_id: str,
+                 path, duration_us: int, is_overlap: bool = True):
+        self.global_id   = uuid.uuid4().hex
+        self.name        = name
+        self.effect_id   = str(effect_id)
+        self.resource_id = str(resource_id)
+        self.path        = path or ''
+        self.duration    = int(duration_us)
+        self.is_overlap  = is_overlap
+
+    def export_json(self) -> Dict[str, Any]:
+        return {
+            "id":                self.global_id,
+            "type":              "transition",
+            "name":              self.name,
+            "effect_id":         self.effect_id,
+            "resource_id":       self.resource_id,
+            "third_resource_id": "0",
+            "source_platform":   1,
+            "path":              self.path,
+            "duration":          self.duration,
+            "is_overlap":        self.is_overlap,
+            "platform":          "all",
+            "category_id":       "100000",
+            "category_name":     "",
+            "request_id":        "",
+            "is_ai_transition":  False,
+            "video_path":        "",
+            "task_id":           "",
+        }
+
+
+# ── Ken Burns presets for static (image) shots ─────────────────────────────
+# A static shot ships as its still PNG; to keep it alive on the timeline we add
+# a slow camera move spanning the whole shot. Presets are cycled by static-shot
+# index (same rotation idea as the transition cycle below). All are deliberately
+# subtle: ≤12% zoom, ≤6% pan, ≤1.2° tilt. Pan/tilt presets pre-scale the image
+# to 1.12 so the move never exposes the frame edge.
+# Units (pyJianYingDraft): uniform_scale 1.0 = fit-to-frame; position_x/y are in
+# half-canvas units (0.06 ≈ 3% of full width/height); rotation is clockwise deg.
+KEN_BURNS_CYCLE = ['zoom_in', 'zoom_out', 'pan_left', 'pan_right', 'tilt', 'pan_up']
+
+
+def _apply_ken_burns(segment: "draft.VideoSegment", duration_us: int, preset: str) -> None:
+    """Animate a still-image segment with a slow Ken-Burns move.
+
+    Zoom presets keyframe `uniform_scale` (the lib keeps the uniform flag on, so
+    it scales both axes evenly). Pan/tilt presets hold a constant base scale via
+    the segment's `clip_settings` (giving margin so the edge never shows) and
+    keyframe only the moving property. pyJianYingDraft only does linear
+    interpolation, which over a whole shot reads as a smooth slow drift.
+    """
+    KP  = draft.KeyframeProperty
+    end = max(1, int(duration_us))
+    if preset == 'zoom_in':
+        segment.add_keyframe(KP.uniform_scale, 0,   1.0)
+        segment.add_keyframe(KP.uniform_scale, end, 1.12)
+    elif preset == 'zoom_out':
+        segment.add_keyframe(KP.uniform_scale, 0,   1.12)
+        segment.add_keyframe(KP.uniform_scale, end, 1.0)
+    elif preset == 'pan_left':
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.add_keyframe(KP.position_x, 0,    0.06)
+        segment.add_keyframe(KP.position_x, end, -0.06)
+    elif preset == 'pan_right':
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.add_keyframe(KP.position_x, 0,   -0.06)
+        segment.add_keyframe(KP.position_x, end,  0.06)
+    elif preset == 'pan_up':
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.add_keyframe(KP.position_y, 0,   -0.06)
+        segment.add_keyframe(KP.position_y, end,  0.06)
+    elif preset == 'tilt':
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.add_keyframe(KP.rotation, 0,   -1.2)
+        segment.add_keyframe(KP.rotation, end,  1.2)
+
+
 def build_draft(manifest: dict) -> Path:
     project   = manifest["project_name"]
     # Where the live CapCut draft goes. Falls back to output_root if the
@@ -142,6 +269,10 @@ def build_draft(manifest: dict) -> Path:
     total_clips     = 0
     total_tts       = 0
     total_bgm       = 0
+    # Static (image) shots: counted for the summary, and indexed to cycle the
+    # Ken Burns preset list across the whole film (not reset per scene).
+    total_static    = 0
+    static_index    = 0
     # Every VideoSegment in playback order — used after the loop to attach a
     # transition between consecutive shots. Skipping the very last entry
     # avoids a transition that has no "next" to dissolve into.
@@ -164,11 +295,54 @@ def build_draft(manifest: dict) -> Path:
             if dur <= 0:
                 _log(f'skipping {sh["shotCode"]}: non-positive duration {dur}')
                 continue
+            # kind defaults to "video" when absent — keeps legacy clip-timed
+            # manifests (no `kind` key) on the exact path they used before.
+            kind     = sh.get("kind") or "video"
             material = draft.VideoMaterial(path, material_name=sh["shotCode"])
-            segment  = draft.VideoSegment(
-                material=material,
-                target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
-            )
+
+            if kind == "image":
+                # Static shot: a still PNG held for `dur`, kept alive by a slow
+                # Ken Burns move cycled across the film.
+                segment = draft.VideoSegment(
+                    material=material,
+                    target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
+                )
+                preset = KEN_BURNS_CYCLE[static_index % len(KEN_BURNS_CYCLE)]
+                try:
+                    _apply_ken_burns(segment, dur, preset)
+                    _log(f'kenburns {sh["shotCode"]:<14} {preset}')
+                except Exception as e:  # noqa: BLE001
+                    _log(f'kenburns failed for {sh["shotCode"]} ({preset}): {e!r}')
+                static_index += 1
+                total_static += 1
+            else:
+                # Animated shot. `source_us` present → narration timing: fit the
+                # clip to the VO hold. window = min(hold, native length):
+                #   VO longer than the clip  → window = native → speed < 1 (slow)
+                #   VO shorter than the clip → window = hold   → speed = 1 (trim)
+                # Clamp the window to the real material length so we never ask
+                # pyJianYingDraft for more frames than the file has.
+                source_us = int(sh.get("source_us") or 0)
+                if source_us > 0:
+                    native = material.duration
+                    window = min(dur, native)
+                    segment = draft.VideoSegment(
+                        material=material,
+                        target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
+                        source_timerange=draft.Timerange(start=0, duration=window),
+                    )
+                    speed = (window / dur) if dur else 1.0
+                    if speed < 0.34:
+                        _log(f'WARNING {sh["shotCode"]}: slow-mo {speed:.2f}x '
+                             f'(VO {dur/1e6:.1f}s on a {native/1e6:.1f}s clip) — '
+                             f'consider splitting this shot')
+                else:
+                    # legacy / native-length path (speed 1.0) — byte-unchanged
+                    segment = draft.VideoSegment(
+                        material=material,
+                        target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
+                    )
+
             script.add_segment(segment, track_name="main_video")
             all_video_segments.append(segment)
 
@@ -241,23 +415,32 @@ def build_draft(manifest: dict) -> Path:
                     _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
 
     # ── Shot-boundary transitions ──────────────────────────────────────
-    # First 12 trending CapCut transitions, cycled across every shot boundary
-    # (not just scene boundaries) so the rotation actually exercises the full
-    # set even on short projects. Applied to the OUTGOING segment per
-    # pyJianYingDraft contract; the very last shot is skipped (no "next" to
-    # dissolve into). Names are Chinese identifiers from
-    # `pyJianYingDraft.TransitionType` — looked up via getattr because the
-    # enum members aren't valid Python attribute names without it.
-    # All five must be is_vip=False AND is_overlap=False — anything VIP
-    # silently fails to render without CapCut Pro, and is_overlap=True
-    # transitions need the next segment to actually overlap on the timeline
-    # (which we don't do; clips are laid back-to-back). Failed picks from
-    # the previous iteration: 闪屏故障 (VIP), 叠加 (overlap), 模糊放大 (VIP),
-    # 旋焦 (VIP) — all four "inserted but invisible" in CapCut.
-    # Final curated set picked by the user after auditioning all 38 free
-    # transitions. Grouped by character: fade → camera moves → directional
-    # slides → glitch accent. All non-VIP, all is_overlap=False, all render
-    # without CapCut Pro.
+    # Two presets, chosen by manifest["transition_preset"]:
+    #
+    #   "default" (legacy): the curated 8 free transitions cycled in rotation
+    #       across every shot boundary, via pyJianYingDraft's bundled
+    #       `TransitionType` enum. All is_vip=False AND is_overlap=False (this
+    #       set was picked after auditioning all 38 free transitions). Keeps
+    #       existing exports byte-identical.
+    #
+    #   "comic": a stylized comic-book look. Each transition is injected as a
+    #       RAW CapCut material (see _RawTransition) — NOT through the enum —
+    #       because the modern «Разрыв с угла» effect (id 7548348919240019261)
+    #       isn't in pyJianYingDraft's bundled table at all, and because only
+    #       the full hand-authored material (with the on-disk `path` to the
+    #       downloaded effect) actually renders + survives final export. Counts
+    #       per transition are exact (the accents get round(n*share), the
+    #       dominant tear — listed LAST — soaks the remainder ≈90%), then the
+    #       sequence is SHUFFLED so accents land at random boundaries
+    #       («в рандомный момент»). The effect resource must have been applied
+    #       once in CapCut so it sits in the local effect cache (path lookup);
+    #       if it isn't cached we still inject it (logged) but it may need a
+    #       manual re-add. All comic transitions are is_overlap=True, so CapCut
+    #       offers "create duplicate frames" on open (clips are back-to-back) —
+    #       expected; accept it and they render.
+    #
+    # Transitions are applied to the OUTGOING segment per pyJianYingDraft
+    # contract; the very last shot is skipped (no "next" to dissolve into).
     TRANSITION_CYCLE = [
         '闪黑',   # Black Fade   — затухание в чёрный
         '推近',   # Push In      — наезд камеры
@@ -268,40 +451,92 @@ def build_draft(manifest: dict) -> Path:
         '向右',   # Slide Right  — сдвиг вправо
         '故障',   # Glitch       — цифровой глитч-срыв
     ]
-    TRANSITION_DURATION_US = 600_000   # 0.6s — short enough to stay invisible
+    # Comic preset, raw CapCut effects: (display name, effect_id, resource_id,
+    # duration_us, share). effect_id == resource_id for these newer effects.
+    # ORDER MATTERS: the dominant transition must be LAST so it soaks the
+    # rounding remainder (→ ≈90%); the fixed-share accents come first. IDs +
+    # durations were read straight out of a hand-authored CapCut draft (apply
+    # the transition once in CapCut, save, read materials.transitions from
+    # draft_content.json). All three are is_overlap=True.
+    COMIC_RAW_TRANSITIONS = [
+        ('Стикер',        '7530469760765545729', '7530469760765545729', 600_000, 0.05),
+        ('Рваный коллаж', '7502327979834461441', '7502327979834461441', 600_000, 0.05),
+        ('Разрыв с угла', '7548348919240019261', '7548348919240019261', 600_000, 0.90),  # dominant — keep LAST
+    ]
+    DEFAULT_TRANSITION_DURATION_US = 600_000   # 0.6s — short enough to stay invisible
+
+    preset = manifest.get('transition_preset') or 'default'
+    n_boundaries = max(0, len(all_video_segments) - 1)
     successful_transitions = 0
-    for i, seg in enumerate(all_video_segments[:-1]):
-        name = TRANSITION_CYCLE[i % len(TRANSITION_CYCLE)]
-        tt   = getattr(draft.TransitionType, name, None)
-        if tt is None:
-            _log(f'transition lookup failed for "{name}" — skipping at boundary {i}')
-            continue
-        try:
-            seg.add_transition(tt, duration=TRANSITION_DURATION_US)
-            # pyJianYingDraft only copies a segment's transition into
-            # `script.materials.transitions` inside `add_segment()` (see
-            # script_file.py:338). Since we attach transitions AFTER all
-            # segments are already added, we have to push the material into
-            # the materials list ourselves — otherwise the segment's
-            # extra_material_refs points to a transition that's missing from
-            # the draft's materials dict, and CapCut silently drops it.
-            if seg.transition is not None and seg.transition not in script.materials:
-                script.materials.transitions.append(seg.transition)
-            # Map shot-boundary index to transition name so the user can match
-            # "I liked the transition between shot 23 and 24" → name.
+
+    if preset == 'comic':
+        # Resolve each comic effect's local cache path + build an exact-count,
+        # shuffled per-boundary spec list. Each spec: (name, effect_id,
+        # resource_id, path).
+        specs: List[tuple] = []
+        counts: List[tuple] = []
+        assigned = 0
+        for idx, (name, eff, res, dur_us, share) in enumerate(COMIC_RAW_TRANSITIONS):
+            path = _capcut_effect_path(manifest.get('capcut_drafts_root', ''), res)
+            if path is None:
+                _log(f'comic transition "{name}" (resource {res}) not in CapCut '
+                     f'effect cache — injecting without path (may need manual re-add)')
+            if idx < len(COMIC_RAW_TRANSITIONS) - 1:
+                count = round(n_boundaries * share)
+            else:
+                count = max(0, n_boundaries - assigned)   # dominant soaks remainder
+            assigned += count
+            counts.append((name, count))
+            specs.extend([(name, eff, res, dur_us, path)] * count)
+        random.shuffle(specs)
+        _log(f'transition preset=comic boundaries={n_boundaries} counts={counts}')
+
+        for i, seg in enumerate(all_video_segments[:-1]):
+            if i >= len(specs):
+                break
+            name, eff, res, dur_us, path = specs[i]
+            rt = _RawTransition(name, eff, res, path, dur_us)
+            # Attach manually (we add transitions AFTER all segments are placed):
+            # set the segment's transition, link it from extra_material_refs, and
+            # register the material so the draft's materials dict resolves it.
+            seg.transition = rt
+            seg.extra_material_refs.append(rt.global_id)
+            script.materials.transitions.append(rt)
             _log(f'transition shot{i:>3}->shot{i+1:<3} {name}')
             successful_transitions += 1
-        except Exception as e:  # noqa: BLE001
-            _log(f'add_transition failed at boundary {i} ({name}): {e!r}')
+    else:
+        plan = [TRANSITION_CYCLE[i % len(TRANSITION_CYCLE)] for i in range(n_boundaries)]
+        _log(f'transition preset=default boundaries={n_boundaries}')
+        for i, seg in enumerate(all_video_segments[:-1]):
+            name = plan[i]
+            tt   = getattr(draft.TransitionType, name, None)
+            if tt is None:
+                _log(f'transition lookup failed for "{name}" — skipping at boundary {i}')
+                continue
+            try:
+                seg.add_transition(tt, duration=DEFAULT_TRANSITION_DURATION_US)
+                # pyJianYingDraft only copies a segment's transition into
+                # `script.materials.transitions` inside `add_segment()`. We
+                # attach AFTER all segments are added, so push it ourselves —
+                # otherwise extra_material_refs points to a missing material and
+                # CapCut silently drops it.
+                if seg.transition is not None and seg.transition not in script.materials:
+                    script.materials.transitions.append(seg.transition)
+                _log(f'transition shot{i:>3}->shot{i+1:<3} {name}')
+                successful_transitions += 1
+            except Exception as e:  # noqa: BLE001
+                _log(f'add_transition failed at boundary {i} ({name}): {e!r}')
     total_transitions = successful_transitions
 
     # ── BGM (ACE-Step) ──────────────────────────────────────────────────
-    # Each NarrativeBlock gets its own audio lane (`bgm_<blockSlug>`). With
-    # blocks on separate tracks, the last cue of a block can play its entire
-    # overgen tail past the planned slot — even when the next block starts
-    # immediately — because there's no same-track neighbour to collide with.
-    # Within a block, consecutive cues still share a lane and so still cap
-    # at the next cue's start.
+    # One audio lane PER ACT (`bgm_act_<act>`): every cue of an act shares a
+    # lane, the next act starts a fresh lane. Within an act-lane, consecutive
+    # cues are laid in start order and each is capped at the next cue's start
+    # (same lane → would collide). The act's LAST cue plays its full overgen
+    # tail — the next act is on a different lane, so the tail can ring out
+    # without colliding. (Per user spec: «все треки в каждом акте в одной
+    # дорожке, следующий акт — новая дорожка».) Falls back to blockSlug for
+    # cues with no resolved act.
     #
     # Two duration fields per entry:
     #   - duration_us         planned slot length on the timeline
@@ -314,21 +549,22 @@ def build_draft(manifest: dict) -> Path:
     # emitted out of timeline order.
     tracks.sort(key=lambda t: int(t.get("start_us") or 0))
 
-    # Group by block, preserving sort order within each group. Each group
-    # becomes its own audio lane so blocks can overlap freely.
-    block_groups: Dict[str, List[Dict[str, Any]]] = {}
-    block_order: List[str] = []
+    # Group by ACT, preserving sort order within each group. Each act becomes
+    # its own audio lane. Cues are already globally sorted by start_us above,
+    # so each act-group is in timeline order.
+    act_groups: Dict[str, List[Dict[str, Any]]] = {}
+    act_order: List[str] = []
     for mt in tracks:
-        slug = (mt.get("blockSlug") or "default") or "default"
-        if slug not in block_groups:
-            block_groups[slug] = []
-            block_order.append(slug)
-        block_groups[slug].append(mt)
+        act = (mt.get("act") or mt.get("blockSlug") or "default") or "default"
+        if act not in act_groups:
+            act_groups[act] = []
+            act_order.append(act)
+        act_groups[act].append(mt)
 
-    for slug in block_order:
-        track_name = f"bgm_{slug}"
+    for act in act_order:
+        track_name = f"bgm_act_{act}"
         script.add_track(draft.TrackType.audio, track_name)
-        group = block_groups[slug]
+        group = act_groups[act]
         for j, mt in enumerate(group):
             wav_path = mt["path"].replace("\\", "/")
             actual_us = _audio_duration_us(wav_path)
@@ -354,7 +590,7 @@ def build_draft(manifest: dict) -> Path:
                 continue
             material = draft.AudioMaterial(
                 wav_path,
-                material_name=f'bgm_{slug}_{mt.get("segmentId","")[:8]}',
+                material_name=f'bgm_{act}_{mt.get("blockSlug","")}_{mt.get("segmentId","")[:8]}',
             )
             # BGM sits under voiceover at 20% gain. ACE-Step output is
             # normalised to roughly -6 dBFS RMS so a straight pass would
@@ -394,8 +630,9 @@ def build_draft(manifest: dict) -> Path:
     register_in_capcut(drafts_root, draft_dir, manifest["draft_name"], total_us)
 
     _log(f'wrote {out_path}')
-    _log(f'project={project} clips={total_clips} narration_tracks={total_tts} '
-         f'bgm_tracks={total_bgm} transitions={total_transitions} duration_us={total_us}')
+    _log(f'project={project} clips={total_clips} static={total_static} '
+         f'narration_tracks={total_tts} bgm_tracks={total_bgm} '
+         f'transitions={total_transitions} duration_us={total_us}')
     return draft_dir
 
 

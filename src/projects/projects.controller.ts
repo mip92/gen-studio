@@ -30,6 +30,22 @@ export class ProjectsController {
     return this.projectsService.listVisualStyles();
   }
 
+  /**
+   * List comic style-LoRAs on disk (models/loras/style/). Used by the project
+   * settings UI to populate the per-project style-LoRA picker. Static path
+   * declared BEFORE /:id so Nest treats 'style-loras' as a literal segment.
+   */
+  @Get('style-loras')
+  @ApiOperation({
+    summary: 'List available graphic-novel style LoRAs',
+    description: 'Returns the .safetensors files under models/loras/style/. '
+              + 'Pick one to store in project.settings.styleLora; it is swapped '
+              + 'into the LoraLoader node at render time for cartoon projects.',
+  })
+  listStyleLoras() {
+    return this.projectsService.listStyleLoras();
+  }
+
   @Post()
   @ApiOperation({
     summary: 'Create a project',

@@ -236,18 +236,18 @@ export class PipelineController {
    * Idempotent — a no-op if the target is already at the edge.
    */
   @Post('queue/:type/:id/move')
-  @ApiOperation({ summary: 'Reorder a pending job (up/down)' })
+  @ApiOperation({ summary: 'Reorder a pending job (up/down/top)' })
   async move(
     @Param('type') type: string,
     @Param('id') id: string,
-    @Body() body: { direction: 'up' | 'down' },
+    @Body() body: { direction: 'up' | 'down' | 'top' },
   ) {
     if (!isJobType(type)) {
       throw new BadRequestException(`type must be one of training|dataset|scene|video|video_upscale|tts|bgm, got: ${type}`);
     }
     const direction = body?.direction;
-    if (direction !== 'up' && direction !== 'down') {
-      throw new BadRequestException(`direction must be 'up' or 'down'`);
+    if (direction !== 'up' && direction !== 'down' && direction !== 'top') {
+      throw new BadRequestException(`direction must be 'up', 'down' or 'top'`);
     }
 
     const target = await this.fetchOne(type, id);
@@ -258,6 +258,18 @@ export class PipelineController {
     const all = await this.collectPendingOrdered();
     const idx = all.findIndex((r) => r.type === type && r.id === id);
     if (idx === -1) throw new NotFoundException('Job is not in the pending list');
+
+    // ── Jump to the FRONT of the pending queue ───────────────────────────────
+    // Single-slot queue: the running job CANNOT be preempted, so "front" means
+    // SECOND position — strictly AFTER the currently-running job(s), BEFORE every
+    // pending job. This mirrors TTSService's front-of-queue placement so the two
+    // never drift. Already-first rows are a no-op.
+    if (direction === 'top') {
+      if (idx === 0) return { moved: false, reason: 'edge' };
+      const front = await this.frontQueuedAt(type, id);
+      await this.updateQueuedAt(type, id, front);
+      return { moved: true };
+    }
 
     const swapIdx = direction === 'up' ? idx - 1 : idx + 1;
     if (swapIdx < 0 || swapIdx >= all.length) return { moved: false, reason: 'edge' };
@@ -270,6 +282,40 @@ export class PipelineController {
       this.updateQueuedAt(b.type, b.id, a.queuedAt),
     ]);
     return { moved: true, swappedWith: { type: b.type, id: b.id } };
+  }
+
+  /**
+   * Timestamp that places a job at the front of the PENDING queue without ever
+   * jumping ahead of a running job. = max(running.queuedAt) + 1ms when anything
+   * is running (right behind it), otherwise just before the earliest *other*
+   * pending job. Mirrors TTSService.start()'s front placement. `excludeType` /
+   * `excludeId` skip the job being moved so it doesn't anchor its own target.
+   */
+  private async frontQueuedAt(excludeType: JobType, excludeId: string): Promise<Date> {
+    const rows = await this.prisma.$queryRawUnsafe<Array<{ running: Date | null }>>(
+      `SELECT (SELECT MAX(q) FROM (
+          SELECT MAX("queuedAt") q FROM tts_jobs           WHERE status='running'
+          UNION ALL SELECT MAX("queuedAt") FROM video_renders      WHERE status='running'
+          UNION ALL SELECT MAX("queuedAt") FROM scene_render_jobs  WHERE status='running'
+          UNION ALL SELECT MAX("queuedAt") FROM dataset_jobs       WHERE status='running'
+          UNION ALL SELECT MAX("queuedAt") FROM training_jobs      WHERE status='running'
+          UNION ALL SELECT MAX("queuedAt") FROM audio_render_jobs  WHERE status='running'
+          UNION ALL SELECT MAX("queuedAt") FROM anchor_render_jobs WHERE status='running'
+       ) r) AS running`,
+    );
+    const running = rows?.[0]?.running ? new Date(rows[0].running as unknown as string) : null;
+
+    const pending = await this.collectPendingOrdered();
+    const earliestOther = pending.find((r) => !(r.type === excludeType && r.id === excludeId));
+    const minPending = earliestOther ? earliestOther.queuedAt : null;
+
+    if (running && minPending) {
+      // Slot just before the earliest pending, but never at/below the running job.
+      return new Date(Math.max(minPending.getTime() - 1, running.getTime() + 1));
+    }
+    if (running)    return new Date(running.getTime() + 1);    // running, but nothing else pending
+    if (minPending) return new Date(minPending.getTime() - 1000); // nothing running → run next
+    return new Date();                                          // empty queue
   }
 
   /** Cancel a pending or running job (works across all types). */

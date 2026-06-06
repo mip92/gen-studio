@@ -164,6 +164,7 @@ export class ShotsService {
           referenceImagePool: dto.referenceImagePool !== undefined
             ? (dto.referenceImagePool as object)
             : undefined,
+          renderMode:         dto.renderMode,
         },
         include: { participants: { include: { character: true } }, scene: true },
       });
@@ -270,6 +271,78 @@ export class ShotsService {
       data:  { chosenVideoId: videoId },
       include: SHOT_FULL_INCLUDE,
     });
+  }
+
+  /**
+   * Bulk-set renderMode: the first `minutes` of the film (in play order) become
+   * "animated", the rest "static". This is the long-form production model — only
+   * the opening is fully animated, the body ships as Ken-Burns stills.
+   *
+   * Per-shot screen time is estimated (the timeline isn't rendered yet) with the
+   * best signal available: approved TTS duration → narration-text length proxy
+   * (~15 chars/sec) → 6 s fallback. The shot that straddles the boundary stays
+   * animated; everything after it is static.
+   */
+  async setAnimatedPrefix(projectIdOrSlug: string, minutes: number) {
+    if (!Number.isFinite(minutes) || minutes < 0) {
+      throw new BadRequestException(`minutes must be a non-negative number, got ${minutes}`);
+    }
+    const project = await this.prisma.project.findFirst({
+      where: { OR: [{ id: projectIdOrSlug }, { slug: projectIdOrSlug }] },
+    });
+    if (!project) throw new NotFoundException(`Project "${projectIdOrSlug}" not found`);
+
+    const budgetSec = minutes * 60;
+    const shots = await this.prisma.shot.findMany({
+      where:  { projectId: project.id },
+      select: { id: true, shotCode: true, narrationText: true, approvedTTSJobId: true,
+                scene: { select: { sortOrder: true } } },
+    });
+    // Play order = scene.sortOrder, then shotCode lexical (matches export).
+    shots.sort((a, b) =>
+      (a.scene.sortOrder - b.scene.sortOrder) || a.shotCode.localeCompare(b.shotCode));
+
+    // Resolve approved-TTS durations in one query for an accurate estimate.
+    const approvedIds = shots.map((s) => s.approvedTTSJobId).filter((x): x is string => !!x);
+    const ttsRows = approvedIds.length
+      ? await this.prisma.tTSJob.findMany({
+          where:  { id: { in: approvedIds } },
+          select: { id: true, durationMs: true },
+        })
+      : [];
+    const durById = new Map(ttsRows.map((t) => [t.id, t.durationMs ?? 0]));
+
+    let acc = 0;
+    let boundaryShotCode: string | null = null;
+    const animated: string[] = [];
+    const statics:  string[] = [];
+    for (const s of shots) {
+      if (acc < budgetSec) {
+        animated.push(s.id);
+      } else {
+        statics.push(s.id);
+        if (!boundaryShotCode) boundaryShotCode = s.shotCode;
+      }
+      const ms = s.approvedTTSJobId ? durById.get(s.approvedTTSJobId) ?? 0 : 0;
+      const sec = ms > 0
+        ? ms / 1000
+        : (s.narrationText ? Math.max(2.5, s.narrationText.length / 15) : 6);
+      acc += sec;
+    }
+
+    if (animated.length) {
+      await this.prisma.shot.updateMany({ where: { id: { in: animated } }, data: { renderMode: 'animated' } });
+    }
+    if (statics.length) {
+      await this.prisma.shot.updateMany({ where: { id: { in: statics } }, data: { renderMode: 'static' } });
+    }
+    return {
+      animatedCount:     animated.length,
+      staticCount:       statics.length,
+      boundaryShotCode,
+      estimatedTotalSec: Math.round(acc),
+      budgetSec,
+    };
   }
 
   async findParticipants(projectIdOrSlug: string, shotId: string) {

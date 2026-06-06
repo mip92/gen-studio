@@ -1,11 +1,33 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { existsSync, readdirSync } from 'fs';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 
+// Mirror of scene-render.service.ts — ComfyUI's loras root. Style LoRAs live
+// in the `style/` subfolder and are referenced by the workflows as
+// "style\\<file>.safetensors" (ComfyUI native backslash path).
+const COMFY_LORA_ROOT = process.env.COMFY_LORA_ROOT ?? 'E:\\ComfyUI\\models\\loras';
+
 @Injectable()
 export class ProjectsService {
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * List the comic/graphic-novel style LoRAs available on disk
+   * (models/loras/style/*.safetensors). Drives the per-project style-LoRA
+   * picker on the settings page. `name` is the exact ComfyUI lora_name to
+   * store in project.settings.styleLora; `label` is the human-readable stem.
+   */
+  listStyleLoras(): Array<{ name: string; label: string }> {
+    const dir = path.join(COMFY_LORA_ROOT, 'style');
+    if (!existsSync(dir)) return [];
+    return readdirSync(dir)
+      .filter((f) => f.toLowerCase().endsWith('.safetensors'))
+      .sort((a, b) => a.localeCompare(b))
+      .map((f) => ({ name: `style\\${f}`, label: f.replace(/\.safetensors$/i, '') }));
+  }
 
   findAll() {
     return this.prisma.project.findMany({ orderBy: { createdAt: 'asc' } });

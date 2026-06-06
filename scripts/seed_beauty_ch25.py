@@ -1,0 +1,47 @@
+# -*- coding: utf-8 -*-
+"""Seed CH25 — Одна, отражение пугает (2nd person). Idempotent."""
+from _seed_beauty_act_engine import seed_act
+MOOD = "cold grey empty-apartment light, hollow loneliness, dread of the reflection"
+SHOTS = [
+ ("CH25_SH01", None, "old_flat",
+  "wide establishing of an empty dim apartment, half-sold furniture, grey curtained windows",
+  "WS","high","push_in","home_night",True,False,
+  "ты осталась совсем одна."),
+ ("CH25_SH02", "HEROINE_OLD", "old_flat",
+  "medium shot of the heroine drifting through the empty rooms like a shadow",
+  "MS","eye","static","home_night",False,False,
+  "муж ушёл, дочь не звонит, подруги давно отвернулись."),
+ ("CH25_SH03", None, "old_flat",
+  "close-up of unpaid bills and a phone buzzing with collector calls",
+  "CU","top_down","static","home_night",True,False,
+  "коллекторы звонят, ты распродаёшь, что ещё можешь."),
+ ("CH25_SH04", "HEROINE_OLD", "old_flat",
+  "medium close-up of the heroine deliberately avoiding a mirror as she passes",
+  "MCU","eye","static","home_night",False,False,
+  "ты стала обходить зеркала стороной."),
+ ("CH25_SH05", "HEROINE_OLD", "old_flat",
+  "extreme close-up of her catching her own reflection by accident and flinching",
+  "ECU","eye","static","home_night",False,True,
+  "случайно поймаешь отражение и вздрагиваешь, кто это."),
+ ("CH25_SH06", "HEROINE_OLD", "old_flat",
+  "medium shot of the heroine sitting at the window for days, a shadow",
+  "MS","eye","static","home_night",False,False,
+  "целыми днями у окна, как тень."),
+ ("CH25_SH07", None, "old_flat",
+  "extreme close-up of the mother's antique powder compact lying on the table",
+  "ECU","top_down","static","home_night",True,False,
+  "только мамина пудреница, и в ней крошечное зеркальце."),
+ ("CH25_SH08", "HEROINE_OLD", "old_flat",
+  "close-up of the heroine's hollow face",
+  "CU","eye","static","home_night",False,False,
+  "красота ушла, а с ней ушло почему-то всё."),
+ ("CH25_SH09", None, "old_flat",
+  "wide B-roll of the empty apartment at dusk",
+  "WS","eye","static","home_night",True,False,""),
+ ("CH25_SH10", "HEROINE_OLD", "old_flat",
+  "close-up of the heroine's lost face",
+  "CU","eye","static","home_night",False,True,
+  "и ты не понимаешь, за что боролась всю свою жизнь."),
+]
+if __name__ == "__main__":
+    seed_act(25, "old_grey", MOOD, "static", "CH25 Alone", SHOTS)
