@@ -9,11 +9,13 @@ export type GateKey =
   | 'upload_dataset_images'
   | 'start_dataset'
   | 'start_training'
+  | 'generate_anchor'
   | 'render_scene'
   | 'approve_render'
   | 'create_video'
   | 'approve_video'
   | 'upscale_video'
+  | 'render_tts'
   | 'approve_tts'
   | 'approve_bgm';
 
@@ -269,6 +271,20 @@ export async function startVideoRender(shotId: string): Promise<void> {
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     throw new Error(`POST video start → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+// Queue a TTS render for a shot (gate render_tts). Uses shot.narrationText when
+// no text is passed. Backend: POST /tts/shots/:id.
+export async function queueShotTTS(shotId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/tts/shots/${shotId}`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({}),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`POST tts queue → HTTP ${res.status} ${txt.slice(0, 200)}`);
   }
 }
 

@@ -75,6 +75,7 @@ export type GateKey =
   | 'create_video'
   | 'approve_video'
   | 'upscale_video'
+  | 'render_tts'
   | 'approve_tts'
   | 'approve_bgm';
 
@@ -440,9 +441,58 @@ export class ActionsService {
   // `approve_tts` simultaneously.
 
   private async collectTtsGates(
-    project: { id: string; slug: string; name: string },
+    project: {
+      id: string; slug: string; name: string;
+      ttsEngine?: string | null; ttsVoiceRefPath?: string | null;
+    },
     out: ActionItem[],
   ): Promise<void> {
+    // Voice-clone engines (xtts2 | f5) can't synthesize anything without a
+    // project voice reference — the renderer throws BadRequest until one is
+    // uploaded (see TtsService.resolveEmotionParams). So a render_tts gate for
+    // such a project isn't an action the user can take, it's a blocked
+    // precondition: surfacing it just floods /actions with rows that would all
+    // fail. Suppress render_tts entirely in that case. silero needs no
+    // reference, so it's never gated here. Note: approve_tts is unaffected — a
+    // completed take can only exist once a reference already did.
+    const engine = project.ttsEngine ?? 'silero';
+    const isVoiceClone = engine === 'xtts2' || engine === 'f5';
+    const canRenderVoice = !isVoiceClone || !!project.ttsVoiceRefPath;
+
+    // render_tts — shot has narration text (>= 1 char) but NO voiceover yet:
+    // no approved take AND no completed/in-flight TTS job. Surfaces shots that
+    // were never queued (or whose takes were all deleted) so a shot with text
+    // can never silently lack audio. Suppressed the moment a take is
+    // completed/pending/running — it then flows to approve_tts or is in hand.
+    if (canRenderVoice) {
+      const needVoice = await this.prisma.shot.findMany({
+        where: {
+          projectId:        project.id,
+          approvedTTSJobId: null,
+          narrationText:    { not: null },
+          ttsJobs: { none: { status: { in: ['completed', 'pending', 'running'] } } },
+        },
+        select: {
+          id:       true,
+          shotCode: true,
+          narrationText: true,
+          scene:    { select: { id: true, sceneKey: true, title: true } },
+        },
+        orderBy: [{ scene: { sortOrder: 'asc' } }, { shotCode: 'asc' }],
+      });
+      for (const shot of needVoice) {
+        // Guard against empty / whitespace-only narration — "min one character".
+        if (!shot.narrationText || shot.narrationText.trim().length < 1) continue;
+        out.push(this.shotItem(
+          9, 'render_tts', project, shot,
+          shot.scene
+            ? { id: shot.scene.id, sceneKey: shot.scene.sceneKey, title: shot.scene.title }
+            : undefined,
+          { link: `/projects/${project.id}/shots/${shot.id}/narration` },
+        ));
+      }
+    }
+
     // Per-shot TTS approval.
     const shots = await this.prisma.shot.findMany({
       where: {

@@ -49,6 +49,18 @@ export class ScenesController {
     return this.render.enqueueRender({ shotId, ...body });
   }
 
+  @Post('project/:projectId/enqueue-pending')
+  @ApiOperation({
+    summary: 'Bulk-enqueue every not-yet-rendered, not-queued shot in a project (one click)',
+    description:
+      'ADDITIVE ONLY — never wipes or re-queues. Skips shots that are already rendered ' +
+      '(awaiting approval), approved (chosenRender set), or already have a pending/running job. ' +
+      'projectId may be the project UUID or slug. Returns { enqueued }.',
+  })
+  enqueueProjectPending(@Param('projectId') projectId: string) {
+    return this.render.enqueuePendingForProject(projectId);
+  }
+
   @Get('strategies')
   @ApiOperation({ summary: 'List registered scene strategies' })
   listStrategies() {

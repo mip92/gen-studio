@@ -36,7 +36,11 @@ export class EngineService {
 
   async isComfyAlive(): Promise<boolean> {
     try {
-      const ctl = AbortSignal.timeout(2000);
+      // 8s, not 2s: a ComfyUI that is mid-render (GPU pegged) or loading a
+      // checkpoint answers /system_stats slowly. A 2s timeout falsely reported
+      // it dead, so the dispatcher respawned a SECOND instance on every render
+      // ("comfy reopens each render" bug). 8s tolerates a busy-but-alive server.
+      const ctl = AbortSignal.timeout(8000);
       const r = await fetch(COMFY_HEALTH_URL, { signal: ctl });
       return r.ok;
     } catch {
@@ -61,6 +65,18 @@ export class EngineService {
     }
     if (!existsSync(COMFY_DIR)) {
       throw new Error(`startComfy: COMFY_DIR not found: ${COMFY_DIR}`);
+    }
+
+    // Not answering HTTP, but a ComfyUI process may be lingering — hung, or it
+    // never bound its port. Kill any such zombie BEFORE spawning, otherwise we
+    // accumulate duplicate instances fighting over port 8188 / VRAM (this is the
+    // root of the "comfy reopens on every render" pile-up). Safe because the
+    // pipeline is single-slot: no other startComfy is cold-starting concurrently.
+    const stale = this.findComfyPids();
+    if (stale.length > 0) {
+      this.logger.warn(`startComfy: ${stale.length} ComfyUI process(es) running but not serving — killing stale PID(s) ${stale.join(', ')} before respawn`);
+      for (const pid of stale) killPid(pid);
+      await sleep(2000);
     }
 
     const argv = ['main.py', ...COMFY_LAUNCH_ARGS];

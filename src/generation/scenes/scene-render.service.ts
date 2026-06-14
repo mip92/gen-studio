@@ -81,6 +81,39 @@ export class SceneRenderService {
     });
   }
 
+  /**
+   * Bulk-enqueue every shot in a project that has NOT been rendered yet and is
+   * NOT already queued. ADDITIVE ONLY — never wipes, deletes, or re-queues
+   * anything. Skips shots that already have renders (awaiting approval), are
+   * approved (chosenRender set), or already have a pending/running job.
+   */
+  async enqueuePendingForProject(projectOrSlug: string) {
+    const project = await this.prisma.project.findFirst({
+      where:  { OR: [{ id: projectOrSlug }, { slug: projectOrSlug }] },
+      select: { id: true },
+    });
+    if (!project) throw new NotFoundException(`Project ${projectOrSlug} not found`);
+
+    const eligible = await this.prisma.$queryRaw<Array<{ id: string }>>`
+      SELECT s.id
+      FROM shots s
+      JOIN scenes sc ON sc.id = s."sceneId"
+      WHERE s."projectId" = ${project.id}
+        AND s."chosenRender" IS NULL
+        AND (s."renderedImages" IS NULL OR s."renderedImages"::text IN ('[]', 'null'))
+        AND NOT EXISTS (
+          SELECT 1 FROM scene_render_jobs j
+          WHERE j."shotId" = s.id AND j.status IN ('pending', 'running')
+        )
+      ORDER BY sc."sortOrder", s."shotCode"
+    `;
+    if (eligible.length === 0) return { enqueued: 0 };
+    await this.prisma.sceneRenderJob.createMany({
+      data: eligible.map((e) => ({ shotId: e.id, status: 'pending', params: {} as any })),
+    });
+    return { enqueued: eligible.length };
+  }
+
   /** Delete previously-rendered files + clear renderedImages/chosenRender for a shot.
    *  Best-effort on files (missing/permission errors are logged, not raised). */
   private async wipePreviousRenders(shot: { id: string; shotCode: string; renderedImages: unknown; project: { slug: string } | null }) {

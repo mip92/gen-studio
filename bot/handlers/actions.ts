@@ -18,6 +18,7 @@ import {
   startUpscale,
   enqueueSceneRender,
   startVideoRender,
+  queueShotTTS,
   approveTTSJob,
   deleteTTSJob,
   clearShotTTSApproval,
@@ -145,6 +146,18 @@ export function registerActionsHandlers(bot: Bot): void {
       await startVideoRender(shotId);
       await safeAnswer(ctx, { text: '🎬 video в очереди' });
       await ctx.reply(`🎬 Видео для шота добавлено в очередь.`, { parse_mode: 'HTML' });
+    } catch (err) {
+      await safeAnswer(ctx, { text: 'Ошибка' });
+      await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
+    }
+  });
+
+  bot.callbackQuery(/^a:r-tts:/, async (ctx) => {
+    const shotId = ctx.callbackQuery.data!.split(':')[2];
+    try {
+      await queueShotTTS(shotId);
+      await safeAnswer(ctx, { text: '🎙 TTS в очереди' });
+      await ctx.reply(`🎙 Озвучка для шота добавлена в очередь.`, { parse_mode: 'HTML' });
     } catch (err) {
       await safeAnswer(ctx, { text: 'Ошибка' });
       await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
@@ -302,11 +315,13 @@ function gateTag(g: GateKey): string {
     case 'upload_dataset_images': return '📤';
     case 'start_dataset':         return '🎲';
     case 'start_training':        return '🧠';
+    case 'generate_anchor':       return '🧷';
     case 'render_scene':          return '🎨';
     case 'approve_render':        return '🖼';
     case 'create_video':          return '🎬';
     case 'approve_video':         return '✅';
     case 'upscale_video':         return '⬆️';
+    case 'render_tts':            return '🎙';
     case 'approve_tts':           return '🎙';
     case 'approve_bgm':           return '🎵';
   }
@@ -316,11 +331,13 @@ function gateLabel(g: GateKey): string {
     case 'upload_dataset_images': return 'нужны reference photo';
     case 'start_dataset':         return 'нужен датасет';
     case 'start_training':        return 'нужна LoRA';
+    case 'generate_anchor':       return 'нужен якорь-портрет';
     case 'render_scene':          return 'нужен рендер';
     case 'approve_render':        return 'выбрать кадр';
     case 'create_video':          return 'нужно видео';
     case 'approve_video':         return 'выбрать видео';
     case 'upscale_video':         return 'нужен FHD-upscale';
+    case 'render_tts':            return 'нужна озвучка';
     case 'approve_tts':           return 'выбрать дубль озвучки';
     case 'approve_bgm':           return 'выбрать дубль BGM';
   }
@@ -475,9 +492,10 @@ async function openShotView(ctx: Context, shotId: string): Promise<void> {
       parse_mode: 'HTML', reply_markup: kb,
     });
   } else if (shot.narrationText) {
+    const kb = new InlineKeyboard().text('🎙 Поставить озвучку', `a:r-tts:${shotId}`);
     await ctx.reply(
-      `<i>🎙 Дублей озвучки нет.</i> Текст есть — поставить TTS в очередь из UI.`,
-      { parse_mode: 'HTML' },
+      `<i>🎙 Дублей озвучки нет.</i> Текст есть — можно поставить TTS в очередь:`,
+      { parse_mode: 'HTML', reply_markup: kb },
     );
   }
 }

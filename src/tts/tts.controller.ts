@@ -6,12 +6,12 @@ import {
   Param,
   Patch,
   Post,
+  Req,
   Res,
-  StreamableFile,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { createReadStream } from 'fs';
-import type { Response } from 'express';
+import { createReadStream, statSync } from 'fs';
+import type { Request, Response } from 'express';
 import { TTSService, StartTTSInput, StartShotTTSInput } from './tts.service';
 
 @ApiTags('TTS')
@@ -112,17 +112,20 @@ export class TTSController {
   }
 
   @Get('jobs/:jobId/file')
-  @ApiOperation({ summary: 'Stream the rendered narration.wav' })
-  async file(@Param('jobId') jobId: string, @Res({ passthrough: true }) res: Response) {
+  @ApiOperation({ summary: 'Stream the rendered narration.wav with HTTP Range support (204/200/206/416)' })
+  async file(
+    @Param('jobId') jobId: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
     const filePath = await this.tts.filePath(jobId);
     if (!filePath) {
-      // 200 with empty body keeps the <audio> tag silent until the job is done;
-      // throwing 404 spams the console while UI polls.
-      res.status(204);
-      return null;
+      // 204 keeps the <audio> tag silent until the job is done; throwing 404
+      // would spam the console while the UI polls.
+      res.status(204).end();
+      return;
     }
-    res.set({ 'Content-Type': 'audio/wav' });
-    return new StreamableFile(createReadStream(filePath));
+    streamWavWithRange(filePath, req, res);
   }
 
   // ── Shot-level TTS (per-shot ~5s voiceover) ──────────────────────────────
@@ -202,4 +205,41 @@ export class TTSController {
   approveAllCompleted(@Param('sceneId') sceneId: string) {
     return this.tts.approveAllCompletedForScene(sceneId);
   }
+}
+
+/**
+ * Stream a wav honouring HTTP Range. Mobile browsers send `Range: bytes=...`
+ * for <audio> and won't play a plain 200 response with no Accept-Ranges — so we
+ * answer 206 with Content-Range. Mirrors the BGM/video controllers' streamers.
+ */
+function streamWavWithRange(filePath: string, req: Request, res: Response): void {
+  const total = statSync(filePath).size;
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', 'audio/wav');
+  res.setHeader('Cache-Control', 'no-transform');
+
+  const range = req.headers.range;
+  if (!range) {
+    res.setHeader('Content-Length', String(total));
+    createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+  if (!m) {
+    res.setHeader('Content-Range', `bytes */${total}`);
+    res.status(416).end();
+    return;
+  }
+  const start = m[1] === '' ? 0 : Number.parseInt(m[1], 10);
+  const end   = m[2] === '' ? total - 1 : Math.min(Number.parseInt(m[2], 10), total - 1);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+    res.setHeader('Content-Range', `bytes */${total}`);
+    res.status(416).end();
+    return;
+  }
+  res.status(206);
+  res.setHeader('Content-Range',  `bytes ${start}-${end}/${total}`);
+  res.setHeader('Content-Length', String(end - start + 1));
+  createReadStream(filePath, { start, end }).pipe(res);
 }

@@ -1,7 +1,7 @@
-import { Body, Controller, Delete, Get, Param, Post, Res, StreamableFile } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Req, Res } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
-import { createReadStream } from 'fs';
-import type { Response } from 'express';
+import { createReadStream, statSync } from 'fs';
+import type { Request, Response } from 'express';
 import { VideoRenderService } from './video-render.service';
 import { StartVideoInput } from './video-job.types';
 
@@ -32,11 +32,14 @@ export class VideosController {
   }
 
   @Get('videos/:videoId/file')
-  @ApiOperation({ summary: 'Stream the rendered mp4' })
-  async file(@Param('videoId') videoId: string, @Res({ passthrough: true }) res: Response) {
+  @ApiOperation({ summary: 'Stream the rendered mp4 with HTTP Range support (200/206/416)' })
+  async file(
+    @Param('videoId') videoId: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
     const filePath = await this.videos.filePath(videoId);
-    res.set({ 'Content-Type': 'video/mp4' });
-    return new StreamableFile(createReadStream(filePath));
+    streamMp4WithRange(filePath, req, res);
   }
 
   @Delete('videos/:videoId')
@@ -58,10 +61,53 @@ export class VideosController {
   }
 
   @Get('videos/:videoId/file-fhd')
-  @ApiOperation({ summary: 'Stream the upscaled FHD mp4 (only available once upscaleStatus = completed)' })
-  async fileFhd(@Param('videoId') videoId: string, @Res({ passthrough: true }) res: Response) {
+  @ApiOperation({ summary: 'Stream the upscaled FHD mp4 with HTTP Range support (only available once upscaleStatus = completed)' })
+  async fileFhd(
+    @Param('videoId') videoId: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
     const filePath = await this.videos.upscaledFilePath(videoId);
-    res.set({ 'Content-Type': 'video/mp4' });
-    return new StreamableFile(createReadStream(filePath));
+    streamMp4WithRange(filePath, req, res);
   }
+}
+
+/**
+ * Stream an mp4 honouring HTTP Range. Mobile browsers (iOS Safari especially)
+ * send `Range: bytes=...` for <video> and refuse to play a plain 200 response
+ * with no Accept-Ranges — so we must answer 206 with Content-Range. Mirrors the
+ * BGM controller's audio streamer.
+ */
+function streamMp4WithRange(filePath: string, req: Request, res: Response): void {
+  const total = statSync(filePath).size;
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Content-Type', 'video/mp4');
+  // Don't let any intermediary gzip the stream — that hides Content-Length and
+  // re-breaks seeking/playback.
+  res.setHeader('Cache-Control', 'no-transform');
+
+  const range = req.headers.range;
+  if (!range) {
+    res.setHeader('Content-Length', String(total));
+    createReadStream(filePath).pipe(res);
+    return;
+  }
+
+  const m = /^bytes=(\d*)-(\d*)$/.exec(range);
+  if (!m) {
+    res.setHeader('Content-Range', `bytes */${total}`);
+    res.status(416).end();
+    return;
+  }
+  const start = m[1] === '' ? 0 : Number.parseInt(m[1], 10);
+  const end   = m[2] === '' ? total - 1 : Math.min(Number.parseInt(m[2], 10), total - 1);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+    res.setHeader('Content-Range', `bytes */${total}`);
+    res.status(416).end();
+    return;
+  }
+  res.status(206);
+  res.setHeader('Content-Range',  `bytes ${start}-${end}/${total}`);
+  res.setHeader('Content-Length', String(end - start + 1));
+  createReadStream(filePath, { start, end }).pipe(res);
 }
