@@ -50,4 +50,13 @@ export class CreateProjectDto {
   @IsOptional()
   @IsString()
   visualStyle?: string;
+
+  /**
+   * Published YouTube URL of the finished video. When set, the project is
+   * marked DONE and /actions stops surfacing pipeline gates for it. Send an
+   * empty string to clear it (back to "in production"). Optional everywhere.
+   */
+  @IsOptional()
+  @IsString()
+  youtubeUrl?: string;
 }

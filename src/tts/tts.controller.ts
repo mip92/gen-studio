@@ -91,6 +91,28 @@ export class TTSController {
     return this.tts.approve(null, sceneId);
   }
 
+  @Post('jobs/:jobId/trim-artifact')
+  @ApiOperation({
+    summary: 'Trim the leading reference-bleed artifact ("понь") off a completed narration',
+    description: 'Detects the burst→pause→speech onset and cuts at the pause '
+              + 'midpoint. A clean render with no artifact is left untouched '
+              + '(returns {trimmed:false, reason}). The pristine original is '
+              + 'backed up first so the trim is reversible. Re-probes durationMs.',
+  })
+  trimArtifact(@Param('jobId') jobId: string) {
+    return this.tts.trimArtifact(jobId);
+  }
+
+  @Post('jobs/:jobId/trim-artifact/revert')
+  @ApiOperation({
+    summary: 'Undo trim-artifact — restore the narration wav from its pre-trim backup',
+    description: 'Fails if there is no backup (the job was never trimmed). '
+              + 'Re-probes durationMs back to the original length.',
+  })
+  revertArtifact(@Param('jobId') jobId: string) {
+    return this.tts.revertArtifact(jobId);
+  }
+
   @Delete('jobs/:jobId')
   @ApiOperation({
     summary: 'Hard-delete a TTS job (DB row + .wav on disk)',

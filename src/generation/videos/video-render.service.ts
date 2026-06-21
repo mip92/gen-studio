@@ -33,6 +33,16 @@ const CFG_WORKFLOW_FILENAME = 'video_wan22_i2v_cfg_api.json';
 // loadTemplate against a row carrying an unexpected workflowFilename value.
 const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME]);
 const UPSCALE_WORKFLOW_FILENAME = 'video_upscale_4x_api.json';
+// FPS interpolation (RIFE/FILM → 2× framerate). Mandatory final step, runs on
+// the FHD-upscaled clip. The model file (e.g. rife47.pth) must live in
+// ComfyUI's models/frame_interpolation/ — override the JSON default via env.
+const INTERP_WORKFLOW_FILENAME = 'video_fps_interp_api.json';
+// MUST be a model in ComfyUI's NATIVE format (comfy_extras frame interpolation),
+// i.e. from the Comfy-Org/frame_interpolation HF repo (rife_v4.x.safetensors /
+// film_net_fp16.safetensors). Fannovel16 custom-node .pth files are NOT
+// compatible — the native loader rejects them ("Unrecognized model format").
+const INTERP_MODEL_NAME        = process.env.INTERP_MODEL_NAME ?? 'rife_v4.26.safetensors';
+const DEFAULT_INTERP_MULTIPLIER = 2;
 
 // Wan2.2 i2v defaults — 768×432 = exact 16:9, both dims divisible by 16.
 // Chosen over 832×480 because 832/480 = 1.733 ≠ 1920/1080 = 1.778, which would
@@ -264,12 +274,14 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
 
     const shotDir = path.join(APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode);
     const toRemove = [
-      v.outputFilename   ? path.join(shotDir, 'videos',     v.outputFilename)   : null,
-      v.upscaledFilename ? path.join(shotDir, 'videos_fhd', v.upscaledFilename) : null,
+      v.outputFilename   ? path.join(shotDir, 'videos',        v.outputFilename)   : null,
+      v.upscaledFilename ? path.join(shotDir, 'videos_fhd',    v.upscaledFilename) : null,
+      v.interpFilename   ? path.join(shotDir, 'videos_smooth', v.interpFilename)   : null,
       // Pre-staged copies in COMFY_INPUT — these are short-lived but cleanupInputCopy
       // is best-effort too, so re-try here in case the row dies before completion.
       path.join(COMFY_INPUT, `video_${v.id}${path.extname(v.sourceImageFilename) || '.png'}`),
       path.join(COMFY_INPUT, `upscale_${v.id}.mp4`),
+      path.join(COMFY_INPUT, `interp_${v.id}.mp4`),
     ].filter((p): p is string => !!p);
 
     for (const p of toRemove) {
@@ -479,6 +491,10 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         upscaleCompletedAt:  null,
         upscaleStartedAt:    null,
         upscalePromptId:     null,
+        // A new FHD pass invalidates any previously-interpolated clip — it was
+        // derived from the old upscale. Wipe the interp lifecycle + smooth file
+        // so the mandatory step re-runs against the fresh FHD output.
+        ...this.clearedInterpFields(),
       },
     });
   }
@@ -558,11 +574,169 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return wf;
   }
 
+  // ── FPS interpolation on demand (RIFE/FILM → 2× framerate) ───────────────────
+
+  /**
+   * Queue a frame-interpolation pass on the FHD-upscaled clip — doubles the
+   * framerate for smooth playback. MANDATORY step before CapCut export. Can
+   * only run once the upscale has completed: it reads the FHD mp4 from
+   * `videos_fhd/` and writes the smoothed clip to `videos_smooth/`. Idempotent:
+   * re-calling while `interpStatus` is pending/running, or after it completed,
+   * is a no-op + returns the row.
+   */
+  async interpolate(videoId: string, multiplier = DEFAULT_INTERP_MULTIPLIER) {
+    const v = await this.prisma.videoRender.findUnique({
+      where:   { id: videoId },
+      include: { shot: { include: { project: true } } },
+    });
+    if (!v) throw new NotFoundException(`Video ${videoId} not found`);
+    // Hard gate: interpolation operates on the upscaled FHD clip, so the upscale
+    // must be finished first. This is the "only after there's an upscaled video"
+    // invariant — enforced server-side, not just in the UI.
+    if (v.upscaleStatus !== 'completed' || !v.upscaledFilename) {
+      throw new BadRequestException(
+        `Video ${videoId} has no completed FHD upscale yet — interpolation runs on the upscaled clip.`,
+      );
+    }
+    if (v.interpStatus === 'running' || v.interpStatus === 'pending') return v;
+    if (v.interpStatus === 'completed' && v.interpFilename) return v;
+
+    const mult = Math.max(2, Math.min(8, Math.round(multiplier) || DEFAULT_INTERP_MULTIPLIER));
+
+    const srcMp4 = path.join(
+      APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, 'videos_fhd', v.upscaledFilename,
+    );
+    if (!existsSync(srcMp4)) {
+      throw new BadRequestException(`Upscaled mp4 missing on disk: ${srcMp4}`);
+    }
+
+    // Copy the FHD mp4 into COMFY_INPUT immediately so the source survives even
+    // if the user re-upscales or deletes before the pipeline tick dispatches.
+    const inputBasename = `interp_${v.id}.mp4`;
+    const inputDest     = path.join(COMFY_INPUT, inputBasename);
+    mkdirSync(COMFY_INPUT, { recursive: true });
+    copyFileSync(srcMp4, inputDest);
+
+    return this.prisma.videoRender.update({
+      where: { id: v.id },
+      data:  {
+        interpStatus:       'pending',
+        interpMultiplier:   mult,
+        interpQueuedAt:     new Date(),
+        interpErrorMessage: null,
+        interpCompletedAt:  null,
+        interpStartedAt:    null,
+        interpPromptId:     null,
+        interpFilename:     null,
+      },
+    });
+  }
+
+  /** Oldest video render with interpStatus='pending' — for pipeline arbitration. */
+  findNextPendingInterp() {
+    return this.prisma.videoRender.findFirst({
+      where:   { interpStatus: 'pending' },
+      orderBy: { interpQueuedAt: 'asc' },
+    });
+  }
+
+  /** Dispatch a pending interpolation to ComfyUI. Called by the pipeline tick. */
+  async dispatchPendingInterp(videoId: string): Promise<void> {
+    const v = await this.prisma.videoRender.findUnique({
+      where:   { id: videoId },
+      include: { shot: { include: { project: true } } },
+    });
+    if (!v) throw new Error(`VideoRender ${videoId} not found`);
+    if (v.interpStatus !== 'pending') return;
+
+    const inputBasename = `interp_${v.id}.mp4`;
+    const inputDest     = path.join(COMFY_INPUT, inputBasename);
+    if (!existsSync(inputDest)) {
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  {
+          interpStatus:       'failed',
+          interpErrorMessage: `Pre-staged FHD mp4 vanished from COMFY_INPUT: ${inputDest}`,
+          interpCompletedAt:  new Date(),
+        },
+      });
+      return;
+    }
+
+    try {
+      const mult     = v.interpMultiplier ?? DEFAULT_INTERP_MULTIPLIER;
+      // The upscale preserves the render's source fps, so the smoothed output
+      // plays at native speed only when CreateVideo fps = sourceFps × multiplier.
+      const params   = (v.params ?? {}) as { fps?: number };
+      const outFps    = (params.fps ?? DEFAULT_FPS) * mult;
+      const template = this.loadInterpTemplate(v.shot.project.slug);
+      const workflow = this.patchInterp(template, {
+        sourceVideo:    inputBasename,
+        multiplier:     mult,
+        fps:            outFps,
+        filenamePrefix: `video_smooth/${v.shot.shotCode}/${v.id}`,
+      });
+      const { promptId } = await this.comfy.queuePrompt(workflow);
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  {
+          interpStatus:       'running',
+          interpPromptId:     promptId,
+          interpStartedAt:    new Date(),
+          interpErrorMessage: null,
+        },
+      });
+    } catch (e: any) {
+      this.logger.error(`dispatchPendingInterp ${v.id} failed — resetting interp state: ${e?.message}`);
+      try { unlinkSync(inputDest); } catch { /* best-effort */ }
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  this.clearedInterpFields(),
+      });
+    }
+  }
+
+  private loadInterpTemplate(projectSlug: string): Record<string, any> {
+    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', INTERP_WORKFLOW_FILENAME);
+    if (!existsSync(filePath)) {
+      throw new NotFoundException(`FPS interpolation workflow not found: ${filePath}`);
+    }
+    return JSON.parse(readFileSync(filePath, 'utf-8'));
+  }
+
+  private patchInterp(template: Record<string, any>, p: {
+    sourceVideo:    string;
+    multiplier:     number;
+    fps:            number;
+    filenamePrefix: string;
+  }): Record<string, any> {
+    const wf = structuredClone(template);
+    if (wf['1']) wf['1'].inputs.file            = p.sourceVideo;          // LoadVideo
+    if (wf['3']) wf['3'].inputs.model_name      = INTERP_MODEL_NAME;       // FrameInterpolationModelLoader
+    if (wf['4']) wf['4'].inputs.multiplier      = p.multiplier;            // FrameInterpolate
+    if (wf['5']) wf['5'].inputs.fps             = p.fps;                   // CreateVideo
+    if (wf['6']) wf['6'].inputs.filename_prefix = p.filenamePrefix;        // SaveVideo
+    return wf;
+  }
+
+  /** Absolute path to the smoothed mp4 once `interpStatus=completed`. */
+  async interpolatedFilePath(videoId: string): Promise<string> {
+    const v = await this.get(videoId);
+    if (!v.interpFilename) throw new BadRequestException(`Video ${videoId} has no interpolated version yet`);
+    const shot = await this.prisma.shot.findUnique({
+      where:   { id: v.shotId },
+      include: { project: true },
+    });
+    if (!shot) throw new NotFoundException(`Shot for video ${videoId} not found`);
+    return path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, 'videos_smooth', v.interpFilename);
+  }
+
   // ── Polling ────────────────────────────────────────────────────────────────
 
   private async poll(): Promise<void> {
     await this.pollMainRenders();
     await this.pollUpscales();
+    await this.pollInterps();
   }
 
   private async pollMainRenders(): Promise<void> {
@@ -664,6 +838,56 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private async pollInterps(): Promise<void> {
+    const running = await this.prisma.videoRender.findMany({ where: { interpStatus: 'running' } });
+    for (const v of running) {
+      if (!v.interpPromptId) continue;
+      const h = await this.comfy.getHistory(v.interpPromptId).catch(() => null);
+      if (!h?.status?.completed) continue;
+
+      const success = h.status.status_str === 'success';
+      if (success) {
+        const outputFile = this.firstVideoOutput(h.outputs);
+        if (outputFile) {
+          let moved: string | null = null;
+          try {
+            moved = await this.moveOutputToShotDir(v.shotId, outputFile, 'videos_smooth');
+          } catch (e: any) {
+            this.logger.warn(`move interpolated video ${v.id}: ${e?.message}`);
+          }
+          if (!moved) {
+            this.logger.warn(`interp ${v.id}: completion seen but file not yet at COMFY_OUTPUT — will retry next tick`);
+            continue;
+          }
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data: {
+              interpStatus:      'completed',
+              interpFilename:    moved,
+              interpCompletedAt: new Date(),
+            },
+          });
+        } else {
+          // Interpolation failed — the underlying FHD clip is fine. Clear all
+          // interp fields so the row looks "never interpolated" and the UI
+          // re-offers the button (same policy as failed upscale).
+          this.logger.warn(`interp ${v.id}: ComfyUI history had no video output — resetting interp state`);
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data:  this.clearedInterpFields(),
+          });
+        }
+      } else {
+        this.logger.warn(`interp ${v.id}: ComfyUI reported non-success status — resetting interp state`);
+        await this.prisma.videoRender.update({
+          where: { id: v.id },
+          data:  this.clearedInterpFields(),
+        });
+      }
+      this.cleanupInterpInputCopy(v.id);
+    }
+  }
+
   /**
    * One-shot startup sweep: drop any leftover `status=failed` rows (from before
    * the auto-delete policy) and reset `upscaleStatus=failed` back to null so
@@ -681,6 +905,12 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       data:  this.clearedUpscaleFields(),
     });
     if (failedUpscales.count > 0) this.logger.log(`sweepFailedRows: reset ${failedUpscales.count} failed upscale state(s)`);
+
+    const failedInterps = await this.prisma.videoRender.updateMany({
+      where: { interpStatus: 'failed' },
+      data:  this.clearedInterpFields(),
+    });
+    if (failedInterps.count > 0) this.logger.log(`sweepFailedRows: reset ${failedInterps.count} failed interp state(s)`);
   }
 
   private clearedUpscaleFields() {
@@ -695,8 +925,26 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
+  private clearedInterpFields() {
+    return {
+      interpStatus:       null,
+      interpFilename:     null,
+      interpPromptId:     null,
+      interpMultiplier:   null,
+      interpQueuedAt:     null,
+      interpStartedAt:    null,
+      interpCompletedAt:  null,
+      interpErrorMessage: null,
+    };
+  }
+
   private cleanupUpscaleInputCopy(videoId: string): void {
     const file = path.join(COMFY_INPUT, `upscale_${videoId}.mp4`);
+    try { unlinkSync(file); } catch { /* best-effort */ }
+  }
+
+  private cleanupInterpInputCopy(videoId: string): void {
+    const file = path.join(COMFY_INPUT, `interp_${videoId}.mp4`);
     try { unlinkSync(file); } catch { /* best-effort */ }
   }
 
@@ -721,7 +969,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   private async moveOutputToShotDir(
     shotId: string,
     out: { filename: string; subfolder?: string },
-    destSubdir: 'videos' | 'videos_fhd' = 'videos',
+    destSubdir: 'videos' | 'videos_fhd' | 'videos_smooth' = 'videos',
   ): Promise<string | null> {
     const shot = await this.prisma.shot.findUnique({
       where:   { id: shotId },

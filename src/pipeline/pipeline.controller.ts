@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, Get, NotFoundException, Param, P
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '../prisma/prisma.service';
 
-type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts' | 'bgm' | 'anchor';
+type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor';
 
 interface QueueRow {
   type:          JobType;
@@ -118,6 +118,7 @@ export class PipelineController {
         where: { OR: [
           { status: { in: ACTIVE_STATUSES } },
           { upscaleStatus: { in: ACTIVE_STATUSES } },
+          { interpStatus: { in: ACTIVE_STATUSES } },
         ] },
         include: shotInclude,
         orderBy: { queuedAt: 'asc' },
@@ -127,7 +128,7 @@ export class PipelineController {
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
     ]);
 
-    const [trR, dsR, scR, vrR, vrUR, ttsR, bgmR, anR] = await Promise.all([
+    const [trR, dsR, scR, vrR, vrUR, vrIR, ttsR, bgmR, anR] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.datasetJob.findMany({     where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.sceneRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude,    orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
@@ -138,19 +139,22 @@ export class PipelineController {
       // take-window when the underlying video rendered long ago.
       this.prisma.videoRender.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.videoRender.findMany({ where: { upscaleStatus: { in: TERMINAL } }, include: shotInclude, orderBy: { upscaleCompletedAt: 'desc' }, take: TERMINAL_TAKE }),
+      this.prisma.videoRender.findMany({ where: { interpStatus: { in: TERMINAL } }, include: shotInclude, orderBy: { interpCompletedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.tTSJob.findMany({ where: { status: { in: TERMINAL } }, include: ttsInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.audioRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: bgmInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
     ]);
 
-    // Each VideoRender row can contribute two queue rows (main + upscale).
+    // Each VideoRender row can contribute three queue rows (main + upscale + interp).
     const videoActiveRows: QueueRow[] = [
       ...vrA.filter((j) => ACTIVE_STATUSES.includes(j.status)).map(normalizeVideo),
       ...vrA.filter((j) => j.upscaleStatus !== null && ACTIVE_STATUSES.includes(j.upscaleStatus)).map(normalizeVideoUpscale),
+      ...vrA.filter((j) => j.interpStatus !== null && ACTIVE_STATUSES.includes(j.interpStatus)).map(normalizeVideoInterp),
     ];
     const videoRecentRows: QueueRow[] = [
       ...vrR.map(normalizeVideo),
       ...vrUR.map(normalizeVideoUpscale),
+      ...vrIR.map(normalizeVideoInterp),
     ];
 
     const all: QueueRow[] = [
@@ -296,6 +300,8 @@ export class PipelineController {
       `SELECT (SELECT MAX(q) FROM (
           SELECT MAX("queuedAt") q FROM tts_jobs           WHERE status='running'
           UNION ALL SELECT MAX("queuedAt") FROM video_renders      WHERE status='running'
+          UNION ALL SELECT MAX("upscaleQueuedAt") FROM video_renders WHERE "upscaleStatus"='running'
+          UNION ALL SELECT MAX("interpQueuedAt")  FROM video_renders WHERE "interpStatus"='running'
           UNION ALL SELECT MAX("queuedAt") FROM scene_render_jobs  WHERE status='running'
           UNION ALL SELECT MAX("queuedAt") FROM dataset_jobs       WHERE status='running'
           UNION ALL SELECT MAX("queuedAt") FROM training_jobs      WHERE status='running'
@@ -362,6 +368,12 @@ export class PipelineController {
       return this.prisma.videoRender.update({
         where: { id },
         data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
+      });
+    }
+    if (type === 'video_interp') {
+      return this.prisma.videoRender.update({
+        where: { id },
+        data:  { interpStatus: 'cancelled', interpCompletedAt: new Date(), interpErrorMessage: 'Manually cancelled' },
       });
     }
     return this.prisma.videoRender.update({
@@ -462,7 +474,9 @@ export class PipelineController {
       include: { shot: { include: { project: true, scene: true } } },
     });
     if (!v) throw new NotFoundException(`video render ${id} not found`);
-    return type === 'video' ? normalizeVideo(v) : normalizeVideoUpscale(v);
+    if (type === 'video')          return normalizeVideo(v);
+    if (type === 'video_interp')   return normalizeVideoInterp(v);
+    return normalizeVideoUpscale(v);
   }
 
   private async collectPendingOrdered(): Promise<QueueRow[]> {
@@ -488,12 +502,13 @@ export class PipelineController {
       shot:  { include: { project: true, scene: true } },
     };
     const bgmInclude = { segment: { include: { block: { include: { project: true } } } } };
-    const [tr, ds, sc, vr, vrU, tts, bgm, an] = await Promise.all([
+    const [tr, ds, sc, vr, vrU, vrI, tts, bgm, an] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.datasetJob.findMany({     where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.sceneRenderJob.findMany({ where: { status: 'pending' },        include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
       this.prisma.videoRender.findMany({    where: { status: 'pending' },        include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
       this.prisma.videoRender.findMany({    where: { upscaleStatus: 'pending' }, include: shotInclude,    orderBy: { upscaleQueuedAt: 'asc' } }),
+      this.prisma.videoRender.findMany({    where: { interpStatus: 'pending' },  include: shotInclude,    orderBy: { interpQueuedAt: 'asc' } }),
       this.prisma.tTSJob.findMany({         where: { status: 'pending' },        include: ttsInclude,     orderBy: { queuedAt: 'asc' } }),
       this.prisma.audioRenderJob.findMany({ where: { status: 'pending' },        include: bgmInclude,     orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: 'pending' }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
@@ -504,6 +519,7 @@ export class PipelineController {
       ...sc.map(normalizeScene),
       ...vr.map(normalizeVideo),
       ...vrU.map(normalizeVideoUpscale),
+      ...vrI.map(normalizeVideoInterp),
       ...tts.map(normalizeTTS),
       ...bgm.map(normalizeBgm),
       ...an.map(normalizeAnchor),
@@ -515,8 +531,9 @@ export class PipelineController {
     if (type === 'dataset')       return this.prisma.datasetJob.update({     where: { id }, data: { queuedAt } });
     if (type === 'scene')         return this.prisma.sceneRenderJob.update({ where: { id }, data: { queuedAt } });
     if (type === 'video')         return this.prisma.videoRender.update({    where: { id }, data: { queuedAt } });
-    // video_upscale uses its own FIFO field — see normalizeVideoUpscale.
+    // video_upscale / video_interp use their own FIFO fields — see normalizers.
     if (type === 'video_upscale') return this.prisma.videoRender.update({    where: { id }, data: { upscaleQueuedAt: queuedAt } });
+    if (type === 'video_interp')  return this.prisma.videoRender.update({    where: { id }, data: { interpQueuedAt: queuedAt } });
     if (type === 'bgm')           return this.prisma.audioRenderJob.update({ where: { id }, data: { queuedAt } });
     if (type === 'anchor')        return (this.prisma as any).anchorRenderJob.update({ where: { id }, data: { queuedAt } });
     return this.prisma.tTSJob.update({ where: { id }, data: { queuedAt } });
@@ -525,7 +542,7 @@ export class PipelineController {
 
 function isJobType(t: string): t is JobType {
   return t === 'training' || t === 'dataset' || t === 'scene'
-      || t === 'video'    || t === 'video_upscale' || t === 'tts'
+      || t === 'video'    || t === 'video_upscale' || t === 'video_interp' || t === 'tts'
       || t === 'bgm'      || t === 'anchor';
 }
 
@@ -648,6 +665,27 @@ function normalizeVideoUpscale(v: any): QueueRow {
     startedAt:     v.upscaleStartedAt ?? null,
     completedAt:   v.upscaleCompletedAt ?? null,
     errorMessage:  v.upscaleErrorMessage ?? null,
+    isFirstPending: false,
+    isLastPending:  false,
+  };
+}
+
+function normalizeVideoInterp(v: any): QueueRow {
+  return {
+    type:          'video_interp',
+    id:            v.id,
+    status:        v.interpStatus,
+    profileCode:   `${v.shot.shotCode} ⏩FPS`,
+    characterCode: v.shot.scene?.title ?? v.shot.scene?.sceneKey ?? '—',
+    projectSlug:   v.shot.project.slug,
+    projectId:     v.shot.project.id,
+    shotId:        v.shot.id,
+    triggerToken:  null,
+    // Interp FIFO timestamp. Legacy fallback chain mirrors the upscale row.
+    queuedAt:      v.interpQueuedAt ?? v.interpStartedAt ?? v.queuedAt,
+    startedAt:     v.interpStartedAt ?? null,
+    completedAt:   v.interpCompletedAt ?? null,
+    errorMessage:  v.interpErrorMessage ?? null,
     isFirstPending: false,
     isLastPending:  false,
   };

@@ -75,6 +75,7 @@ export type GateKey =
   | 'create_video'
   | 'approve_video'
   | 'upscale_video'
+  | 'interpolate_video'
   | 'render_tts'
   | 'approve_tts'
   | 'approve_bgm';
@@ -130,6 +131,10 @@ export class ActionsService {
 
     const items: ActionItem[] = [];
     for (const project of projects) {
+      // A project with a published YouTube link is DONE — the deliverable
+      // already shipped. Skip every pipeline gate (render/upscale/FPS/TTS/BGM)
+      // so /actions doesn't nag about steps on a finished video.
+      if ((project as { youtubeUrl?: string | null }).youtubeUrl) continue;
       await this.collectCharacterGates(project, items);
       await this.collectShotGates(project, items);
       // TTS + BGM gates are independent of the visual pipeline — a shot can
@@ -271,7 +276,7 @@ export class ActionsService {
         videoRenders: {
           select: {
             id: true, status: true, outputFilename: true,
-            upscaleStatus: true,
+            upscaleStatus: true, interpStatus: true,
           },
         },
       },
@@ -352,11 +357,24 @@ export class ActionsService {
       // Gate 8 — upscale video. chosenVideoId set, upscale not yet running/completed.
       const chosen = shot.videoRenders.find((v) => v.id === shot.chosenVideoId);
       if (!chosen) continue; // stale id, nothing to upscale
-      if (chosen.upscaleStatus && (UPSCALE_INFLIGHT_OR_DONE as readonly string[]).includes(chosen.upscaleStatus)) continue;
+      if (!chosen.upscaleStatus || !(UPSCALE_INFLIGHT_OR_DONE as readonly string[]).includes(chosen.upscaleStatus)) {
+        out.push(this.shotItem(8, 'upscale_video', project, shot, scene, {
+          link: `/projects/${project.id}/shots/${shot.id}/videos`,
+          action: { method: 'POST', path: `/generation/videos/${chosen.id}/upscale`, body: {} },
+        }));
+        continue;
+      }
+      // Upscale still pending/running → wait; the FHD clip isn't ready to interpolate.
+      if (chosen.upscaleStatus !== 'completed') continue;
 
-      out.push(this.shotItem(8, 'upscale_video', project, shot, scene, {
+      // Gate 8b — interpolate video (MANDATORY). Upscale done, but the FPS
+      // interpolation hasn't run yet (or failed). Surface it so the user can't
+      // forget the step the CapCut export now requires.
+      const interpInFlightOrDone = (['pending', 'running', 'completed'] as const) as readonly string[];
+      if (chosen.interpStatus && interpInFlightOrDone.includes(chosen.interpStatus)) continue;
+      out.push(this.shotItem(8, 'interpolate_video', project, shot, scene, {
         link: `/projects/${project.id}/shots/${shot.id}/videos`,
-        action: { method: 'POST', path: `/generation/videos/${chosen.id}/upscale`, body: {} },
+        action: { method: 'POST', path: `/generation/videos/${chosen.id}/interpolate`, body: {} },
       }));
     }
   }

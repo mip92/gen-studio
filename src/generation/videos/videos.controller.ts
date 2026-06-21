@@ -70,6 +70,26 @@ export class VideosController {
     const filePath = await this.videos.upscaledFilePath(videoId);
     streamMp4WithRange(filePath, req, res);
   }
+
+  @Post('videos/:videoId/interpolate')
+  @ApiOperation({
+    summary: 'Queue an FPS interpolation (RIFE/FILM → 2× framerate) of the upscaled clip',
+    description: 'Mandatory final step. Requires upscaleStatus=completed (operates on the FHD clip). Idempotent. The smoothed mp4 is served at /videos/:id/file-smooth once done. Optional body { multiplier: 2-8 }.',
+  })
+  interpolate(@Param('videoId') videoId: string, @Body() body: { multiplier?: number } = {}) {
+    return this.videos.interpolate(videoId, body?.multiplier);
+  }
+
+  @Get('videos/:videoId/file-smooth')
+  @ApiOperation({ summary: 'Stream the FPS-interpolated (smoothed) mp4 with HTTP Range support (only once interpStatus = completed)' })
+  async fileSmooth(
+    @Param('videoId') videoId: string,
+    @Req() req: Request,
+    @Res() res: Response,
+  ): Promise<void> {
+    const filePath = await this.videos.interpolatedFilePath(videoId);
+    streamMp4WithRange(filePath, req, res);
+  }
 }
 
 /**

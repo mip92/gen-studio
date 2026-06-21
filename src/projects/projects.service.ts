@@ -96,6 +96,11 @@ export class ProjectsService {
           // Allow changing visualStyle post-creation. Affects future renders
           // only (already-rendered shots keep their existing image data).
           ...(dto.visualStyle ? { visualStyle: dto.visualStyle } : {}),
+          // Published-video link. Empty string clears it (back to in-production);
+          // a non-empty value marks the project DONE (hides /actions gates).
+          ...((dto as any).youtubeUrl !== undefined
+            ? { youtubeUrl: ((dto as any).youtubeUrl as string).trim() || null }
+            : {}),
         } as any),
       },
     });

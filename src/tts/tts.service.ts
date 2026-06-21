@@ -17,6 +17,15 @@ const TTS_XTTS2_SCRIPT = path.join(APP_ROOT, 'scripts', 'tts_xtts2.py');
 const TTS_F5_SCRIPT    = path.join(APP_ROOT, 'scripts', 'tts_f5.py');
 const SILERO_CACHE  = process.env.SILERO_CACHE_DIR
                     ?? path.join(APP_ROOT, '.silero_cache');
+// Leading reference-bleed ("понь") trimmer — detects + cuts the artifact, keeps
+// a reversible backup. Shares the ffmpeg binary that the F5 worker already ships.
+const FFMPEG_BIN           = process.env.FFMPEG_BIN ?? path.join(APP_ROOT, 'bin', 'ffmpeg.exe');
+const TRIM_ARTIFACT_SCRIPT = path.join(APP_ROOT, 'scripts', 'trim_lead_artifact.py');
+/** data/<slug>/_pon_backup/{shots|scenes}/<code>/<filename> — pristine pre-trim
+ *  original. Presence of this file is the "trimmed, can revert" flag. */
+function artifactBackupPath(slug: string, kind: 'shots' | 'scenes', code: string, filename: string): string {
+  return path.join(APP_ROOT, 'data', slug, '_pon_backup', kind, code, filename);
+}
 
 /** Engines the service knows how to dispatch. Source of truth is the
  *  Python worker scripts; this constant exists to validate the
@@ -389,11 +398,23 @@ export class TTSService {
     });
   }
 
-  listForShot(shotId: string) {
-    return this.prisma.tTSJob.findMany({
+  async listForShot(shotId: string) {
+    const shot = await this.prisma.shot.findUnique({
+      where: { id: shotId }, include: { project: true },
+    });
+    const jobs = await this.prisma.tTSJob.findMany({
       where:   { shotId },
       orderBy: { queuedAt: 'desc' },
     });
+    if (!shot) return jobs;
+    // Annotate each completed job with whether its leading "понь" artifact has
+    // been trimmed (a pre-trim backup exists) — drives the trim/revert button.
+    return jobs.map((j) => ({
+      ...j,
+      trimmedArtifact:
+        j.status === 'completed' && !!j.outputFilename &&
+        existsSync(artifactBackupPath(shot.project.slug, 'shots', shot.shotCode, j.outputFilename)),
+    }));
   }
 
   async get(jobId: string) {
@@ -444,6 +465,115 @@ export class TTSService {
     }
     this.logger.error(`TTS job ${jobId}: neither sceneId nor shotId set — corrupt row`);
     return null;
+  }
+
+  /**
+   * Resolve the on-disk wav + its pre-trim backup path for a completed job.
+   * Used by the leading-artifact trim/revert actions. Throws if the job has no
+   * completed wav or is a corrupt (ownerless) row.
+   */
+  private async resolveArtifactPaths(
+    jobId: string,
+  ): Promise<{ jobId: string; wavPath: string; backupPath: string; isApproved: boolean }> {
+    const job = await this.prisma.tTSJob.findUnique({
+      where:   { id: jobId },
+      include: { shot: { include: { project: true } }, scene: { include: { project: true } } },
+    });
+    if (!job) throw new NotFoundException(`TTS job ${jobId} not found`);
+    if (job.status !== 'completed' || !job.outputFilename) {
+      throw new BadRequestException(`TTS job ${jobId} has no completed wav to trim`);
+    }
+    if (job.shotId && job.shot) {
+      const { slug } = job.shot.project;
+      return {
+        jobId: job.id,
+        wavPath:    path.join(APP_ROOT, 'data', slug, 'shots', job.shot.shotCode, job.outputFilename),
+        backupPath: artifactBackupPath(slug, 'shots', job.shot.shotCode, job.outputFilename),
+        isApproved: job.shot.approvedTTSJobId === job.id,
+      };
+    }
+    if (job.sceneId && job.scene) {
+      const { slug } = job.scene.project;
+      return {
+        jobId: job.id,
+        wavPath:    path.join(APP_ROOT, 'data', slug, 'scenes', job.scene.sceneKey, job.outputFilename),
+        backupPath: artifactBackupPath(slug, 'scenes', job.scene.sceneKey, job.outputFilename),
+        isApproved: job.scene.approvedTTSJobId === job.id,
+      };
+    }
+    throw new BadRequestException(`TTS job ${jobId} has no owner — corrupt row`);
+  }
+
+  /** Spawn a short-lived helper and capture its stdout/stderr + exit code. */
+  private spawnCapture(
+    bin: string, argv: string[],
+  ): Promise<{ code: number; stdout: string; stderr: string }> {
+    return new Promise((resolve) => {
+      const proc = spawn(bin, argv, { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '', stderr = '';
+      proc.stdout.on('data', (c: Buffer) => { stdout += c.toString(); });
+      proc.stderr.on('data', (c: Buffer) => { stderr = (stderr + c.toString()).slice(-4000); });
+      proc.on('error', () => resolve({ code: 1, stdout, stderr }));
+      proc.on('exit',  (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    });
+  }
+
+  /**
+   * Trim the leading reference-bleed artifact ("понь") off a completed
+   * narration wav. Detects the burst→pause→speech structure and cuts at the
+   * pause midpoint; a clean render (no artifact) is left untouched. The pristine
+   * original is backed up first so {@link revertArtifact} can restore it.
+   */
+  async trimArtifact(
+    jobId: string,
+  ): Promise<{ trimmed: boolean; reason?: string; cutMs?: number; durationMs?: number | null }> {
+    const { wavPath, backupPath, isApproved } = await this.resolveArtifactPaths(jobId);
+    // Only the approved take may be trimmed — never an unapproved/candidate one.
+    if (!isApproved) {
+      throw new BadRequestException(`TTS job ${jobId} is not the approved take — approve it before trimming «понь»`);
+    }
+    if (!existsSync(wavPath))               throw new BadRequestException(`narration wav missing on disk: ${wavPath}`);
+    if (!existsSync(PYTHON_BIN))            throw new BadRequestException(`python bin missing: ${PYTHON_BIN}`);
+    if (!existsSync(TRIM_ARTIFACT_SCRIPT))  throw new BadRequestException(`trim script missing: ${TRIM_ARTIFACT_SCRIPT}`);
+
+    const { code, stdout, stderr } = await this.spawnCapture(PYTHON_BIN, [
+      '-X', 'utf8', TRIM_ARTIFACT_SCRIPT,
+      '--in', wavPath, '--backup', backupPath, '--ffmpeg', FFMPEG_BIN,
+    ]);
+    const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop() ?? '';
+    if (code !== 0) throw new BadRequestException(stderr.trim() || `trim worker exited ${code}`);
+
+    if (line.startsWith('SKIP')) {
+      return { trimmed: false, reason: line.slice(4).trim() || 'no «понь» detected' };
+    }
+    if (line.startsWith('OK')) {
+      const cutMs = Number(/cut_ms=(\d+)/.exec(line)?.[1] ?? NaN);
+      const durationMs = probeWavDurationMs(wavPath);
+      await this.prisma.tTSJob.update({ where: { id: jobId }, data: { durationMs } });
+      this.logger.log(`trim artifact ${jobId}: cut ${cutMs}ms → duration ${durationMs ?? '?'}ms`);
+      return { trimmed: true, cutMs: Number.isFinite(cutMs) ? cutMs : undefined, durationMs };
+    }
+    throw new BadRequestException(stderr.trim() || `unexpected trim output: ${line || '(empty)'}`);
+  }
+
+  /** Restore a job's narration wav from its pre-trim backup (undo trimArtifact). */
+  async revertArtifact(jobId: string): Promise<{ reverted: boolean; durationMs?: number | null }> {
+    const { wavPath, backupPath } = await this.resolveArtifactPaths(jobId);
+    if (!existsSync(backupPath)) {
+      throw new BadRequestException(`nothing to revert — no pre-trim backup for job ${jobId}`);
+    }
+    const { code, stdout, stderr } = await this.spawnCapture(PYTHON_BIN, [
+      '-X', 'utf8', TRIM_ARTIFACT_SCRIPT,
+      '--in', wavPath, '--backup', backupPath, '--revert',
+    ]);
+    const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop() ?? '';
+    if (code !== 0 || !line.startsWith('REVERTED')) {
+      throw new BadRequestException(stderr.trim() || `revert worker exited ${code}`);
+    }
+    const durationMs = probeWavDurationMs(wavPath);
+    await this.prisma.tTSJob.update({ where: { id: jobId }, data: { durationMs } });
+    this.logger.log(`revert artifact ${jobId}: restored → duration ${durationMs ?? '?'}ms`);
+    return { reverted: true, durationMs };
   }
 
   /**

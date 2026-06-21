@@ -428,6 +428,7 @@ export class ProjectsDashboardController {
           const videos = ((sh as any).videoRenders ?? []) as Array<{
             id: string; status: string; outputFilename: string | null;
             upscaleStatus: string | null; upscaledFilename: string | null;
+            interpStatus: string | null; interpFilename: string | null;
             queuedAt: Date;
           }>;
           const chosenVideo = sh.chosenVideoId
@@ -441,6 +442,11 @@ export class ProjectsDashboardController {
           // only one the UI surfaces an upscale button for).
           const inflightUpscale = chosenVideo
             && (chosenVideo.upscaleStatus === 'pending' || chosenVideo.upscaleStatus === 'running')
+            ? chosenVideo
+            : null;
+          // Pending|running FPS interpolation on the chosen video.
+          const inflightInterp = chosenVideo
+            && (chosenVideo.interpStatus === 'pending' || chosenVideo.interpStatus === 'running')
             ? chosenVideo
             : null;
 
@@ -471,6 +477,8 @@ export class ProjectsDashboardController {
                   outputFilename:   chosenVideo.outputFilename,
                   upscaleStatus:    chosenVideo.upscaleStatus,
                   upscaledFilename: chosenVideo.upscaledFilename,
+                  interpStatus:     chosenVideo.interpStatus,
+                  interpFilename:   chosenVideo.interpFilename,
                 }
               : null,
             pipelineVideo: inflightVideo
@@ -478,6 +486,9 @@ export class ProjectsDashboardController {
               : null,
             pipelineUpscale: inflightUpscale
               ? { id: inflightUpscale.id, status: inflightUpscale.upscaleStatus as string }
+              : null,
+            pipelineInterp: inflightInterp
+              ? { id: inflightInterp.id, status: inflightInterp.interpStatus as string }
               : null,
             // ── Per-shot narration (shot-level TTS) ─────────────────────────
             narrationText:    (sh as any).narrationText    ?? null,

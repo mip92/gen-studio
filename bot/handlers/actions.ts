@@ -16,6 +16,7 @@ import {
   deleteRender,
   deleteVideo,
   startUpscale,
+  startInterpolate,
   enqueueSceneRender,
   startVideoRender,
   queueShotTTS,
@@ -40,6 +41,7 @@ const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 //   "a:p-vid:<shotId>:<idx>"       — approve video #idx
 //   "a:d-vid:<shotId>:<idx>"       — delete video #idx
 //   "a:u-vid:<shotId>:<idx>"       — start FHD upscale on video #idx
+//   "a:i-vid:<shotId>:<idx>"       — start FPS interpolation on video #idx (after upscale)
 //   "a:r-scn:<shotId>"             — enqueue a fresh scene render
 //   "a:r-vid:<shotId>"             — start a video render (from chosenRender)
 //   "a:s-img:<shotId>"             — clear chosenRender
@@ -125,6 +127,16 @@ export function registerActionsHandlers(bot: Bot): void {
       await startUpscale(v.id);
       await safeAnswer(ctx, { text: `⬆️ upscale поставлен` });
       await ctx.reply(`⬆️ <b>${escapeHtml(shot.shotCode)}</b> — FHD-upscale в очереди`, { parse_mode: 'HTML' });
+    });
+  });
+
+  bot.callbackQuery(/^a:i-vid:/, async (ctx) => {
+    const [, , shotId, idxStr] = ctx.callbackQuery.data!.split(':');
+    await withShotIdx(ctx, shotId, Number(idxStr), 'vid', async (shot, item) => {
+      const v = item as { id: string };
+      await startInterpolate(v.id);
+      await safeAnswer(ctx, { text: `⏩ FPS поставлен` });
+      await ctx.reply(`⏩ <b>${escapeHtml(shot.shotCode)}</b> — увеличение FPS в очереди`, { parse_mode: 'HTML' });
     });
   });
 
@@ -321,6 +333,7 @@ function gateTag(g: GateKey): string {
     case 'create_video':          return '🎬';
     case 'approve_video':         return '✅';
     case 'upscale_video':         return '⬆️';
+    case 'interpolate_video':     return '⏩';
     case 'render_tts':            return '🎙';
     case 'approve_tts':           return '🎙';
     case 'approve_bgm':           return '🎵';
@@ -337,6 +350,7 @@ function gateLabel(g: GateKey): string {
     case 'create_video':          return 'нужно видео';
     case 'approve_video':         return 'выбрать видео';
     case 'upscale_video':         return 'нужен FHD-upscale';
+    case 'interpolate_video':     return 'нужен FPS (обязательно)';
     case 'render_tts':            return 'нужна озвучка';
     case 'approve_tts':           return 'выбрать дубль озвучки';
     case 'approve_bgm':           return 'выбрать дубль BGM';
@@ -423,7 +437,8 @@ async function openShotView(ctx: Context, shotId: string): Promise<void> {
       }
       const isChosen = shot.chosenVideoId === v.id;
       const upscaled = v.upscaleStatus === 'completed';
-      const caption  = `#${i + 1}${isChosen ? '  ✓ chosen' : ''}${upscaled ? '  · FHD ✓' : ''}`;
+      const smoothed = v.interpStatus === 'completed';
+      const caption  = `#${i + 1}${isChosen ? '  ✓ chosen' : ''}${upscaled ? '  · FHD ✓' : ''}${smoothed ? '  · FPS ✓' : ''}`;
       try {
         await ctx.replyWithVideo(new InputFile(filePath), { caption, parse_mode: 'HTML' });
       } catch (err) {
@@ -438,10 +453,16 @@ async function openShotView(ctx: Context, shotId: string): Promise<void> {
       if (v.upscaleStatus !== 'completed' && v.upscaleStatus !== 'running' && v.upscaleStatus !== 'pending') {
         kb.text(`🎬 ⬆️ #${i + 1}`, `a:u-vid:${shotId}:${i + 1}`);
       }
+      // FPS interpolation (mandatory) — offered once the FHD upscale is done and
+      // interpolation hasn't been queued/run yet.
+      if (v.upscaleStatus === 'completed'
+          && v.interpStatus !== 'completed' && v.interpStatus !== 'running' && v.interpStatus !== 'pending') {
+        kb.text(`🎬 ⏩ #${i + 1}`, `a:i-vid:${shotId}:${i + 1}`);
+      }
       kb.row();
     });
     kb.text('🎬 Сделать ещё видео', `a:r-vid:${shotId}`);
-    await ctx.reply(`<b>🎬 Видео</b> — выбери / удали / FHD / дорендер:`, {
+    await ctx.reply(`<b>🎬 Видео</b> — выбери / удали / FHD / ⏩FPS / дорендер:`, {
       parse_mode: 'HTML', reply_markup: kb,
     });
   } else if (shot.chosenRender) {

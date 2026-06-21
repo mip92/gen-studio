@@ -88,6 +88,11 @@ model Project {
   ///               (~45 min) model where only the first minutes are animated and
   ///               the rest are stills. See exports.service + export_capcut.py.
   exportTiming            String       @default("clip")
+  /// Published YouTube URL of the FINISHED video. When set, the project is
+  /// considered DONE: the /actions page suppresses every pipeline gate for it
+  /// (no more render/upscale/FPS/TTS nagging — the deliverable already shipped).
+  /// Null = still in production. Set/cleared from the project overview page.
+  youtubeUrl              String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -560,11 +565,29 @@ model VideoRender {
   upscaleCompletedAt   DateTime?
   upscaleErrorMessage  String?
 
+  /// FPS interpolation (RIFE/FILM → 2× framerate). MANDATORY final step before
+  /// CapCut export. Null until the user queues it; can only be queued once the
+  /// upscale has completed (it interpolates the FHD output). Lifecycle mirrors
+  /// the upscale fields above: null → pending → running → completed | failed.
+  interpStatus         String?
+  /// Basename of the smoothed mp4 in `data/<project>/shots/<shotCode>/videos_smooth/`.
+  interpFilename       String?
+  interpPromptId       String?
+  /// Frame multiplier used (2 = double FPS). Snapshot at enqueue time.
+  interpMultiplier     Int?
+  /// When this row's interpolation lifecycle entered `pending` — FIFO key,
+  /// distinct from queuedAt/upscaleQueuedAt for the same reason upscale needs its own.
+  interpQueuedAt       DateTime?
+  interpStartedAt      DateTime?
+  interpCompletedAt    DateTime?
+  interpErrorMessage   String?
+
   shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
 
   @@index([shotId])
   @@index([status, queuedAt])
   @@index([upscaleStatus, upscaleQueuedAt])
+  @@index([interpStatus, interpQueuedAt])
   @@map("video_renders")
 }
 

@@ -15,6 +15,7 @@ export type GateKey =
   | 'create_video'
   | 'approve_video'
   | 'upscale_video'
+  | 'interpolate_video'
   | 'render_tts'
   | 'approve_tts'
   | 'approve_bgm';
@@ -56,6 +57,8 @@ export interface VideoRow {
   outputFilename:     string | null;
   upscaleStatus:      string | null;
   upscaledFilename:   string | null;
+  interpStatus:       string | null;
+  interpFilename:     string | null;
 }
 
 export interface ShotFull {
@@ -247,6 +250,17 @@ export async function startUpscale(videoId: string): Promise<void> {
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
     throw new Error(`POST upscale → HTTP ${res.status} ${txt.slice(0, 200)}`);
+  }
+}
+
+// Queue the mandatory FPS interpolation on the upscaled clip (gate
+// interpolate_video). Backend: POST /generation/videos/:id/interpolate — 400s
+// if the upscale isn't completed yet.
+export async function startInterpolate(videoId: string): Promise<void> {
+  const res = await fetchWithTimeout(`${API_BASE}/generation/videos/${videoId}/interpolate`, { method: 'POST' });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`POST interpolate → HTTP ${res.status} ${txt.slice(0, 200)}`);
   }
 }
 

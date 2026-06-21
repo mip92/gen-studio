@@ -21,7 +21,7 @@ const EXPORT_FPS    = 30;
 interface ShotReadinessIssue {
   shotCode:  string;
   shotId:    string;
-  reason:    'no_chosen_video' | 'no_upscale' | 'no_chosen_render';
+  reason:    'no_chosen_video' | 'no_upscale' | 'no_interp' | 'no_chosen_render';
 }
 interface SceneReadinessIssue {
   sceneKey:  string;
@@ -186,6 +186,10 @@ export class ExportsService {
           missingShots.push({ shotCode: shot.shotCode, shotId: shot.id, reason: 'no_chosen_video' });
         } else if (chosen.upscaleStatus !== 'completed' || !chosen.upscaledFilename) {
           missingShots.push({ shotCode: shot.shotCode, shotId: shot.id, reason: 'no_upscale' });
+        } else if (chosen.interpStatus !== 'completed' || !chosen.interpFilename) {
+          // Mandatory FPS-interpolation gate — runs after upscale; the smoothed
+          // clip is the deliverable. Blocks export until done.
+          missingShots.push({ shotCode: shot.shotCode, shotId: shot.id, reason: 'no_interp' });
         }
       }
     }
@@ -220,7 +224,7 @@ export class ExportsService {
       throw new BadRequestException(
         `Project ${project.slug} is not ready to export: `
         + `${readiness.missingShots.length} shot(s) not render-ready `
-        + `(animated need a chosen video + FHD upscale; static need a chosen render), `
+        + `(animated need a chosen video + FHD upscale + FPS interpolation; static need a chosen render), `
         + `${readiness.missingScenes.length} empty scene(s).`,
       );
     }
@@ -368,12 +372,16 @@ export class ExportsService {
           kind = 'image';
         } else {
           const video = shot.videoRenders.find((v) => v.id === shot.chosenVideoId);
-          if (!video || !video.upscaledFilename) continue; // gated upstream
-          mediaPath = path.join(dataRoot, 'shots', shot.shotCode, 'videos_fhd', video.upscaledFilename);
+          if (!video || !video.interpFilename) continue; // gated upstream (needs upscale + interp)
+          // The FPS-interpolated (smoothed) clip is the final deliverable — it
+          // supersedes the raw FHD upscale. videos_smooth/<file> is FHD too
+          // (interpolation only changes framerate, not resolution).
+          mediaPath = path.join(dataRoot, 'shots', shot.shotCode, 'videos_smooth', video.interpFilename);
           if (!existsSync(mediaPath)) {
-            throw new BadRequestException(`FHD mp4 missing for shot ${shot.shotCode}: ${mediaPath}`);
+            throw new BadRequestException(`Smoothed (interpolated) mp4 missing for shot ${shot.shotCode}: ${mediaPath}`);
           }
-          // length = frame count at FPS; FHD upscale preserves frame count.
+          // length = frame count at FPS; upscale + interpolation both preserve
+          // real-time duration (interp adds frames AND raises fps proportionally).
           const params  = (video.params ?? {}) as { fps?: number; length?: number };
           const fpsP    = params.fps    ?? 16;
           const lengthP = params.length ?? 81;
