@@ -8,6 +8,7 @@ import {
   Param,
   Patch,
   Post,
+  Put,
   UploadedFile,
   UseInterceptors,
 } from '@nestjs/common';
@@ -17,6 +18,7 @@ import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from 'f
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { TTS_ENGINES, type TTSEngine } from './tts.service';
+import { VoiceoversService } from '../voiceovers/voiceovers.service';
 
 const APP_ROOT       = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 const MAX_REF_BYTES  = 12 * 1024 * 1024;   // 12 MB — generous for 15s WAV at 48 kHz mono
@@ -46,7 +48,10 @@ function emotionRefDir(slug: string): string {
 @ApiTags('Project TTS')
 @Controller('projects/:projectId/tts')
 export class ProjectTTSController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly voiceovers: VoiceoversService,
+  ) {}
 
   // ── Engine switch ──────────────────────────────────────────────────────
 
@@ -73,7 +78,10 @@ export class ProjectTTSController {
   // ── Voice reference (1 per project) ────────────────────────────────────
 
   @Post('voice-reference')
-  @ApiOperation({ summary: 'Upload the project voice reference (replaces existing)' })
+  @ApiOperation({
+    summary: 'Upload a voice reference: adds it to the shared library (dedup by md5) ' +
+             'and assigns it to this project. Use PUT /voiceover to assign an existing one.',
+  })
   @ApiConsumes('multipart/form-data')
   @ApiBody({ schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } } } })
   @UseInterceptors(FileInterceptor('file'))
@@ -82,53 +90,35 @@ export class ProjectTTSController {
     @UploadedFile()     file: Express.Multer.File,
   ) {
     if (!file) throw new BadRequestException(`Field "file" is required (multipart/form-data)`);
-    if (file.size > MAX_REF_BYTES) {
-      throw new BadRequestException(`File too large (${file.size} bytes); max ${MAX_REF_BYTES}`);
-    }
-    const ext = pickAudioExt(file);
 
     const project = await this.prisma.project.findUnique({ where: { id: projectId } });
     if (!project) throw new NotFoundException(`Project ${projectId} not found`);
 
-    const dir = projectDataRoot(project.slug);
-    mkdirSync(dir, { recursive: true });
+    // Land the clip in the shared library (deduped by md5), then assign it.
+    // The voice now lives ONCE in data/_voices/, not copied into this project.
+    const vo = await this.voiceovers.createFromBuffer(
+      file.buffer, file.originalname, file.mimetype, { slug: project.slug, name: project.slug },
+    );
+    await this.voiceovers.assignToProject(projectId, vo.id);
+    return { ok: true, path: vo.filePath, bytes: vo.bytes, voiceoverId: vo.id };
+  }
 
-    // One slot per project: wipe any previous voice_reference.* before write.
-    for (const f of readdirSync(dir)) {
-      if (f.startsWith('voice_reference.')) {
-        try { unlinkSync(path.join(dir, f)); } catch { /* best-effort */ }
-      }
-    }
-
-    const filename     = `voice_reference${ext}`;
-    const absolutePath = path.join(dir, filename);
-    writeFileSync(absolutePath, file.buffer);
-
-    // Store project-relative path (portable across machines if APP_ROOT shifts).
-    const relativePath = path.posix.join('data', project.slug, 'tts', filename);
-    await this.prisma.project.update({
-      where: { id: projectId },
-      data:  { ttsVoiceRefPath: relativePath },
-    });
-    return { ok: true, path: relativePath, bytes: file.size };
+  @Put('voiceover')
+  @ApiOperation({ summary: 'Assign an existing library voiceover to this project (voiceoverId=null unassigns)' })
+  async assignVoiceover(
+    @Param('projectId') projectId: string,
+    @Body() body: { voiceoverId: string | null },
+  ) {
+    return this.voiceovers.assignToProject(projectId, body?.voiceoverId ?? null);
   }
 
   @Delete('voice-reference')
-  @ApiOperation({ summary: 'Remove the project voice reference (file + DB pointer)' })
+  @ApiOperation({ summary: 'Unassign the project voice (keeps the shared library file intact)' })
   async deleteVoiceRef(@Param('projectId') projectId: string) {
-    const project = await this.prisma.project.findUnique({ where: { id: projectId } });
-    if (!project) throw new NotFoundException(`Project ${projectId} not found`);
-    if (project.ttsVoiceRefPath) {
-      const abs = path.isAbsolute(project.ttsVoiceRefPath)
-        ? project.ttsVoiceRefPath
-        : path.join(APP_ROOT, project.ttsVoiceRefPath);
-      try { unlinkSync(abs); } catch { /* best-effort — file may already be gone */ }
-    }
-    await this.prisma.project.update({
-      where: { id: projectId },
-      data:  { ttsVoiceRefPath: null },
-    });
-    return { ok: true };
+    // Only detaches this project — never deletes the shared file, since other
+    // projects may reference the same voiceover. Delete from the library via
+    // DELETE /voiceovers/:id instead.
+    return this.voiceovers.assignToProject(projectId, null);
   }
 
   // ── Emotion references (named library) ─────────────────────────────────

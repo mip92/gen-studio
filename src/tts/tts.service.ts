@@ -56,18 +56,19 @@ type SampleRate = (typeof ALLOWED_SAMPLE_RATES)[number];
 
 const DEFAULT_VOICE: Voice           = 'eugene';
 const DEFAULT_SAMPLE_RATE: SampleRate = 48000;
-const DEFAULT_RATE                    = 1.0;
+const DEFAULT_RATE                    = 0.85;
 const MIN_RATE                        = 0.5;
 const MAX_RATE                        = 2.0;
 /** Extra silence after each sentence — capped at 30s to keep ridiculous values out. */
 const MIN_SENTENCE_PAUSE = 0;
 const MAX_SENTENCE_PAUSE = 30;
 
-// F5-TTS Russian renders a touch fast and runs sentences together, so f5
-// projects sound right out of the box with a slightly slowed rate + a 1s
-// pause between sentences. These are only DEFAULTS — an explicit per-render
-// rate/sentencePauseSec still wins. silero/xtts2 keep the 1.0 / 0 defaults.
-const F5_DEFAULT_RATE           = 0.95;
+// Default narration speed is a slowed 0.85 for ALL engines (user request
+// 2026-06-18 — "для всех проектов по умолчанию 0.85"). F5-TTS Russian also
+// runs sentences together, so f5 additionally gets a 1s pause between
+// sentences. These are only DEFAULTS — an explicit per-render
+// rate/sentencePauseSec still wins.
+const F5_DEFAULT_RATE           = 0.85;
 const F5_DEFAULT_SENTENCE_PAUSE = 1.0;
 
 /** Default playback rate when the caller didn't specify one — engine-aware. */

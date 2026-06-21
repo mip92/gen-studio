@@ -11,6 +11,7 @@ import { ComfyModule } from './comfy/comfy.module';
 import { GenerationModule } from './generation/generation.module';
 import { TrainingModule } from './training/training.module';
 import { TTSModule } from './tts/tts.module';
+import { VoiceoversModule } from './voiceovers/voiceovers.module';
 import { BgmModule } from './bgm/bgm.module';
 import { ExportsModule } from './exports/exports.module';
 import { PipelineModule } from './pipeline/pipeline.module';
@@ -32,6 +33,7 @@ import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
     GenerationModule,
     TrainingModule,
     TTSModule,
+    VoiceoversModule,
     BgmModule,
     ExportsModule,
     PipelineModule,

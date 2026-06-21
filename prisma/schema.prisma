@@ -60,7 +60,18 @@ model Project {
   /// voice-clone engines (xtts2 / f5). Convention:
   /// data/<slug>/tts/voice_reference.wav. Null = not uploaded yet (renders
   /// fail with a clear error until set when ttsEngine is a voice-clone engine).
+  ///
+  /// MIRROR FIELD: when `ttsVoiceoverId` is set, this is kept in sync to the
+  /// assigned Voiceover's shared `filePath` so all render/gating code can keep
+  /// reading this single field. Direct legacy uploads still populate it too.
   ttsVoiceRefPath         String?
+  /// FK to a shared Voiceover (закадровая озвучка) in the reusable library.
+  /// Assigning a library voice sets this AND mirrors `ttsVoiceRefPath` to the
+  /// voiceover's shared file — so a voice lives ONCE on disk and is referenced
+  /// by many projects instead of copied into each. Null = no library voice
+  /// assigned. onDelete: SetNull (deleting a voiceover unassigns, never cascades
+  /// a project away).
+  ttsVoiceoverId          String?
   /// Visual style of this project. Drives workflow routing + LoRA pipeline +
   /// style-block injection into shot prompts. References visual_styles.id.
   /// Default photoreal_cinematic for backwards compatibility with last_shift /
@@ -90,7 +101,9 @@ model Project {
   referenceAssets   ReferenceAsset[]
   narrativeBlocks   NarrativeBlock[]
   ttsEmotionRefs    ProjectTTSEmotionRef[]
+  ttsVoiceover      Voiceover?            @relation(fields: [ttsVoiceoverId], references: [id], onDelete: SetNull)
 
+  @@index([ttsVoiceoverId])
   @@map("projects")
 }
 
@@ -685,6 +698,42 @@ model ProjectTTSEmotionRef {
 
   @@unique([projectId, name])
   @@map("project_tts_emotion_refs")
+}
+
+// ─── Voiceovers (закадровая озвучка — shared reusable voice library) ──────────
+//
+// A Voiceover is ONE voice-clone reference clip stored once in a shared library
+// (data/_voices/<slug>/voice_reference.<ext>) and assigned to any number of
+// projects via Project.ttsVoiceoverId — instead of uploading a copy into every
+// project's data/<slug>/tts/. `checksum` (md5 of the bytes) is unique so two
+// identical uploads collapse into one row. Assigning mirrors the shared path
+// into Project.ttsVoiceRefPath, which the render/gating code already reads.
+
+model Voiceover {
+  id        String   @id @default(uuid())
+  /// Stable kebab/snake identifier, unique across the library, ASCII only.
+  /// e.g. "cat_lady" or "female-tired". Used in the data/_voices/<slug>/ path.
+  slug      String   @unique
+  /// Human-friendly label for the UI dropdown. Russian is fine — never sent to TTS.
+  name      String
+  /// App-relative path to the single clip: data/_voices/<slug>/voice_reference.<ext>.
+  filePath  String
+  /// File extension including the dot (".wav", ".mp3", …).
+  ext       String
+  /// Byte size on disk (shown in the UI; informational).
+  bytes     Int
+  /// MD5 hex of the file bytes — unique, dedupes identical uploads into one row.
+  checksum  String   @unique
+  /// Optional provenance link — the YouTube (or any) URL the reference clip was
+  /// taken from, so the original source can be re-found. Null = unknown source.
+  sourceUrl String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Projects that have this voice assigned (Project.ttsVoiceoverId).
+  projects  Project[]
+
+  @@map("voiceovers")
 }
 
 // ─── BGM (ACE-Step v1.5 background music) ────────────────────────────────────
