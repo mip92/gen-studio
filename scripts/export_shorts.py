@@ -365,6 +365,8 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True, help="path to the shorts plan json")
+    ap.add_argument("--only", help="build ONLY the short with this slug (per-short "
+                                   "export from the UI); default builds all shorts")
     ap.add_argument("--out", help="write the result json ({project,shorts:[...]}) to this "
                                   "path (the backend reads it instead of parsing stdout)")
     ap.add_argument("--dry-run", action="store_true",
@@ -385,6 +387,10 @@ def main() -> int:
     shorts = plan.get("shorts") or []
     if not shorts:
         sys.exit("plan has no shorts")
+    if args.only:
+        shorts = [s for s in shorts if s.get("slug") == args.only]
+        if not shorts:
+            sys.exit(f"--only '{args.only}': no short with that slug in the plan")
 
     if not os.path.exists(EXPORT_SCRIPT):
         sys.exit(f"export_capcut.py missing: {EXPORT_SCRIPT}")

@@ -18,6 +18,7 @@ import { PipelineModule } from './pipeline/pipeline.module';
 import { ActionsModule } from './actions/actions.module';
 import { LocationsModule } from './locations/locations.module';
 import { PropsModule } from './props/props.module';
+import { YoutubeModule } from './youtube/youtube.module';
 import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
 
 @Module({
@@ -41,6 +42,7 @@ import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
     ActionsModule,
     LocationsModule,
     PropsModule,
+    YoutubeModule,
     TelegramBotModule,
   ],
 })

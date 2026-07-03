@@ -671,6 +671,9 @@ export class ExportsService {
     idOrSlug: string,
     body?: {
       shorts?: Array<{ slug: string; title?: string; shots: string[] }>;
+      /** Build ONLY this short (per-short export from the UI). Applies to the
+       *  versioned plan file; ignored when an explicit `shorts` array is sent. */
+      only?: string;
       fill?: string;
       background_fill?: string;
       width?: number;
@@ -718,9 +721,17 @@ export class ExportsService {
     mkdirSync(outDir, { recursive: true });
     const outPath = path.join(outDir, 'shorts_result.json');
 
-    this.logger.log(`Spawning shorts exporter for ${project.slug} (plan ${path.basename(planPath)})`);
+    // Per-short export: --only filters the plan to one short (only meaningful
+    // when we didn't already narrow it to a single POSTed short above).
+    const onlyArgs = (body?.only && !(body.shorts && body.shorts.length))
+      ? ['--only', body.only] : [];
+
+    this.logger.log(
+      `Spawning shorts exporter for ${project.slug} (plan ${path.basename(planPath)}`
+      + `${body?.only ? `, only=${body.only}` : ''})`,
+    );
     const { code, stderr } = await runPython(SHORTS_PYTHON, [
-      '-X', 'utf8', SHORTS_SCRIPT, '--plan', planPath, '--out', outPath,
+      '-X', 'utf8', SHORTS_SCRIPT, '--plan', planPath, '--out', outPath, ...onlyArgs,
     ]);
     if (code !== 0) {
       throw new BadRequestException(`export_shorts.py exited ${code}: ${stderr.trim().slice(-800)}`);
