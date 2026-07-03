@@ -19,6 +19,9 @@ Manifest schema (see ExportsService.buildManifest for the writer):
   "height":             1080,
   "fps":                30,
   "transition_preset":  "default" | "comic",   # shot-boundary transition style
+  "background_fill":    "blur" | "color" | "",  # optional; vertical Shorts: fill
+                                                #   the canvas behind a 16:9 clip
+                                                #   in a 9:16 frame. "" = legacy.
   "scenes": [
     {
       "sceneKey":   "S01",
@@ -111,6 +114,324 @@ def _audio_duration_us(path: str) -> int:
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+# ── Subtitles from the voiceover text ───────────────────────────────────────
+# We know the exact timeline position + length of every voiceover line (it's
+# how the narration lane is laid out below), and the line's source text
+# (manifest narration.text = TTSJob.text). So we build subtitles straight from
+# that text instead of relying on CapCut's auto-recognition, which mangles
+# f5/RUAccent output. Two deliverables, both perfectly synced to the audio:
+#
+#   1. A native CapCut RECOGNISED-SUBTITLE group injected into the draft. This
+#      is NOT a plain text track (pyJianYingDraft's TextSegment produces a
+#      flag=0 text track that CapCut treats as loose text — you can't batch-
+#      style it or apply a subtitle animation template). We instead clone the
+#      exact shape CapCut writes for auto-recognised captions, reverse-
+#      engineered from a real draft on this machine:
+#        • a text track with flag=1              (marks it as a subtitle track)
+#        • per cue: a material with type='subtitle', a SHARED group_id, plus
+#          language / words / recognize_* scaffolding                (the group)
+#        • per cue: a sticker_animation placeholder in material_animations
+#          referenced from the segment's extra_material_refs   (the slot CapCut
+#          fills when you apply an animation template to the whole group)
+#      Result: the captions land in CapCut's subtitle panel and accept a
+#      one-click batch animation template, exactly like recognised subtitles —
+#      but with our correct text and timing, no speech-to-text.
+#   2. A sidecar <draft>.srt next to draft_content.json — a plain file the user
+#      can import elsewhere if they'd rather manage captions by hand.
+#
+# Set manifest["embed_subtitles"]=false to skip the native group (the .srt is
+# still written).
+_SRT_MAX_CHARS = 84   # ≈ two 42-char lines; longer cues get split by words
+
+# Native subtitle styling / placement. Values mirror CapCut's recognised-
+# subtitle defaults read from a real draft: white fill, black stroke, centered,
+# parked at transform_y ≈ -0.737 (half-canvas units, negative = lower third).
+_SUB_FONT_SIZE      = 5.0     # CapCut's own recognised-caption default size
+_SUB_TRANSFORM_Y    = -0.7368493150684934
+_SUB_STROKE_WIDTH   = 0.06
+_SUB_MAX_LINE_WIDTH = 0.82
+
+
+def _fmt_srt_ts(us: int) -> str:
+    """Microseconds → SRT timestamp 'HH:MM:SS,mmm'."""
+    us = max(0, int(us))
+    ms_total = us // 1000
+    h  = ms_total // 3_600_000
+    m  = (ms_total % 3_600_000) // 60_000
+    s  = (ms_total % 60_000) // 1000
+    ms = ms_total % 1000
+    return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
+
+
+def _split_cue(start_us: int, end_us: int, text: str):
+    """Split one voiceover line into readable SRT cues.
+
+    We have no word-level timing, only the whole line's [start, end]. So pack
+    words greedily into ≤_SRT_MAX_CHARS chunks and hand each chunk a slice of
+    the line's duration proportional to its character length. A short line
+    stays a single cue (byte-identical to "one cue per shot")."""
+    text = ' '.join(text.split())
+    if not text:
+        return []
+    words = text.split(' ')
+    chunks: List[str] = []
+    cur = ''
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > _SRT_MAX_CHARS:
+            chunks.append(cur)
+            cur = w
+        else:
+            cur = f'{cur} {w}' if cur else w
+    if cur:
+        chunks.append(cur)
+    if len(chunks) <= 1:
+        return [(start_us, end_us, text)]
+    total_chars = sum(len(c) for c in chunks) or 1
+    span = max(0, end_us - start_us)
+    out = []
+    t = start_us
+    for i, c in enumerate(chunks):
+        e = end_us if i == len(chunks) - 1 else t + (span * len(c)) // total_chars
+        out.append((t, e, c))
+        t = e
+    return out
+
+
+def _write_srt(cues: List[tuple], path: Path) -> int:
+    """Write cues [(start_us, end_us, text), ...] to an SRT file. Cues are
+    sorted by start; each is split into readable sub-cues first. Returns the
+    number of SRT entries written."""
+    expanded: List[tuple] = []
+    for start_us, end_us, text in sorted(cues, key=lambda c: c[0]):
+        expanded.extend(_split_cue(start_us, end_us, text))
+    lines: List[str] = []
+    for i, (start_us, end_us, text) in enumerate(expanded, 1):
+        lines.append(str(i))
+        lines.append(f'{_fmt_srt_ts(start_us)} --> {_fmt_srt_ts(end_us)}')
+        lines.append(text)
+        lines.append('')
+    # SRT convention: CRLF line endings, trailing blank line.
+    path.write_text('\r\n'.join(lines) + '\r\n', encoding='utf-8')
+    return len(expanded)
+
+
+def _resolve_capcut_font(drafts_root: Path) -> str:
+    """Best-effort absolute path to CapCut's bundled system font.
+
+    Recognised-subtitle materials CapCut writes carry a concrete font path
+    (…/CapCut/Apps/<ver>/Resources/Font/SystemFont/en.ttf). We mirror that so
+    the caption renders identically; the app-version folder changes between
+    installs, so glob for the newest one. `drafts_root` is
+    …/CapCut/User Data/Projects/com.lveditor.draft — the CapCut root is three
+    levels up. Returns '' when nothing is found (CapCut then falls back to its
+    default font, which is fine)."""
+    try:
+        capcut_root = drafts_root.parent.parent.parent      # …/CapCut
+        apps = capcut_root / "Apps"
+        candidates = sorted(apps.glob("*/Resources/Font/SystemFont/en.ttf"))
+        if candidates:
+            return str(candidates[-1]).replace("\\", "/")
+    except Exception as e:  # noqa: BLE001
+        _log(f'font resolve failed: {e!r}')
+    return ''
+
+
+def _subtitle_content(text: str, font_path: str) -> str:
+    """The `content` blob of a subtitle material: white fill + black stroke,
+    matching CapCut's recognised-caption default. JSON-encoded string (CapCut
+    stores `content` as an embedded JSON string, not a nested object)."""
+    style = {
+        "fill":    {"alpha": 1.0, "content": {"render_type": "solid",
+                    "solid": {"alpha": 1.0, "color": [1.0, 1.0, 1.0]}}},
+        "strokes": [{"content": {"render_type": "solid",
+                    "solid": {"alpha": 1.0, "color": [0.0, 0.0, 0.0]}},
+                    "width": _SUB_STROKE_WIDTH, "mode": 0}],
+        "range":   [0, len(text)],
+        "size":    _SUB_FONT_SIZE,
+    }
+    if font_path:
+        style["font"] = {"id": "", "path": font_path}
+    return json.dumps({"text": text, "styles": [style]}, ensure_ascii=False)
+
+
+def _build_subtitle_words(text: str, dur_us: int) -> Dict[str, Any]:
+    """Synthesise a word-level timing map for one cue by splitting on spaces and
+    handing each token a share of the cue duration proportional to its length.
+    CapCut needs this `words` map for word-by-word subtitle animation templates;
+    we have no real word timing, so proportional spacing is the best estimate."""
+    toks = text.split(' ')
+    total = sum(len(t) for t in toks) or 1
+    dur_ms = max(1, dur_us // 1000)
+    starts, ends, words = [], [], []
+    t = 0
+    for i, tok in enumerate(toks):
+        e = dur_ms if i == len(toks) - 1 else t + (dur_ms * len(tok)) // total
+        starts.append(t); ends.append(e); words.append(tok)
+        t = e
+    return {"start_time": starts, "end_time": ends, "text": words}
+
+
+def _build_subtitle_material(mat_id: str, text: str, dur_us: int,
+                             group_id: str, font_path: str) -> Dict[str, Any]:
+    """One recognised-subtitle text material, cloned from the field set CapCut
+    writes for auto-recognition. The fields that make CapCut treat this as a
+    caption (not loose text) and group it for batch editing: type='subtitle',
+    a shared `group_id`, `language`, `add_type`=1, `recognize_type`=0, and the
+    `words` timing map. Styling fields mirror the recognised-caption default."""
+    content = _subtitle_content(text, font_path)
+    return {
+        "id":              mat_id,
+        "type":            "subtitle",
+        "content":         content,
+        "base_content":    content,
+        # Recognition scaffolding. task_id/model left blank — we're not backed
+        # by a cloud recognition job, but the grouping fields below are what
+        # CapCut actually keys the subtitle panel + batch templates off of.
+        "recognize_task_id": "",
+        "recognize_text":    text,
+        "recognize_model":   "",
+        "punc_model":        "",
+        "recognize_type":    0,
+        "add_type":          1,
+        "group_id":          group_id,
+        "language":          "ru-RU",
+        "words":             _build_subtitle_words(text, dur_us),
+        "current_words":     {"start_time": [], "end_time": [], "text": []},
+        # Styling / layout defaults (match CapCut recognised captions).
+        "alignment":         1,
+        "typesetting":       0,
+        "line_feed":         1,
+        "line_spacing":      0.02,
+        "letter_spacing":    0.0,
+        "line_max_width":    _SUB_MAX_LINE_WIDTH,
+        "force_apply_line_max_width": False,
+        "text_color":        "#ffffff",
+        "text_alpha":        1.0,
+        "border_color":      "#000000",
+        "border_alpha":      1.0,
+        "border_width":      _SUB_STROKE_WIDTH,
+        "border_mode":       0,
+        "font_size":         _SUB_FONT_SIZE,
+        "font_path":         font_path,
+        "font_id":           "",
+        "font_title":        "none",
+        "has_shadow":        False,
+        "underline":         False,
+        "italic_degree":     0,
+        "bold_width":        0.0,
+        "check_flag":        15,
+        "global_alpha":      1.0,
+        "combo_info":            {"text_templates": []},
+        "caption_template_info": {"resource_id": "", "third_resource_id": "",
+            "resource_name": "", "category_id": "", "category_name": "",
+            "effect_id": "", "request_id": "", "path": "", "is_new": False,
+            "source_platform": 0},
+        "name":              "",
+        "fixed_width":       -1.0,
+        "fixed_height":      -1.0,
+    }
+
+
+def _build_subtitle_segment(seg_id: str, mat_id: str, anim_id: str,
+                            start_us: int, dur_us: int, render_index: int) -> Dict[str, Any]:
+    """One subtitle segment: links its text material + its sticker_animation
+    placeholder (`extra_material_refs`), positions the caption in the lower
+    third (`clip.transform.y`), and carries the render-layer bookkeeping CapCut
+    expects. Mirrors a real recognised-subtitle segment."""
+    return {
+        "id":               seg_id,
+        "material_id":      mat_id,
+        "extra_material_refs": [anim_id],
+        "target_timerange": {"start": int(start_us), "duration": int(dur_us)},
+        "source_timerange": None,
+        "render_timerange": {"start": 0, "duration": 0},
+        "render_index":     render_index,
+        "track_render_index": 0,
+        "track_attribute":  0,
+        "clip": {
+            "scale":     {"x": 1.0, "y": 1.0},
+            "rotation":  0.0,
+            "transform": {"x": 0.0, "y": _SUB_TRANSFORM_Y},
+            "flip":      {"vertical": False, "horizontal": False},
+            "alpha":     1.0,
+        },
+        "uniform_scale":    {"on": True, "value": 1.0},
+        "speed":            1.0,
+        "volume":           1.0,
+        "last_nonzero_volume": 1.0,
+        "visible":          True,
+        "state":            0,
+        "desc":             "",
+        "group_id":         "",
+        "is_placeholder":   False,
+        "is_loop":          False,
+        "is_tone_modify":   False,
+        "reverse":          False,
+        "intensifies_audio": False,
+        "cartoon":          False,
+        "enable_adjust":    False,
+        "enable_lut":       False,
+        "keyframe_refs":    [],
+        "common_keyframes": [],
+        "caption_info":     None,
+        "template_id":      "",
+        "template_scene":   "default",
+        "source":           "segmentsourcenormal",
+        "responsive_layout": {"enable": False, "target_follow": "",
+            "size_layout": 0, "horizontal_pos_layout": 0, "vertical_pos_layout": 0},
+    }
+
+
+def _inject_subtitles(data: Dict[str, Any], cues: List[tuple],
+                      drafts_root: Path, group_id: str) -> int:
+    """Mutate a loaded draft_content.json dict: add a recognised-subtitle group
+    built from `cues`. Splits each cue like the SRT, then appends one subtitle
+    material + one sticker_animation placeholder per chunk, and a single flag=1
+    text track holding all the segments. Returns the number of cues written."""
+    expanded: List[tuple] = []
+    for start_us, end_us, text in sorted(cues, key=lambda c: c[0]):
+        expanded.extend(_split_cue(start_us, end_us, text))
+    if not expanded:
+        return 0
+
+    materials = data.setdefault("materials", {})
+    texts     = materials.setdefault("texts", [])
+    anims     = materials.setdefault("material_animations", [])
+    tracks    = data.setdefault("tracks", [])
+    font_path = _resolve_capcut_font(drafts_root)
+
+    # render_index must be unique + high; continue above the max already used
+    # by video/text segments so we never collide with an existing layer.
+    max_ri = 0
+    for tr in tracks:
+        for s in tr.get("segments", []):
+            max_ri = max(max_ri, int(s.get("render_index") or 0))
+    ri = max_ri + 1
+
+    segments: List[Dict[str, Any]] = []
+    for start_us, end_us, text in expanded:
+        dur = max(1, int(end_us) - int(start_us))
+        mat_id  = uuid.uuid4().hex
+        anim_id = uuid.uuid4().hex
+        seg_id  = uuid.uuid4().hex
+        texts.append(_build_subtitle_material(mat_id, text, dur, group_id, font_path))
+        anims.append({"id": anim_id, "type": "sticker_animation",
+                      "animations": [], "multi_language_current": "none"})
+        segments.append(_build_subtitle_segment(seg_id, mat_id, anim_id, start_us, dur, ri))
+        ri += 1
+
+    tracks.append({
+        "id":              uuid.uuid4().hex,
+        "type":            "text",
+        "flag":            1,          # ← marks the track as a subtitle group
+        "attribute":       0,
+        "name":            "",
+        "is_default_name": True,
+        "segments":        segments,
+    })
+    return len(segments)
 
 
 def _capcut_effect_path(capcut_drafts_root: str, resource_id: str):
@@ -243,6 +564,12 @@ def build_draft(manifest: dict) -> Path:
     width     = int(manifest.get("width",  1920))
     height    = int(manifest.get("height", 1080))
     fps       = int(manifest.get("fps",    30))
+    # Vertical / YouTube-Shorts export. When the manifest asks for a canvas
+    # fill, every video/image segment gets a CapCut background-fill so a 16:9
+    # source sits centered in a 9:16 (or any mismatched) canvas over a blurred
+    # (or solid) backdrop instead of bare black bars. Absent → empty string →
+    # no-op, so legacy 16:9 exports stay byte-identical. Values: "blur" | "color".
+    background_fill = str(manifest.get("background_fill") or "").strip().lower()
 
     # `maintrack_adsorb=False` — we lay clips sequentially with explicit
     # timeranges, so we don't need JianYing's auto-snap behavior.
@@ -266,6 +593,10 @@ def build_draft(manifest: dict) -> Path:
     # past its shot and into this one, the current narration starts right
     # after the previous instead. Sequential, never overlapping.
     cursor_narration_us = 0
+    # (start_us, end_us, text) for every voiceover line, in placement order.
+    # Written to <draft>.srt after the draft so captions match the audio lane
+    # exactly (same start/duration math as the AudioSegments below).
+    subtitle_cues: List[tuple] = []
     total_clips     = 0
     total_tts       = 0
     total_bgm       = 0
@@ -343,6 +674,21 @@ def build_draft(manifest: dict) -> Path:
                         target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
                     )
 
+            # Vertical Shorts: fill the empty canvas behind a mismatched-aspect
+            # clip. MUST run before add_segment() — that reads background_filling
+            # into the draft's canvas material list. blur=0.375 is CapCut's 2nd
+            # preset (a soft, non-distracting backdrop).
+            if background_fill == "blur":
+                try:
+                    segment.add_background_filling("blur", blur=0.375)
+                except Exception as e:  # noqa: BLE001
+                    _log(f'background_filling(blur) failed for {sh["shotCode"]}: {e!r}')
+            elif background_fill == "color":
+                try:
+                    segment.add_background_filling("color", color="#000000FF")
+                except Exception as e:  # noqa: BLE001
+                    _log(f'background_filling(color) failed for {sh["shotCode"]}: {e!r}')
+
             script.add_segment(segment, track_name="main_video")
             all_video_segments.append(segment)
 
@@ -381,6 +727,10 @@ def build_draft(manifest: dict) -> Path:
                     cursor_narration_us = audio_start_us + tts_dur
                     total_tts += 1
                     any_shot_narration = True
+                    # Subtitle cue spans exactly the spoken audio for this shot.
+                    narr_text = (shot_narr.get("text") or "").strip()
+                    if narr_text:
+                        subtitle_cues.append((audio_start_us, audio_start_us + tts_dur, narr_text))
 
             cursor_video_us += dur
             total_clips += 1
@@ -411,6 +761,9 @@ def build_draft(manifest: dict) -> Path:
                     )
                     script.add_segment(a_seg, track_name="narration")
                     total_tts += 1
+                    narr_text = (narr.get("text") or "").strip()
+                    if narr_text:
+                        subtitle_cues.append((scene_start_us, scene_start_us + tts_dur, narr_text))
                 else:
                     _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
 
@@ -623,7 +976,31 @@ def build_draft(manifest: dict) -> Path:
     #      but CapCut International (`app_source: cc`) refuses drafts from
     #      a different distribution. We rewrite the platform metadata so the
     #      international client treats the file as its own.
-    rewrite_for_capcut_international(out_path)
+    #   3. Inject the recognised-subtitle group (flag=1 text track + subtitle
+    #      materials + animation placeholders) built from the voiceover cues —
+    #      done here, on the loaded dict, because these fields live outside
+    #      pyJianYingDraft's model. Skipped when embed_subtitles=false.
+    embed_subtitles = manifest.get("embed_subtitles", True)
+    sub_segments = rewrite_for_capcut_international(
+        out_path,
+        subtitle_cues if embed_subtitles else None,
+        drafts_root,
+    )
+
+    # ── Subtitles sidecar (.srt) ──────────────────────────────────────────
+    # Emit <draft>.srt next to draft_content.json. Perfectly synced to the
+    # narration lane (same start/duration as the native track above), as a
+    # portable fallback the user can import by hand or feed to other tools.
+    srt_entries = 0
+    if subtitle_cues:
+        srt_path = draft_dir / f'{manifest["draft_name"]}.srt'
+        try:
+            srt_entries = _write_srt(subtitle_cues, srt_path)
+            _log(f'wrote {srt_entries} subtitle cue(s) → {srt_path}')
+        except Exception as e:  # noqa: BLE001
+            _log(f'SRT write failed ({e!r}) — draft is fine, subtitles skipped')
+    else:
+        _log('no voiceover lines found — no .srt written')
 
     # Total duration of this draft (used both by root_meta and draft_meta).
     total_us = cursor_video_us
@@ -632,13 +1009,16 @@ def build_draft(manifest: dict) -> Path:
     _log(f'wrote {out_path}')
     _log(f'project={project} clips={total_clips} static={total_static} '
          f'narration_tracks={total_tts} bgm_tracks={total_bgm} '
-         f'transitions={total_transitions} duration_us={total_us}')
+         f'transitions={total_transitions} subtitles_embedded={sub_segments} '
+         f'subtitles_srt={srt_entries} duration_us={total_us}')
     return draft_dir
 
 
-def rewrite_for_capcut_international(draft_content_path: Path) -> None:
+def rewrite_for_capcut_international(draft_content_path: Path,
+                                    subtitle_cues: "List[tuple] | None" = None,
+                                    drafts_root: "Path | None" = None) -> int:
     """Post-process pyJianYingDraft's draft_content.json so CapCut International
-    will open it. Two patches:
+    will open it. Patches:
 
     1. Normalise every string field that contains backslashes to forward slashes
        (CapCut paths are forward-slash on Windows). pyJianYingDraft uses
@@ -648,9 +1028,28 @@ def rewrite_for_capcut_international(draft_content_path: Path) -> None:
        that match a CapCut International project. pyJianYingDraft tags drafts
        as JianYing (`app_source='lv'`, `app_id=3704`, `app_version='5.9.0'`)
        which CapCut International won't load.
+    3. When `subtitle_cues` is given, inject a recognised-subtitle group built
+       from them (see `_inject_subtitles`). Done here because it operates on the
+       loaded dict and uses fields outside pyJianYingDraft's model.
+
+    Returns the number of subtitle segments injected (0 if none).
     """
     with open(draft_content_path, "r", encoding="utf-8") as f:
         data = json.load(f)
+
+    # Inject subtitles BEFORE the slash-normalisation pass so any font path we
+    # add gets the same forward-slash treatment as everything else.
+    sub_segments = 0
+    if subtitle_cues:
+        try:
+            group_id = f'ru-RU_{int(time.time() * 1000)}'
+            sub_segments = _inject_subtitles(data, subtitle_cues,
+                                             drafts_root or draft_content_path.parent, group_id)
+            _log(f'injected recognised-subtitle group: {sub_segments} cue(s)')
+        except Exception as e:  # noqa: BLE001
+            _log(f'subtitle injection failed ({e!r}) — draft is fine, '
+                 f'falling back to the .srt sidecar')
+            sub_segments = 0
 
     # 1. Backslash → forward slash everywhere (paths can be nested in many
     # places — material list, captions, attachments, fonts). Cheap blanket pass.
@@ -690,6 +1089,8 @@ def rewrite_for_capcut_international(draft_content_path: Path) -> None:
 
     with open(draft_content_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
+
+    return sub_segments
 
 
 def _build_root_meta_entry(
