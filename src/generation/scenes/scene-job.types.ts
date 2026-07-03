@@ -24,7 +24,24 @@ export interface SceneJobParams {
   seed:            number;
   steps?:          number;
   cfg?:            number;
+  /** Flux only: FluxGuidance value (the distilled-guidance knob; cfg stays 1.0
+   *  on Flux). Ignored by SDXL strategies. Default ~3.5 when unset. */
+  guidance?:       number;
   /** How many images to generate in a single ComfyUI run (batch_size on EmptyLatentImage). */
   batchSize?:      number;
   filenamePrefix:  string;
+
+  // ── Flux Redux identity (graphic_novel_flux only) ─────────────────────────
+  /** ComfyUI-input-relative filename of the staged anchor PNG. When set, the
+   *  Flux comic single-character strategy injects the Redux nodes and feeds this
+   *  image as the identity reference. Absent → text-only identity (promptBase).
+   *  The service only sets this when the anchor PNG AND the Redux model files
+   *  are present on disk, so the strategy can trust it. */
+  referenceImagePath?: string;
+  /** Redux style-model filename (models/style_models/). */
+  reduxStyleModel?:    string;
+  /** Redux CLIP-Vision filename (models/clip_vision/). */
+  reduxClipVision?:    string;
+  /** StyleModelApply strength (0..1, identity influence). Default ~0.8. */
+  reduxStrength?:      number;
 }

@@ -4,14 +4,26 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService, QueuePromptResult } from '../../comfy/comfy.service';
+import { ImageValidationService } from '../../validation/image-validation.service';
 import { SceneFactory } from './scene.factory';
 import { SceneJobParams, SceneParticipant } from './scene-job.types';
 
 const APP_ROOT        = process.env.APP_ROOT        ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_OUTPUT    = process.env.COMFY_OUTPUT    ?? 'E:\\ComfyUI\\output';
+const COMFY_INPUT     = process.env.COMFY_INPUT     ?? 'E:\\ComfyUI\\input';
 const COMFY_LORA_ROOT = process.env.COMFY_LORA_ROOT ?? 'E:\\ComfyUI\\models\\loras';
+// models/ root is the parent of models/loras. Used to probe for the Flux Redux
+// model files before wiring the Redux identity chain.
+const COMFY_MODELS_ROOT = process.env.COMFY_MODELS_ROOT ?? path.dirname(COMFY_LORA_ROOT);
 const KOHYA_PYTHON    = process.env.KOHYA_PYTHON    ?? 'E:\\kohya_ss\\venv\\Scripts\\python.exe';
 const UPSCALE_SCRIPT  = path.join(APP_ROOT, 'scripts', 'upscale_to_fhd.py');
+
+// Flux Redux identity (graphic_novel_flux). Both files must be present for the
+// single-character Flux comic strategy to attach the anchor portrait as a
+// reference; otherwise identity falls back to text-only (promptBase).
+const FLUX_VISUAL_STYLE      = 'graphic_novel_flux';
+const REDUX_STYLE_MODEL_NAME = process.env.FLUX_REDUX_MODEL        ?? 'flux1-redux-dev.safetensors';
+const REDUX_CLIP_VISION_NAME = process.env.FLUX_REDUX_CLIP_VISION  ?? 'sigclip_vision_patch14_384.safetensors';
 
 export interface RenderShotInput {
   shotId:          string;
@@ -23,17 +35,32 @@ export interface RenderShotInput {
   seed?:           number;
   steps?:          number;
   cfg?:            number;
+  /** Flux only: FluxGuidance value (cfg stays 1.0 on Flux). Ignored by SDXL. */
+  guidance?:       number;
+  /** Per-generation visual-style / pipeline override (e.g. 'graphic_novel_flux'
+   *  vs 'graphic_novel_cell_shaded'). Resolves the SceneStrategy + workflow JSON.
+   *  Once a shot has any render, the pipeline is LOCKED (see enqueueRender): a
+   *  request whose visualStyle differs from the pinned one is rejected. Absent
+   *  → the shot's pinned style (Shot.workflowRouteKey) or the project default. */
+  visualStyle?:    string;
   /** How many images to generate at once (batch_size on EmptyLatentImage). */
   batchSize?:      number;
   loraStrength?:   number;
   /** If true, return the assembled workflow without queuing it. */
   dryRun?:         boolean;
+  /** If true, wipe previously-rendered candidates (files + renderedImages +
+   *  chosenRender) before queuing — a deliberate "regenerate from scratch".
+   *  Default false: renders ACCUMULATE so the "+ ещё 5 вариантов" button adds
+   *  to the candidate pool instead of replacing it. */
+  replace?:        boolean;
 }
 
 export interface RenderResult {
   shotId:        string;
   shotCode:      string;
   strategyId:    string;
+  /** Resolved positive prompt sent to ComfyUI (validation scores against this). */
+  positive?:     string;
   participants:  Array<{ profileCode: string; displayName: string; loraPath: string }>;
   job?:          QueuePromptResult;
   workflow?:     Record<string, unknown>;
@@ -47,19 +74,20 @@ export class SceneRenderService {
     private readonly prisma:  PrismaService,
     private readonly comfy:   ComfyService,
     private readonly scenes:  SceneFactory,
+    private readonly validation: ImageValidationService,
   ) {}
 
   // ── Queue-aware API (used by PipelineQueueService) ──────────────────────────
 
   /** Enqueue a render: creates a `pending` SceneRenderJob; pipeline-tick will dispatch it.
    *
-   * Re-render semantics: any previously-rendered candidates for this shot are
-   * wiped before the new job is queued — both the files on disk and the
-   * `Shot.renderedImages` JSON list, and any `chosenRender` selection. This
-   * matches the "regenerate replaces" expectation: users who click render
-   * twice in a row don't end up with stale outputs piling next to the new
-   * batch. In-flight renders (pending/running scene jobs) are NOT touched —
-   * pollRunning will still append their outputs when they finish.
+   * Re-render semantics: renders ACCUMULATE. Each enqueue adds a fresh batch of
+   * candidates to `Shot.renderedImages` so the "+ ещё 5 вариантов" button does
+   * what it says — grows the pool the user picks from (and deletes from
+   * manually). Only when `input.replace === true` do we wipe the previous
+   * candidates (files + renderedImages + chosenRender) first — a deliberate
+   * "regenerate from scratch". In-flight renders (pending/running scene jobs)
+   * are never touched; pollRunning still appends their outputs when they finish.
    */
   async enqueueRender(input: RenderShotInput) {
     const shot = await this.prisma.shot.findUnique({
@@ -68,10 +96,17 @@ export class SceneRenderService {
     });
     if (!shot) throw new NotFoundException(`Shot ${input.shotId} not found`);
 
-    await this.wipePreviousRenders(shot);
+    if (input.replace) await this.wipePreviousRenders(shot);
 
-    // Strip non-serialisable fields (shotId is on the row itself; dryRun doesn't queue).
-    const { shotId, dryRun: _dryRun, ...params } = input;
+    // Visual style / pipeline is a PER-PROJECT setting (project.visualStyle) —
+    // not pinned per shot. A per-generation `input.visualStyle` override (rare)
+    // is carried in the job params and applied in renderShot; we do NOT write it
+    // to Shot.workflowRouteKey (that column is the workflow ROUTE key, owned by
+    // the seeders).
+
+    // Strip non-serialisable / control fields (shotId is on the row itself;
+    // dryRun + replace don't belong in the persisted render params).
+    const { shotId, dryRun: _dryRun, replace: _replace, ...params } = input;
     return this.prisma.sceneRenderJob.create({
       data: {
         shotId,
@@ -175,6 +210,9 @@ export class SceneRenderService {
           status:        'running',
           startedAt:     new Date(),
           comfyPromptId: result.job.promptId,
+          // Persist the resolved positive so pollRunning can seed the follow-up
+          // image-validation job with what the frame was asked to depict.
+          params:        { ...params, _resolvedPositive: result.positive } as any,
         },
       });
     } catch (e: any) {
@@ -210,6 +248,12 @@ export class SceneRenderService {
         // renumber filenames on collision, so we record the post-move names.
         const finalFilenames = await this.moveOutputsToShotDir(j.shotId, filenames);
         await this.appendShotRenders(j.shotId, finalFilenames, j.comfyPromptId);
+        // Auto-queue an image-validation pass so the vision model picks the best
+        // of the shot's candidates against what the frame was asked to depict.
+        // No-op when there are <2 candidates or one is already queued/running.
+        const resolvedPositive = ((j.params ?? {}) as any)?._resolvedPositive ?? null;
+        await this.validation.enqueue(j.shotId, resolvedPositive).catch((e: any) =>
+          this.logger.warn(`validation enqueue for shot ${j.shotId} failed: ${e?.message ?? e}`));
       }
       await this.prisma.sceneRenderJob.update({
         where: { id: j.id },
@@ -368,6 +412,46 @@ export class SceneRenderService {
     });
   }
 
+  /**
+   * Stage a character's anchor PNG into ComfyUI's input dir for the Flux Redux
+   * identity chain, returning the staged filename (relative to the input dir,
+   * as LoadImage expects). Returns undefined — so the caller falls back to
+   * text-only identity — when either Redux model file is missing or the anchor
+   * PNG can't be found under any of the character's attached project slugs.
+   */
+  private stageFluxReduxReference(
+    shotCode: string,
+    anchor: { profileCode: string; slugs: string[] },
+  ): string | undefined {
+    const styleModel = path.join(COMFY_MODELS_ROOT, 'style_models', REDUX_STYLE_MODEL_NAME);
+    const clipVision = path.join(COMFY_MODELS_ROOT, 'clip_vision',  REDUX_CLIP_VISION_NAME);
+    if (!existsSync(styleModel) || !existsSync(clipVision)) return undefined;
+    if (!anchor.profileCode) return undefined;
+
+    // Resolve the anchor PNG across candidate slugs (current project first, then
+    // the character's other attached projects — cameo anchors live elsewhere).
+    let anchorPath: string | undefined;
+    const seen = new Set<string>();
+    for (const slug of anchor.slugs) {
+      if (!slug || seen.has(slug)) continue;
+      seen.add(slug);
+      const p = path.join(APP_ROOT, 'data', slug, 'reference', `${anchor.profileCode}_anchor.png`);
+      if (existsSync(p)) { anchorPath = p; break; }
+    }
+    if (!anchorPath) return undefined;
+
+    const staged = `scene_ref_${shotCode}.png`;
+    try {
+      mkdirSync(COMFY_INPUT, { recursive: true });
+      copyFileSync(anchorPath, path.join(COMFY_INPUT, staged));
+    } catch (e: any) {
+      this.logger.warn(`[${shotCode}] Redux anchor staging failed: ${e?.message ?? e} — text-only fallback`);
+      return undefined;
+    }
+    this.logger.log(`[${shotCode}] Flux Redux identity → ${path.basename(anchorPath)}`);
+    return staged;
+  }
+
   // ── Direct render (called by queue worker after engine arbitration) ─────────
 
   async renderShot(input: RenderShotInput): Promise<RenderResult> {
@@ -381,7 +465,16 @@ export class SceneRenderService {
         scene:        true,
         participants: {
           include: {
-            character: { include: { profiles: true } },
+            // projectLinks → the slugs an anchor PNG might live under. A cameo
+            // character's anchor is stored under its HOME project's slug, not
+            // necessarily the current one, so Redux resolution must scan all
+            // attached slugs (see memory: cameo assets scan all projects).
+            character: {
+              include: {
+                profiles:     true,
+                projectLinks: { include: { project: { select: { slug: true } } } },
+              },
+            },
             profile:   true,
           },
         },
@@ -393,13 +486,19 @@ export class SceneRenderService {
     // regeneration when the locations table was added mid-session. Prepends
     // location.description to the positive so a single edit in the location
     // row updates every shot tagged with it.
-    const locationRows = await this.prisma.$queryRaw<Array<{ description: string }>>`
-      SELECT l.description
+    // Also LEFT JOIN props: a prop-hero shot (sh."propId" set) makes a story
+    // OBJECT the subject. Object anchors live separately from characters (user
+    // 2026-06-21 «предметы программа не рисует» — a macro of an object + a
+    // 400-700char location description renders "just a room", losing the prop).
+    const ctxRows = await this.prisma.$queryRaw<Array<{ description: string | null; propDescription: string | null }>>`
+      SELECT l.description AS description, p.description AS "propDescription"
       FROM shots sh
       LEFT JOIN locations l ON sh."locationId" = l.id
+      LEFT JOIN props p ON sh."propId" = p.id
       WHERE sh.id = ${input.shotId}
     `;
-    const locationDescription = locationRows[0]?.description ?? null;
+    const locationDescription = ctxRows[0]?.description ?? null;
+    const propDescription = ctxRows[0]?.propDescription ?? null;
 
     // ── 2. Resolve participant → CharacterProfile ────────────────────────────
     // Photoreal path (Project.visualStyle = 'photoreal_cinematic'): requires
@@ -408,15 +507,23 @@ export class SceneRenderService {
     // lock is via IP-Adapter at 0.4 weight on a single anchor reference image,
     // no LoRA training required. profile.loraPath stays NULL; profile.useIpAdapter
     // is TRUE; reference image lives at data/<slug>/reference/<profileCode>_anchor.png.
-    const visualStyle: string = (shot.project as any).visualStyle ?? 'photoreal_cinematic';
+    // Effective visual style = per-generation override (input.visualStyle, from
+    // the render job params) → the shot's pinned pipeline (workflowRouteKey, set
+    // by enqueueRender) → the project default. This is what makes the per-shot
+    // pipeline choice + lock work end-to-end.
+    const visualStyle: string = resolveVisualStyle(shot, input.visualStyle);
     const isCartoon = visualStyle !== 'photoreal_cinematic';
+
+    // Anchor info for cartoon participants, parallel to `participants`. Used by
+    // the Flux Redux identity path (graphic_novel_flux) to find the anchor PNG.
+    const cartoonAnchors: Array<{ profileCode: string; slugs: string[] }> = [];
 
     const participants: SceneParticipant[] = [];
     for (const sp of shot.participants) {
       if (!sp.character) continue;            // unbound participant slot
 
       if (isCartoon) {
-        // Cartoon path — no LoRA required, identity via IP-Adapter anchor + text.
+        // Cartoon path — no LoRA required, identity via anchor reference + text.
         const profile = sp.profile ?? sp.character.profiles[0];
         if (!profile || !profile.triggerToken) {
           throw new BadRequestException(
@@ -429,6 +536,13 @@ export class SceneRenderService {
           loraPath:        '',                              // sentinel — strategy ignores when style=cartoon
           characterPrompt: profile.promptBase ?? '',
           loraStrength:    input.loraStrength,
+        });
+        cartoonAnchors.push({
+          profileCode: (profile as any).profileCode,
+          slugs: [
+            shot.project.slug,
+            ...((sp.character as any).projectLinks ?? []).map((l: any) => l.project?.slug).filter(Boolean),
+          ],
         });
         continue;
       }
@@ -501,7 +615,18 @@ export class SceneRenderService {
     // first and the location prose comes last. Single source of truth for
     // the train_kupe / corridor / vestibule prose; editing the Location row
     // updates every shot tagged with it. Idempotent.
-    if (locationDescription && locationDescription.trim().length > 0) {
+    if (propDescription && propDescription.trim().length > 0) {
+      // Prop-hero shot: the OBJECT is the subject. PREPEND the prop anchor + a
+      // shallow-DOF directive so the object dominates (front tokens carry the
+      // strongest CLIP-G weight), and SKIP the location — a rich room
+      // description would pull the render back to "just a room" and bury the
+      // prop. Object anchors are managed in the Props tab, separate from chars.
+      const dof = 'the prop fills the frame as the single clear subject in crisp sharp focus, the surroundings thrown far out of focus into soft neutral shapes, shallow depth of field, one warm focused light on the object';
+      const propClause = `macro insert, ${propDescription.trim()}, ${dof}`;
+      if (!positive.startsWith(propClause)) {
+        positive = positive.trim().length > 0 ? `${propClause}, ${positive}` : propClause;
+      }
+    } else if (locationDescription && locationDescription.trim().length > 0) {
       const desc = locationDescription.trim();
       if (!positive.endsWith(desc)) {
         positive = positive.trim().length > 0 ? `${positive}, ${desc}` : desc;
@@ -526,6 +651,13 @@ export class SceneRenderService {
       : projectDefault;
     const negative = sanitizeNegative(rawNegative, this.logger, shot.shotCode);
 
+    // Flux Redux identity reference (graphic_novel_flux, single character only).
+    // Resolves to a staged input filename when the anchor PNG AND both Redux
+    // model files are present; otherwise undefined → strategy stays text-only.
+    const referenceImagePath = (visualStyle === FLUX_VISUAL_STYLE && participants.length === 1 && cartoonAnchors[0])
+      ? this.stageFluxReduxReference(shot.shotCode, cartoonAnchors[0])
+      : undefined;
+
     const params: SceneJobParams = {
       participants,
       scenePrompt:    input.scenePrompt   ?? positive ?? '',
@@ -536,8 +668,12 @@ export class SceneRenderService {
       seed:           input.seed   ?? Math.floor(Math.random() * 2 ** 32),
       steps:          input.steps,
       cfg:            input.cfg,
+      guidance:       input.guidance,
       batchSize:      input.batchSize ?? 5,
       filenamePrefix: `scene_${shot.shotCode}`,
+      referenceImagePath,
+      reduxStyleModel: REDUX_STYLE_MODEL_NAME,
+      reduxClipVision: REDUX_CLIP_VISION_NAME,
     };
 
     const workflow = strategy.buildPrompt(template, params);
@@ -553,13 +689,37 @@ export class SceneRenderService {
     // LoRA, so we must never touch it there. Absent/null settings → the JSON
     // default LoRA is used unchanged (keeps gaz / bio_plus working as before).
     if (isCartoon) {
-      const styleLora = normalizeStyleLora((shot.project as any).settings);
       const node2 = (workflow as any)['2']?.inputs;
+      const styleLora = normalizeStyleLora((shot.project as any).settings);
       if (styleLora && node2) {
         node2.lora_name = styleLora.name;
-        if (styleLora.strengthModel !== undefined) node2.strength_model = styleLora.strengthModel;
-        if (styleLora.strengthClip  !== undefined) node2.strength_clip  = styleLora.strengthClip;
+        // Default to full strength when a project sets a comic LoRA. The Flux
+        // comic templates ship the LoRA DISABLED (strength 0 → neutral, never
+        // realism); configuring the project's styleLora is what turns it on.
+        node2.strength_model = styleLora.strengthModel ?? 1.0;
+        node2.strength_clip  = styleLora.strengthClip  ?? 1.0;
         this.logger.log(`[${shot.shotCode}] style LoRA override → ${styleLora.name}`);
+      }
+      // Per-render style-LoRA strength (UI slider) wins over the settings/JSON
+      // default. node "2" is the style LoRA for every cartoon style (SDXL comic
+      // AND graphic_novel_flux), so this knob is honoured on both.
+      if (node2 && input.loraStrength !== undefined) {
+        node2.strength_model = input.loraStrength;
+        node2.strength_clip  = input.loraStrength;
+      }
+    }
+
+    // ── 4c. Per-project Flux base-model override (graphic_novel_flux only) ────
+    // The Flux comic templates bake a default UNET at node "1". Because the
+    // comic LoRA must match the base it was trained on (usually flux1-dev), a
+    // project can pin a neutral base via `project.settings.fluxBaseModel`
+    // without editing the JSON. Absent → the JSON default is kept.
+    if (visualStyle === FLUX_VISUAL_STYLE) {
+      const fluxBase = normalizeFluxBase((shot.project as any).settings);
+      const node1 = (workflow as any)['1']?.inputs;
+      if (fluxBase && node1) {
+        node1.unet_name = fluxBase;
+        this.logger.log(`[${shot.shotCode}] Flux base override → ${fluxBase}`);
       }
     }
 
@@ -568,6 +728,9 @@ export class SceneRenderService {
       shotId:       shot.id,
       shotCode:     shot.shotCode,
       strategyId:   strategy.id,
+      // The resolved positive prompt actually sent to ComfyUI — captured so the
+      // image-validation step can score candidates against what was asked for.
+      positive:     params.scenePrompt,
       participants: participants.map((p) => ({
         profileCode: p.triggerToken,
         displayName: p.displayName,
@@ -624,6 +787,36 @@ export function normalizeStyleLora(
     }
   }
   return null;
+}
+
+/**
+ * Read `project.settings.fluxBaseModel` — the UNET filename used at node "1" of
+ * the Flux comic workflows — or null when unset/blank (JSON default is kept).
+ * Lets a graphic_novel_flux project pin a base that matches its comic LoRA
+ * without editing the workflow JSON.
+ */
+/**
+ * Resolve the effective visual style for a shot: an explicit per-generation
+ * override (rare; API power-users) → the project default. The visual style /
+ * pipeline is a PER-PROJECT setting (project.visualStyle, changeable on the
+ * Settings page) — NOT per shot.
+ *
+ * NB: do NOT read Shot.workflowRouteKey here — that column holds the workflow
+ * ROUTE key (e.g. "<slug>_character_ip" / "<slug>_environment") set by the
+ * seeders, not a visual-style id. Treating it as a style breaks SceneFactory.
+ */
+export function resolveVisualStyle(
+  shot: { project?: { visualStyle?: string | null } | null },
+  requested?: string | null,
+): string {
+  const r    = requested && requested.trim().length > 0 ? requested.trim() : undefined;
+  const proj = ((shot.project as { visualStyle?: string | null } | null | undefined)?.visualStyle) ?? 'photoreal_cinematic';
+  return r ?? proj;
+}
+
+export function normalizeFluxBase(settings: unknown): string | null {
+  const s = (settings as { fluxBaseModel?: unknown } | null | undefined)?.fluxBaseModel;
+  return typeof s === 'string' && s.trim().length > 0 ? s.trim() : null;
 }
 
 /**

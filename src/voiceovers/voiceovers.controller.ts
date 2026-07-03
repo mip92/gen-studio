@@ -17,6 +17,7 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiBody, ApiConsumes, ApiOperation, ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
 import { existsSync } from 'fs';
+import * as path from 'path';
 import { VoiceoversService } from './voiceovers.service';
 
 const MIME_BY_EXT: Record<string, string> = {
@@ -31,6 +32,12 @@ const MIME_BY_EXT: Record<string, string> = {
 @Controller('voiceovers')
 export class VoiceoversController {
   constructor(private readonly svc: VoiceoversService) {}
+
+  /** Send an audio file with the right Content-Type for in-browser playback. */
+  private streamAudio(res: Response, absPath: string, ext: string) {
+    res.setHeader('Content-Type', MIME_BY_EXT[ext] ?? 'application/octet-stream');
+    res.sendFile(absPath);
+  }
 
   @Get()
   @ApiOperation({ summary: 'List the shared voiceover library (закадровая озвучка)' })
@@ -63,6 +70,52 @@ export class VoiceoversController {
       slug:      body?.slug,
       sourceUrl: body?.sourceUrl,
     });
+  }
+
+  // ── Import + trim (source → staging → trimmed clip). Literal `source/*`
+  //    routes are declared before `:id` so they win the match. ───────────────
+
+  @Post('source/youtube')
+  @ApiOperation({ summary: 'Fetch a YouTube URL audio track into staging for trimming' })
+  youtubeSource(@Body() body: { url?: string }) {
+    if (!body?.url) throw new BadRequestException('Field "url" is required');
+    return this.svc.createYoutubeSource(body.url);
+  }
+
+  @Post('source/upload')
+  @ApiOperation({ summary: 'Upload an audio file into staging for trimming' })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({ schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } } } })
+  @UseInterceptors(FileInterceptor('file'))
+  uploadSource(@UploadedFile() file: Express.Multer.File) {
+    if (!file) throw new BadRequestException('Field "file" is required (multipart/form-data)');
+    return this.svc.createUploadSource(file.buffer, file.originalname, file.mimetype);
+  }
+
+  @Get('source/:token/raw')
+  @ApiOperation({ summary: 'Stream a staged source clip for the waveform editor' })
+  sourceRaw(@Param('token') token: string, @Res() res: Response) {
+    const { absPath, ext } = this.svc.stagingSource(token);
+    this.streamAudio(res, absPath, ext);
+  }
+
+  @Post('source/:token/save')
+  @ApiOperation({ summary: 'Commit a staged source at [startMs,endMs] into a new library voice' })
+  saveSource(
+    @Param('token') token: string,
+    @Body() body: { name?: string; startMs: number; endMs: number },
+  ) {
+    return this.svc.saveFromStaging(token, {
+      name:    body?.name,
+      startMs: body?.startMs,
+      endMs:   body?.endMs,
+    });
+  }
+
+  @Delete('source/:token')
+  @ApiOperation({ summary: 'Discard a staged source (cancel the import)' })
+  discardSource(@Param('token') token: string) {
+    return this.svc.discardStaging(token);
   }
 
   @Get(':id')
@@ -98,7 +151,24 @@ export class VoiceoversController {
       res.status(404).json({ error: `voiceover file missing on disk: ${v.filePath}` });
       return;
     }
-    res.setHeader('Content-Type', MIME_BY_EXT[v.ext] ?? 'application/octet-stream');
-    res.sendFile(abs);
+    this.streamAudio(res, abs, v.ext);
+  }
+
+  @Get(':id/source/raw')
+  @ApiOperation({ summary: 'Stream the retained untrimmed source clip (for re-trimming)' })
+  async sourceOfVoice(@Param('id') id: string, @Res() res: Response) {
+    const v   = await this.svc.get(id);
+    const abs = this.svc.sourceAbsPath(v);
+    if (!abs || !existsSync(abs)) {
+      res.status(404).json({ error: 'no retained source for this voice' });
+      return;
+    }
+    this.streamAudio(res, abs, path.extname(abs).toLowerCase());
+  }
+
+  @Patch(':id/trim')
+  @ApiOperation({ summary: 'Re-cut an existing voice from its retained source at a new [startMs,endMs]' })
+  retrim(@Param('id') id: string, @Body() body: { startMs: number; endMs: number }) {
+    return this.svc.retrim(id, body?.startMs, body?.endMs);
   }
 }

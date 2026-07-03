@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Res } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Res } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsArray, IsNumber, IsOptional, IsString, IsUUID, ValidateNested } from 'class-validator';
@@ -9,6 +9,7 @@ import { ShotsService } from './shots.service';
 import { CreateShotDto } from './dto/create-shot.dto';
 import { UpdateShotDto } from './dto/update-shot.dto';
 import { SceneRenderService } from '../generation/scenes/scene-render.service';
+import { ImageValidationService } from '../validation/image-validation.service';
 
 class ParticipantInput {
   @IsString()
@@ -98,6 +99,7 @@ export class ShotsStandaloneController {
   constructor(
     private readonly shotsService: ShotsService,
     private readonly sceneRender:  SceneRenderService,
+    private readonly validation:   ImageValidationService,
   ) {}
 
   @Get(':shotId')
@@ -145,6 +147,34 @@ export class ShotsStandaloneController {
     @Body() body: { filename: string | null },
   ) {
     return this.shotsService.setChosenRender(shotId, body.filename);
+  }
+
+  @Post(':shotId/validate')
+  @ApiOperation({ summary: 'Queue an image-validation pass: the vision model re-scores the current candidates and picks the best' })
+  async validate(@Param('shotId') shotId: string) {
+    const job = await this.validation.enqueue(shotId, null);
+    // Re-checking invalidates whatever was chosen before (by the AI or by hand):
+    // clear it so the shot shows "under review" and the fresh pass decides anew.
+    if (job) await this.shotsService.setChosenRender(shotId, null);
+    return { queued: !!job, jobId: job?.id ?? null };
+  }
+
+  @Post(':shotId/apply-suggested-prompt')
+  @ApiOperation({ summary: 'Approve the vision model\'s suggested positive prompt (optionally wipe candidates + re-render)' })
+  async applySuggestedPrompt(
+    @Param('shotId') shotId: string,
+    @Body() body: { prompt: string; rerender?: boolean },
+  ) {
+    if (!body?.prompt || !body.prompt.trim()) {
+      throw new BadRequestException('prompt is required');
+    }
+    const shot = await this.shotsService.setPositivePrompt(shotId, body.prompt.trim());
+    if (body.rerender) {
+      // Deliberate rework: wipe the failed candidates and queue a fresh batch
+      // with the approved prompt (see feedback: invalidate stale renders).
+      await this.sceneRender.enqueueRender({ shotId, replace: true });
+    }
+    return shot;
   }
 
   @Patch(':shotId/chosen-video')

@@ -80,5 +80,15 @@ export class PipelineBootService implements OnModuleInit {
     }
     if (sceneRecovered > 0) this.logger.log(`Boot: ${sceneRecovered} scene job(s) recoverable from ComfyUI history — left running`);
     if (sceneFailed    > 0) this.logger.warn(`Boot: failed ${sceneFailed} zombie scene render job(s)`);
+
+    // Image-validation runs entirely in-process (Ollama HTTP calls, no external
+    // subprocess to recover). A restart mid-run orphans the row at 'running',
+    // which would jam the single-slot gate forever — fail them so the queue
+    // moves on. They're cheap and idempotent to re-trigger (auto or manual).
+    const val = await (this.prisma as any).imageValidationJob.updateMany({
+      where: { status: 'running' },
+      data:  { status: 'failed', errorMessage: reason, completedAt },
+    });
+    if (val.count > 0) this.logger.warn(`Boot: failed ${val.count} zombie image-validation job(s)`);
   }
 }

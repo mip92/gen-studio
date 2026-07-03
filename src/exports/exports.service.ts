@@ -57,16 +57,19 @@ interface ManifestShot  {
   source_us?:  number;
   /** Per-shot narration wav (shot-level TTS). When set, the python exporter
    *  lays the wav on the audio track at this shot's video timeline position
-   *  instead of the legacy scene-level narration block. */
-  narration?:  { path: string; duration_us: number } | null;
+   *  instead of the legacy scene-level narration block. `text` is the exact
+   *  VO line (TTSJob.text) — the exporter emits it as an SRT subtitle cue at
+   *  the wav's timeline position, so captions match the spoken audio without
+   *  CapCut's error-prone auto-recognition. */
+  narration?:  { path: string; duration_us: number; text: string } | null;
 }
 interface ManifestScene {
   sceneKey:  string;
   title:     string | null;
   /** Legacy whole-scene voiceover. Used only when per-shot narrations are not
    *  set on any shot of the scene — the python exporter prefers per-shot wavs
-   *  when they exist. */
-  narration: { path: string; duration_us: number } | null;
+   *  when they exist. `text` feeds the SRT subtitle export (see ManifestShot). */
+  narration: { path: string; duration_us: number; text: string } | null;
   shots:     ManifestShot[];
 }
 /**
@@ -352,7 +355,7 @@ export class ExportsService {
               ? approvedTts.durationMs * 1000
               : Math.max(800_000, Math.round((approvedTts.text.length / 15) * 1_000_000));
             narrationUs   = trueWavUs;
-            shotNarration = { path: wavPath, duration_us: trueWavUs };
+            shotNarration = { path: wavPath, duration_us: trueWavUs, text: approvedTts.text };
           } else {
             this.logger.warn(`shot ${shot.shotCode}: approved TTS wav missing on disk (${wavPath}) — skipping audio`);
           }
@@ -464,7 +467,7 @@ export class ExportsService {
           const sceneShotsDuration = shotEntries.reduce((s, x) => s + x.duration_us, 0);
           const charBasedGuessUs   = Math.max(1_500_000, Math.round((tts.text.length / 15) * 1_000_000));
           const duration_us = Math.min(charBasedGuessUs, Math.max(sceneShotsDuration, charBasedGuessUs));
-          narration = { path: fp, duration_us };
+          narration = { path: fp, duration_us, text: tts.text };
         }
       }
 

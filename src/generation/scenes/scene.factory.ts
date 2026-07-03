@@ -13,6 +13,9 @@ import { EnvironmentFluxHiresSceneStrategy } from './strategies/environment-flux
 import { SingleCharacterGraphicNovelSceneStrategy } from './strategies/single-character-graphic-novel.strategy';
 import { DualCharacterGraphicNovelSceneStrategy } from './strategies/dual-character-graphic-novel.strategy';
 import { EnvironmentGraphicNovelSceneStrategy } from './strategies/environment-graphic-novel.strategy';
+import { EnvironmentFluxComicSceneStrategy } from './strategies/environment-flux-comic.strategy';
+import { SingleCharacterFluxComicSceneStrategy } from './strategies/single-character-flux-comic.strategy';
+import { DualCharacterFluxComicSceneStrategy } from './strategies/dual-character-flux-comic.strategy';
 
 const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..', '..');
 
@@ -46,6 +49,16 @@ export class SceneFactory {
     this.register(new SingleCharacterGraphicNovelSceneStrategy());
     this.register(new DualCharacterGraphicNovelSceneStrategy());
     this.register(new EnvironmentGraphicNovelSceneStrategy());
+
+    // ── GRAPHIC NOVEL FLUX strategies ─────────────────────────────────────────
+    // For projects with Project.visualStyle = 'graphic_novel_flux'. Same comic
+    // look as graphic_novel_cell_shaded but on a Flux base + Flux comic style-
+    // LoRA (node "2", overridable via settings.styleLora), cfg=1.0 + FluxGuidance.
+    // Identity: text-only (promptBase) with OPTIONAL Flux Redux anchor on the
+    // single-character strategy when the anchor PNG + Redux models are present.
+    this.register(new EnvironmentFluxComicSceneStrategy());
+    this.register(new SingleCharacterFluxComicSceneStrategy());
+    this.register(new DualCharacterFluxComicSceneStrategy());
 
     // PHOTOREAL DualCharacterRegional was a 2-LoRA regional-prompting attempt
     // that produced face-bleed and identity mixing. Replaced by SingleWithBack
@@ -114,9 +127,15 @@ export class SceneFactory {
   }
 
   loadTemplate(strategy: SceneStrategy, projectSlug: string): WorkflowTemplate {
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', strategy.filename);
+    // Per-project workflow JSON wins; fall back to the shared master template
+    // in data/_templates/comfy/ when a project hasn't copied it in yet. This is
+    // how a NEW project (e.g. a graphic_novel_flux one) renders out of the box —
+    // its comfy/ dir need not be pre-populated for every strategy.
+    const perProject = path.join(APP_ROOT, 'data', projectSlug, 'comfy', strategy.filename);
+    const shared     = path.join(APP_ROOT, 'data', '_templates', 'comfy', strategy.filename);
+    const filePath   = existsSync(perProject) ? perProject : shared;
     if (!existsSync(filePath)) {
-      throw new NotFoundException(`Scene workflow not found: ${filePath}`);
+      throw new NotFoundException(`Scene workflow not found: ${perProject} (and no shared template at ${shared})`);
     }
     return JSON.parse(readFileSync(filePath, 'utf-8')) as WorkflowTemplate;
   }

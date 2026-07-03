@@ -106,7 +106,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     }
 
     const count = Math.max(1, Math.min(8, input.count ?? 1));
-    const workflowFilename = this.resolveWorkflowFilename(input.mode, shot);
+    const workflowFilename = this.resolveWorkflowFilename(input.mode);
 
     // Create N pending rows. Actual ComfyUI dispatch happens in PipelineQueueService.tick()
     // which serializes video renders against scene renders, training and dataset jobs.
@@ -318,28 +318,18 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   // ── Workflow loading + patching ────────────────────────────────────────────
 
   /**
-   * Resolve the i2v workflow file for a render. Explicit 'fast'/'cfg' wins.
-   * 'auto' (or undefined) picks cfg ONLY for a static shot on a comic-style
-   * (non-photoreal) project — those are the shots where the negative prompt
-   * needs to bite (toy must not move, no drinking). Everything else stays on
-   * the fast 4-step workflow. Falls back to fast if the cfg file isn't present
-   * for the project (loadTemplate re-checks existence on disk).
+   * Resolve the i2v workflow file — a BINARY, explicit per-shot choice:
+   *   'cfg'        → cfg workflow (20 steps, cfg=4, negative fires) = «качество».
+   *   else / fast  → fast workflow (4-step lightx2v, cfg=1, negative ignored)
+   *                  = «быстро», the DEFAULT.
+   * cfg is ~5× slower, so it is ONLY ever used when the user explicitly picks it
+   * per shot. There is NO 'auto' — the old auto silently routed comic/static or
+   * motionNegative shots to cfg and quietly 5×'d render time (every shot here
+   * has a baked motionNegative). Engine family (Wan/Flux/SDXL) is decided once
+   * per project via project.visualStyle, not here.
    */
-  private resolveWorkflowFilename(
-    mode: 'auto' | 'fast' | 'cfg' | undefined,
-    shot: { promptFields: any; project: { slug: string; visualStyle?: string | null } },
-  ): string {
-    if (mode === 'cfg')  return CFG_WORKFLOW_FILENAME;
-    if (mode === 'fast') return WORKFLOW_FILENAME;
-    // auto
-    const pf       = (shot.promptFields ?? {}) as Record<string, unknown>;
-    const cam      = (pf.camera as Record<string, unknown> | undefined) ?? {};
-    const movement = typeof cam.movement === 'string' ? cam.movement.trim() : '';
-    const isStatic = /^static/i.test(movement);
-    const isComic  = (shot.project.visualStyle ?? 'photoreal_cinematic') !== 'photoreal_cinematic';
-    const cfgPath  = path.join(APP_ROOT, 'data', shot.project.slug, 'comfy', CFG_WORKFLOW_FILENAME);
-    if (isComic && isStatic && existsSync(cfgPath)) return CFG_WORKFLOW_FILENAME;
-    return WORKFLOW_FILENAME;
+  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | undefined): string {
+    return mode === 'cfg' ? CFG_WORKFLOW_FILENAME : WORKFLOW_FILENAME;
   }
 
   private loadTemplate(projectSlug: string, workflowFilename?: string | null): Record<string, any> {

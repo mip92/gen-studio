@@ -371,6 +371,7 @@ model Shot {
   renderJobs   SceneRenderJob[]
   videoRenders VideoRender[]
   ttsJobs      TTSJob[]
+  validationJobs ImageValidationJob[]
 
   @@unique([projectId, shotCode])
   @@index([projectId, sceneId])
@@ -519,6 +520,48 @@ model SceneRenderJob {
   @@index([shotId])
   @@index([status, queuedAt])
   @@map("scene_render_jobs")
+}
+
+/// Image-validation jobs. After a shot's batch of candidate stills lands, a
+/// local vision model (Ollama qwen3-vl) scores every current candidate against
+/// what the shot is supposed to show and picks the best one — auto-setting
+/// Shot.chosenRender. Runs in the same single-slot pipeline as every other GPU
+/// job (PipelineQueueService.tick), but with the OPPOSITE engine arbitration to
+/// ComfyUI jobs: dispatch stops ComfyUI first so the whole 16 GB card is free
+/// for the vision model, and starting a ComfyUI job later unloads the model.
+/// See ImageValidationService.
+model ImageValidationJob {
+  id             String    @id @default(uuid())
+  shotId         String
+  status         String    @default("pending")   // pending | running | completed | failed
+  /// What the frame is SUPPOSED to show — the resolved positive prompt captured
+  /// from the render job — for the vision model to score the match against.
+  expectedPrompt String?
+  /// The shot's narration (VO). VO↔image match is the strongest correctness
+  /// signal (a frame must show exactly the subject the voiceover names).
+  narration      String?
+  /// Snapshot of the candidate filenames scored, in scoring order.
+  candidates     Json?
+  /// Full per-candidate result: [{filename, score, matchesPrompt, issues[]}].
+  result         Json?
+  /// Filename the model picked as best (also written to Shot.chosenRender).
+  /// Null when NO candidate was acceptable (all severe / none matched) — in that
+  /// case the shot's chosenRender is cleared and suggestedPrompt is filled.
+  chosenFilename String?
+  /// When no candidate passed, the vision model's proposed improved positive
+  /// prompt to fix the failures. The user reviews/edits/approves it in the UI,
+  /// which writes it into Shot.promptFields.positive for the next render.
+  suggestedPrompt String?
+  errorMessage   String?
+  queuedAt       DateTime  @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
+
+  @@index([shotId])
+  @@index([status, queuedAt])
+  @@map("image_validation_jobs")
 }
 
 // ─── Video renders ───────────────────────────────────────────────────────────
@@ -750,6 +793,17 @@ model Voiceover {
   /// Optional provenance link — the YouTube (or any) URL the reference clip was
   /// taken from, so the original source can be re-found. Null = unknown source.
   sourceUrl String?
+  /// App-relative path to the FULL, untrimmed source clip kept alongside the
+  /// reference (data/_voices/<slug>/source.<ext>) so the clip can be re-trimmed
+  /// later without re-downloading. Null = imported before this feature / no
+  /// source retained (a plain legacy upload). The rendered `filePath` clip is
+  /// always the trimmed WAV the engines consume; this is only for re-editing.
+  sourceFilePath String?
+  /// Trim window (milliseconds into `sourceFilePath`) that produced the current
+  /// `filePath` clip. Both null = clip is the whole source / no trim recorded.
+  /// Persisted so the trim UI can reopen at the last selection and re-cut.
+  trimStartMs Int?
+  trimEndMs   Int?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

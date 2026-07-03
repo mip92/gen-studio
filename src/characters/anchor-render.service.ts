@@ -36,6 +36,19 @@ const STYLE_PREFIX =
   'flat color blocks with subtle hatching for shadow, 16:9 cinematic composition, ' +
   'no photorealism, no 3D render, no plastic skin';
 
+// Flux comic projects (graphic_novel_flux) need the SAME anti-anime steering the
+// scene strategy uses, or Flux turns a young/bright portrait into anime even
+// with the comic LoRA at full strength. The load-bearing tokens are
+// "muted desaturated cinematic palette" + "semi-realistic ADULT proportions" +
+// "western/american comic" — proven to hold western-comic on the flux1-dev base.
+const FLUX_COMIC_STYLE =
+  'printed western graphic novel panel, american comic book illustration, ' +
+  'bold confident heavy black ink outlines with clean variable line weight, ' +
+  'flat cell-shaded color blocks with cross-hatching in the shadows, ' +
+  'muted desaturated cinematic color palette, grounded semi-realistic adult proportions, ' +
+  'mature naturalistic face, gritty inked comic art, ' +
+  'no anime, no manga, no chibi, no big shiny eyes, no photorealism, no 3D render';
+
 const PORTRAIT_COMPOSITION =
   'three-quarter portrait facing camera, head-and-shoulders framing, ' +
   'neutral pale grey backdrop, soft north-window light, anchor reference portrait';
@@ -158,14 +171,21 @@ export class AnchorRenderService {
     }
 
     const visualStyle = (project as any).visualStyle ?? 'photoreal_cinematic';
-    // For now there's only one anchor workflow (graphic_novel). Future styles
-    // can register their own gen_anchor_portrait_<style>_api.json files.
-    const workflowFilename = 'gen_anchor_portrait_graphic_novel_api.json';
-    const workflowPath = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
+    // Anchor workflow per visual style. Both share the node layout the patches
+    // below target (2=LoraLoader, 3/4=text, 6=KSampler, 8=SaveImage), so the
+    // same code drives the SDXL and Flux comic anchor graphs.
+    const workflowFilename = visualStyle === 'graphic_novel_flux'
+      ? 'gen_anchor_portrait_flux_comic_api.json'
+      : 'gen_anchor_portrait_graphic_novel_api.json';
+    // Per-project workflow wins; fall back to the shared master template so a
+    // new project renders anchors without pre-copying its comfy/ dir.
+    const perProject   = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
+    const shared       = path.join(APP_ROOT, 'data', '_templates', 'comfy', workflowFilename);
+    const workflowPath = existsSync(perProject) ? perProject : shared;
     if (!existsSync(workflowPath)) {
       await this.failJob(
         jobId,
-        `Anchor workflow not found at ${workflowPath}. Copy a template and configure LoRA loader for visualStyle=${visualStyle}.`,
+        `Anchor workflow not found at ${perProject} (and no shared template at ${shared}). Configure a LoRA loader for visualStyle=${visualStyle}.`,
       );
       return;
     }
@@ -181,12 +201,19 @@ export class AnchorRenderService {
     const node2 = wf['2']?.inputs;
     if (styleLora && node2) {
       node2.lora_name = styleLora.name;
-      if (styleLora.strengthModel !== undefined) node2.strength_model = styleLora.strengthModel;
-      if (styleLora.strengthClip  !== undefined) node2.strength_clip  = styleLora.strengthClip;
+      // Default the comic LoRA to full strength. The Flux comic anchor template
+      // ships the LoRA DISABLED (strength 0 → neutral, never realism); a project
+      // setting its styleLora is what turns it on. Without this default the
+      // anchor renders on the bare Flux base + "cell-shaded" text → ANIME.
+      node2.strength_model = styleLora.strengthModel ?? 1.0;
+      node2.strength_clip  = styleLora.strengthClip  ?? 1.0;
       this.logger.log(`Anchor ${profile.profileCode}: style LoRA override → ${styleLora.name}`);
     }
 
-    const positive = [STYLE_PREFIX, PORTRAIT_COMPOSITION, profile.promptBase].join(', ');
+    // graphic_novel_flux needs the western/realistic anti-anime prefix; the SDXL
+    // comic prefix ("cell-shaded …") sends Flux portraits to anime.
+    const stylePrefix = visualStyle === 'graphic_novel_flux' ? FLUX_COMIC_STYLE : STYLE_PREFIX;
+    const positive = [stylePrefix, PORTRAIT_COMPOSITION, profile.promptBase].join(', ');
     const negative = (profile.negative && profile.negative.trim().length > 0)
       ? profile.negative
       : ANCHOR_NEGATIVE;

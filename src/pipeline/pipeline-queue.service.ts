@@ -9,6 +9,7 @@ import { TrainingService } from '../training/training.service';
 import { TTSService } from '../tts/tts.service';
 import { BgmRenderService } from '../bgm/bgm-render.service';
 import { AnchorRenderService } from '../characters/anchor-render.service';
+import { ImageValidationService } from '../validation/image-validation.service';
 import { EngineService } from './engine.service';
 
 const POLL_MS = 5_000;
@@ -45,6 +46,7 @@ export class PipelineQueueService {
     private readonly tts:      TTSService,
     private readonly bgm:      BgmRenderService,
     private readonly anchors:  AnchorRenderService,
+    private readonly validation: ImageValidationService,
     private readonly engine:   EngineService,
   ) {}
 
@@ -103,10 +105,15 @@ export class PipelineQueueService {
     const anchorActive = await (this.prisma as any).anchorRenderJob.count({
       where: { status: 'running' },
     });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0) return;
+    // Image-validation (Ollama vision) shares the single GPU slot too — it needs
+    // ComfyUI OFF, so it must never run concurrently with a ComfyUI job.
+    const validationActive = await (this.prisma as any).imageValidationJob.count({
+      where: { status: 'running' },
+    });
+    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0 || validationActive > 0) return;
 
     // ── 3. Pick oldest pending across all queues ───────────────────────────
-    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextInterp, nextTTS, nextBgm, nextAnchor] = await Promise.all([
+    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextInterp, nextTTS, nextBgm, nextAnchor, nextValidation] = await Promise.all([
       this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
       this.datasets.findNextPending(),
       this.scenes.findNextPending(),
@@ -116,9 +123,10 @@ export class PipelineQueueService {
       this.tts.findNextPending(),
       this.bgm.findNextPending(),
       this.anchors.findNextPending(),
+      this.validation.findNextPending(),
     ]);
 
-    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor'; id: string; ts: number };
+    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation'; id: string; ts: number };
     const candidates: Pick[] = [];
     if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
@@ -141,6 +149,7 @@ export class PipelineQueueService {
     if (nextTTS)      candidates.push({ type: 'tts',      id: nextTTS.id,      ts: nextTTS.queuedAt.getTime() });
     if (nextBgm)      candidates.push({ type: 'bgm',      id: nextBgm.id,      ts: nextBgm.queuedAt.getTime() });
     if (nextAnchor)   candidates.push({ type: 'anchor',   id: nextAnchor.id,   ts: nextAnchor.queuedAt.getTime() });
+    if (nextValidation) candidates.push({ type: 'validation', id: nextValidation.id, ts: nextValidation.queuedAt.getTime() });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
@@ -154,7 +163,31 @@ export class PipelineQueueService {
     else if (winner.type === 'video_interp')  await this.dispatchVideoInterp(winner.id);
     else if (winner.type === 'tts')           await this.dispatchTTS(winner.id);
     else if (winner.type === 'bgm')           await this.dispatchBgm(winner.id);
-    else                                       await this.dispatchAnchor(winner.id);
+    else if (winner.type === 'anchor')        await this.dispatchAnchor(winner.id);
+    else                                       await this.dispatchValidation(winner.id);
+  }
+
+  /**
+   * Dispatch an image-validation job. OPPOSITE arbitration to ComfyUI jobs:
+   * stop ComfyUI first so the whole GPU is free for the Ollama vision model
+   * (mirrors dispatchTraining). We mark the job `running` synchronously BEFORE
+   * firing the async scoring, so the very next tick sees the held slot and
+   * doesn't double-dispatch. The scoring self-updates the row to completed/failed.
+   */
+  private async dispatchValidation(jobId: string): Promise<void> {
+    this.logger.log(`Dispatching image validation ${jobId} — stopping ComfyUI first to free the GPU`);
+    try {
+      await this.engine.stopComfy();
+    } catch (e: any) {
+      this.logger.warn(`stopComfy failed (proceeding anyway): ${e.message}`);
+    }
+    await (this.prisma as any).imageValidationJob.update({
+      where: { id: jobId },
+      data:  { status: 'running', startedAt: new Date() },
+    });
+    void this.validation.run(jobId).catch((e) => {
+      this.logger.error(`validation run ${jobId} threw: ${e?.message ?? e}`);
+    });
   }
 
   /**
@@ -244,6 +277,9 @@ export class PipelineQueueService {
   ): Promise<boolean> {
     if (await this.engine.isComfyAlive()) return true;
     this.logger.log(`${jobType} job ${jobId} needs ComfyUI — auto-starting…`);
+    // Free the vision model's VRAM first — validation and ComfyUI can't both
+    // hold the 16 GB card. Best-effort; no-op if nothing is loaded.
+    await this.engine.unloadOllama();
     try {
       await this.engine.startComfy();
       return true;

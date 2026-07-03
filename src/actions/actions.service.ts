@@ -40,6 +40,42 @@ function hasAnchorOnDisk(absPath: string): boolean {
 }
 
 /**
+ * Every project-slug whose reference dir could hold this character's anchor PNG.
+ *
+ * A cameo character is attached to several projects (ProjectCharacter M:N join
+ * and/or the legacy Character.projectId hard-binding). Its anchor is rendered
+ * once — under its home project's slug — and re-used everywhere (see
+ * AnchorRenderService.deleteAnchor / getAnchorPath, which already iterate all
+ * attached projects). So the anchor "exists" for a profile if the PNG is present
+ * under ANY attached project's dir, not just the project currently evaluated.
+ * Checking only the current slug is what made /actions nag to re-render an
+ * anchor that already exists under the character's home project.
+ */
+function anchorSlugCandidates(
+  currentSlug: string,
+  character: {
+    project?:      { slug: string } | null;
+    projectLinks?: Array<{ project: { slug: string } }>;
+  },
+): string[] {
+  const slugs = new Set<string>([currentSlug]);
+  if (character.project?.slug) slugs.add(character.project.slug);
+  for (const l of character.projectLinks ?? []) slugs.add(l.project.slug);
+  return [...slugs];
+}
+
+/** True if `<profileCode>_anchor.png` exists under any of the candidate slugs. */
+function anchorExistsForProfile(slugs: string[], profileCode: string): boolean {
+  const root = process.env.APP_ROOT ?? 'E:\\ComfyUI\\gen-studio';
+  for (const slug of slugs) {
+    if (hasAnchorOnDisk(`${root}\\data\\${slug}\\reference\\${profileCode}_anchor.png`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Actions page — "what is waiting for the user to act on right now?"
  *
  * 8 gates across the pipeline, evaluated in linear order so each character /
@@ -175,6 +211,11 @@ export class ActionsService {
       },
       include: {
         profiles: { orderBy: { profileCode: 'asc' } },
+        // Cameo characters carry their anchor under their HOME project's slug,
+        // not this project's — pull every attached slug so the anchor probe
+        // below can look there too (mirrors AnchorRenderService.getAnchorPath).
+        project:      { select: { slug: true } },
+        projectLinks: { select: { project: { select: { slug: true } } } },
       },
       orderBy: { code: 'asc' },
     });
@@ -183,8 +224,8 @@ export class ActionsService {
       for (const profile of character.profiles) {
         // ── Cartoon path: one gate "generate_anchor" if anchor PNG missing. ──
         if (isCartoonProject) {
-          const anchorPath = `${process.env.APP_ROOT ?? 'E:\\ComfyUI\\gen-studio'}\\data\\${project.slug}\\reference\\${profile.profileCode}_anchor.png`;
-          if (!hasAnchorOnDisk(anchorPath)) {
+          const anchorSlugs = anchorSlugCandidates(project.slug, character);
+          if (!anchorExistsForProfile(anchorSlugs, profile.profileCode)) {
             // Don't queue a duplicate generate_anchor gate if a render job is
             // already pending/running for this profile.
             const inflight = await (this.prisma as any).anchorRenderJob.count({
@@ -271,7 +312,14 @@ export class ActionsService {
       where: { projectId: project.id },
       include: {
         scene:        { select: { id: true, sceneKey: true, title: true, sortOrder: true } },
-        participants: { include: { profile: { select: { id: true, profileCode: true, loraPath: true, useIpAdapter: true } } } },
+        participants: { include: { profile: { select: {
+          id: true, profileCode: true, loraPath: true, useIpAdapter: true,
+          // Anchor may live under a cameo's home project — carry every slug.
+          character: { select: {
+            project:      { select: { slug: true } },
+            projectLinks: { select: { project: { select: { slug: true } } } },
+          } },
+        } } } },
         renderJobs:   { select: { id: true, status: true, completedAt: true } },
         videoRenders: {
           select: {
@@ -279,6 +327,9 @@ export class ActionsService {
             upscaleStatus: true, interpStatus: true,
           },
         },
+        // In-flight image-validation → the LLM is still reviewing this shot's
+        // candidates; we suppress its render/approve gates until it finishes.
+        validationJobs: { select: { status: true } },
       },
       orderBy: [{ scene: { sortOrder: 'asc' } }, { shotCode: 'asc' } ],
     });
@@ -300,6 +351,14 @@ export class ActionsService {
 
       // Gate 4 — render scene. No chosenRender, no in-flight render, LoRA-ready (or not needed).
       if (!shot.chosenRender) {
+        // Suppress render/approve gates while the vision model is still reviewing
+        // this shot's candidates — it will auto-pick the best or clear + suggest a
+        // new prompt. No point asking the user to act mid-review.
+        const validationInFlight = ((shot as any).validationJobs ?? []).some(
+          (v: any) => v.status === 'pending' || v.status === 'running',
+        );
+        if (validationInFlight) continue;
+
         const renderInFlight = shot.renderJobs.some((j) => (SCENE_INFLIGHT as readonly string[]).includes(j.status));
         const hasCompletedRender = shot.renderJobs.some((j) => j.status === 'completed');
         const hasRenderedImages = Array.isArray(shot.renderedImages) && shot.renderedImages.length > 0;
@@ -398,17 +457,23 @@ export class ActionsService {
    *  offered — otherwise the render has no face to lock and hallucinates.
    *  Photoreal projects return true (they're LoRA-gated by isLoraReady). */
   private anchorsReadyForShot(
-    participants: Array<{ profile: { profileCode: string; useIpAdapter: boolean } | null }>,
+    participants: Array<{ profile: {
+      profileCode: string;
+      useIpAdapter: boolean;
+      character?: {
+        project?:      { slug: string } | null;
+        projectLinks?: Array<{ project: { slug: string } }>;
+      };
+    } | null }>,
     slug: string,
     isCartoon: boolean,
   ): boolean {
     if (!isCartoon) return true;
-    const root = process.env.APP_ROOT ?? 'E:\\ComfyUI\\gen-studio';
     for (const p of participants) {
       if (!p.profile) continue;              // text-only participant
       if (!p.profile.useIpAdapter) continue; // non-IP profile — not anchor-gated here
-      const anchorPath = `${root}\\data\\${slug}\\reference\\${p.profile.profileCode}_anchor.png`;
-      if (!hasAnchorOnDisk(anchorPath)) return false;
+      const slugs = anchorSlugCandidates(slug, p.profile.character ?? {});
+      if (!anchorExistsForProfile(slugs, p.profile.profileCode)) return false;
     }
     return true;
   }

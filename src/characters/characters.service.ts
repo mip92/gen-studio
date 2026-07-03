@@ -202,6 +202,25 @@ export class CharactersService {
     });
   }
 
+  /** Paginated library list for the infinite-scroll /characters grid. Returns
+   *  one page of characters (same row shape as listLibrary) + the total count,
+   *  so the client knows when to stop loading. */
+  async listLibraryPage(skip = 0, take = 24) {
+    const [rows, total] = await this.prisma.$transaction([
+      this.prisma.character.findMany({
+        include: {
+          profiles:     true,
+          projectLinks: { include: { project: { select: { id: true, slug: true, name: true, visualStyle: true } } } },
+        },
+        orderBy: { code: 'asc' },
+        skip,
+        take,
+      }),
+      this.prisma.character.count(),
+    ]);
+    return { rows, total };
+  }
+
   /**
    * Attach an existing character (library or already in other projects) to a
    * project. Idempotent — re-attaching is a no-op.

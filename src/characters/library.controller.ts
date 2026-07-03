@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsOptional, ValidateNested } from 'class-validator';
@@ -30,6 +30,14 @@ export class CharacterLibraryController {
   })
   create(@Body() dto: CreateLibraryCharacterBody) {
     return this.charactersService.createLibrary(dto);
+  }
+
+  @Get('page')
+  @ApiOperation({ summary: 'Paginated library list ({ rows, total }) for the infinite-scroll grid' })
+  listPage(@Query('skip') skip?: string, @Query('take') take?: string) {
+    const s = Math.max(0, parseInt(skip ?? '0', 10) || 0);
+    const t = Math.min(100, Math.max(1, parseInt(take ?? '24', 10) || 24));
+    return this.charactersService.listLibraryPage(s, t);
   }
 
   @Get(':characterId')

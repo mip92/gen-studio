@@ -134,6 +134,31 @@ export class EngineService {
     return { killed: pids };
   }
 
+  // ── Ollama (vision validation) ──────────────────────────────────────────────
+
+  /**
+   * Ask the local Ollama server to unload any resident model (keep_alive:0), so
+   * its VRAM is freed before ComfyUI cold-starts. Symmetric to stopComfy():
+   * validation stops ComfyUI, and ComfyUI startup unloads the vision model —
+   * the two GPU consumers are mutually exclusive on a 16 GB card. Best-effort:
+   * if Ollama isn't running or the call fails, we just proceed.
+   */
+  async unloadOllama(): Promise<void> {
+    const base  = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
+    const model = process.env.OLLAMA_VALIDATION_MODEL ?? 'qwen3-vl:8b';
+    try {
+      await fetch(`${base}/api/generate`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ model, keep_alive: 0 }),
+        signal:  AbortSignal.timeout(10_000),
+      });
+      this.logger.log('unloadOllama: requested model unload to free VRAM for ComfyUI');
+    } catch (e: any) {
+      this.logger.warn(`unloadOllama: ${e?.message ?? e} (proceeding)`);
+    }
+  }
+
   // ── kohya ──────────────────────────────────────────────────────────────────
 
   trackKohya(jobId: string, pid: number): void {

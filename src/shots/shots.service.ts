@@ -35,6 +35,17 @@ const SHOT_FULL_INCLUDE = {
       upscaleStatus: true, upscaledFilename: true,
     },
   },
+  // Latest image-validation verdict(s) for the render-picker UI: the vision
+  // model's per-candidate scores + issues and which filename it chose. Newest
+  // first; the UI reads validationJobs[0].
+  validationJobs: {
+    select: {
+      id: true, status: true, result: true, chosenFilename: true,
+      suggestedPrompt: true, errorMessage: true, completedAt: true,
+    },
+    orderBy: { queuedAt: 'desc' as const },
+    take: 3,
+  },
 };
 
 @Injectable()
@@ -85,6 +96,15 @@ export class ShotsService {
         },
         scene:   true,
         project: true,
+        // Latest image-validation verdict(s) for the render-picker UI.
+        validationJobs: {
+          select: {
+            id: true, status: true, result: true, chosenFilename: true,
+            errorMessage: true, completedAt: true,
+          },
+          orderBy: { queuedAt: 'desc' as const },
+          take: 3,
+        },
       },
     });
     if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);
@@ -236,6 +256,20 @@ export class ShotsService {
         renderedImages: next as object,
         chosenRender:   chosenStays ? shot.chosenRender : null,
       },
+      include: SHOT_FULL_INCLUDE,
+    });
+  }
+
+  /** Write a positive prompt into the shot's promptFields (merging, so other
+   *  fields like negative/camera survive). Used by the "approve the vision
+   *  model's suggested prompt" flow after a failed validation. */
+  async setPositivePrompt(shotId: string, positive: string) {
+    const shot = await this.findById(shotId);
+    const pf = { ...((shot.promptFields as Record<string, unknown> | null) ?? {}) };
+    pf.positive = positive;
+    return this.prisma.shot.update({
+      where: { id: shotId },
+      data:  { promptFields: pf as object },
       include: SHOT_FULL_INCLUDE,
     });
   }
