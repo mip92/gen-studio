@@ -519,7 +519,21 @@ class _RawTransition:
 KEN_BURNS_CYCLE = ['zoom_in', 'zoom_out', 'pan_left', 'pan_right', 'tilt', 'pan_up']
 
 
-def _apply_ken_burns(segment: "draft.VideoSegment", duration_us: int, preset: str) -> None:
+def _cover_scale(mat_w: int, mat_h: int, canvas_w: int, canvas_h: int) -> float:
+    """Scale (relative to fit-to-frame = 1.0) needed to COVER the canvas with the
+    material, cropping the overflow instead of letterboxing. For a 16:9 clip in a
+    9:16 canvas this is ~3.16 (fills the height, crops the sides). Computed
+    per-material so it's correct for stills of any aspect too. Returns 1.0 on bad
+    input (→ plain fit)."""
+    if not (mat_w and mat_h and canvas_w and canvas_h):
+        return 1.0
+    a_m = mat_w / mat_h
+    a_c = canvas_w / canvas_h
+    return max(a_m / a_c, a_c / a_m)
+
+
+def _apply_ken_burns(segment: "draft.VideoSegment", duration_us: int, preset: str,
+                     base: float = 1.0) -> None:
     """Animate a still-image segment with a slow Ken-Burns move.
 
     Zoom presets keyframe `uniform_scale` (the lib keeps the uniform flag on, so
@@ -527,29 +541,33 @@ def _apply_ken_burns(segment: "draft.VideoSegment", duration_us: int, preset: st
     the segment's `clip_settings` (giving margin so the edge never shows) and
     keyframe only the moving property. pyJianYingDraft only does linear
     interpolation, which over a whole shot reads as a smooth slow drift.
+
+    `base` multiplies every scale value — pass the cover scale (>1) for a vertical
+    Shorts fill so the still fills the 9:16 frame AND still Ken-Burns on top of it.
+    base=1.0 (default) is byte-identical to the old behaviour.
     """
     KP  = draft.KeyframeProperty
     end = max(1, int(duration_us))
     if preset == 'zoom_in':
-        segment.add_keyframe(KP.uniform_scale, 0,   1.0)
-        segment.add_keyframe(KP.uniform_scale, end, 1.12)
+        segment.add_keyframe(KP.uniform_scale, 0,   base * 1.0)
+        segment.add_keyframe(KP.uniform_scale, end, base * 1.12)
     elif preset == 'zoom_out':
-        segment.add_keyframe(KP.uniform_scale, 0,   1.12)
-        segment.add_keyframe(KP.uniform_scale, end, 1.0)
+        segment.add_keyframe(KP.uniform_scale, 0,   base * 1.12)
+        segment.add_keyframe(KP.uniform_scale, end, base * 1.0)
     elif preset == 'pan_left':
-        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = base * 1.12
         segment.add_keyframe(KP.position_x, 0,    0.06)
         segment.add_keyframe(KP.position_x, end, -0.06)
     elif preset == 'pan_right':
-        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = base * 1.12
         segment.add_keyframe(KP.position_x, 0,   -0.06)
         segment.add_keyframe(KP.position_x, end,  0.06)
     elif preset == 'pan_up':
-        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = base * 1.12
         segment.add_keyframe(KP.position_y, 0,   -0.06)
         segment.add_keyframe(KP.position_y, end,  0.06)
     elif preset == 'tilt':
-        segment.clip_settings.scale_x = segment.clip_settings.scale_y = 1.12
+        segment.clip_settings.scale_x = segment.clip_settings.scale_y = base * 1.12
         segment.add_keyframe(KP.rotation, 0,   -1.2)
         segment.add_keyframe(KP.rotation, end,  1.2)
 
@@ -570,6 +588,10 @@ def build_draft(manifest: dict) -> Path:
     # (or solid) backdrop instead of bare black bars. Absent → empty string →
     # no-op, so legacy 16:9 exports stay byte-identical. Values: "blur" | "color".
     background_fill = str(manifest.get("background_fill") or "").strip().lower()
+    # Vertical fit mode. "cover" = enlarge each clip to FILL the 9:16 frame and
+    # crop the overflow (content is big, no letterbox) — the default for Shorts.
+    # "" / "fit" = contain (letterbox), optionally paired with background_fill.
+    fill_mode = str(manifest.get("fill") or "").strip().lower()
 
     # `maintrack_adsorb=False` — we lay clips sequentially with explicit
     # timeranges, so we don't need JianYing's auto-snap behavior.
@@ -631,17 +653,23 @@ def build_draft(manifest: dict) -> Path:
             kind     = sh.get("kind") or "video"
             material = draft.VideoMaterial(path, material_name=sh["shotCode"])
 
+            # Vertical "cover": how much to enlarge this clip so it fills the
+            # frame and crops the overflow (1.0 = no enlarge / letterbox path).
+            cover = _cover_scale(material.width, material.height, width, height) \
+                if fill_mode == "cover" else 1.0
+
             if kind == "image":
                 # Static shot: a still PNG held for `dur`, kept alive by a slow
-                # Ken Burns move cycled across the film.
+                # Ken Burns move cycled across the film (built on top of `cover`).
                 segment = draft.VideoSegment(
                     material=material,
                     target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
                 )
                 preset = KEN_BURNS_CYCLE[static_index % len(KEN_BURNS_CYCLE)]
                 try:
-                    _apply_ken_burns(segment, dur, preset)
-                    _log(f'kenburns {sh["shotCode"]:<14} {preset}')
+                    _apply_ken_burns(segment, dur, preset, base=cover)
+                    _log(f'kenburns {sh["shotCode"]:<14} {preset}'
+                         + (f' x{cover:.2f}' if cover != 1.0 else ''))
                 except Exception as e:  # noqa: BLE001
                     _log(f'kenburns failed for {sh["shotCode"]} ({preset}): {e!r}')
                 static_index += 1
@@ -674,20 +702,26 @@ def build_draft(manifest: dict) -> Path:
                         target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
                     )
 
-            # Vertical Shorts: fill the empty canvas behind a mismatched-aspect
-            # clip. MUST run before add_segment() — that reads background_filling
-            # into the draft's canvas material list. blur=0.375 is CapCut's 2nd
-            # preset (a soft, non-distracting backdrop).
-            if background_fill == "blur":
-                try:
-                    segment.add_background_filling("blur", blur=0.375)
-                except Exception as e:  # noqa: BLE001
-                    _log(f'background_filling(blur) failed for {sh["shotCode"]}: {e!r}')
-            elif background_fill == "color":
-                try:
-                    segment.add_background_filling("color", color="#000000FF")
-                except Exception as e:  # noqa: BLE001
-                    _log(f'background_filling(color) failed for {sh["shotCode"]}: {e!r}')
+            if fill_mode == "cover":
+                # Enlarge the animated clip to fill the vertical frame, cropping
+                # the sides (stills already covered via the Ken-Burns `base`).
+                if kind != "image" and cover != 1.0:
+                    segment.clip_settings.scale_x = cover
+                    segment.clip_settings.scale_y = cover
+            else:
+                # Letterbox path: fill the empty canvas behind a mismatched-aspect
+                # clip. MUST run before add_segment() — that reads background_filling
+                # into the draft's canvas list. blur=0.375 is CapCut's 2nd preset.
+                if background_fill == "blur":
+                    try:
+                        segment.add_background_filling("blur", blur=0.375)
+                    except Exception as e:  # noqa: BLE001
+                        _log(f'background_filling(blur) failed for {sh["shotCode"]}: {e!r}')
+                elif background_fill == "color":
+                    try:
+                        segment.add_background_filling("color", color="#000000FF")
+                    except Exception as e:  # noqa: BLE001
+                        _log(f'background_filling(color) failed for {sh["shotCode"]}: {e!r}')
 
             script.add_segment(segment, track_name="main_video")
             all_video_segments.append(segment)

@@ -671,6 +671,7 @@ export class ExportsService {
     idOrSlug: string,
     body?: {
       shorts?: Array<{ slug: string; title?: string; shots: string[] }>;
+      fill?: string;
       background_fill?: string;
       width?: number;
       height?: number;
@@ -690,7 +691,9 @@ export class ExportsService {
     if (body && Array.isArray(body.shorts) && body.shorts.length > 0) {
       const plan = {
         project:         project.slug,
-        background_fill: body.background_fill ?? 'blur',
+        // "cover" = enlarge each clip to fill the 9:16 frame (crop sides).
+        fill:            body.fill ?? 'cover',
+        background_fill: body.background_fill ?? '',
         width:           body.width  ?? 1080,
         height:          body.height ?? 1920,
         fps:             body.fps    ?? 30,
