@@ -102,7 +102,7 @@ def _load_shots(cur, project_id: str):
     Mirrors the joins ExportsService uses (chosen video render + approved TTS)."""
     cur.execute(
         '''
-        SELECT sh."shotCode", sh."renderMode", sh."chosenRender", sh."chosenVideoId",
+        SELECT sh.id AS shot_id, sh."shotCode", sh."renderMode", sh."chosenRender", sh."chosenVideoId",
                vr."interpFilename", vr."interpStatus", vr.params AS vparams,
                tj."outputFilename" AS tts_file, tj.text AS tts_text,
                tj."durationMs" AS tts_ms
@@ -114,6 +114,124 @@ def _load_shots(cur, project_id: str):
         (project_id,),
     )
     return {r["shotCode"]: dict(r) for r in cur.fetchall()}
+
+
+def _load_bgm(cur, project_id: str):
+    """Load the project's BGM so shorts can carry the act's music.
+    Returns (shot_to_block, blocks_by_id) where blocks_by_id[bid] =
+    {slug, sort, segments:[{seg_id, job_id, file, dur_sec, render_sec}]} with only
+    approved+completed+on-disk segments, ordered by segment sortOrder."""
+    cur.execute(
+        'SELECT id, slug, "sortOrder" AS sort, "shotIds" AS shot_ids '
+        'FROM narrative_blocks WHERE "projectId" = %s ORDER BY "sortOrder"',
+        (project_id,),
+    )
+    blocks_by_id: dict = {}
+    shot_to_block: dict = {}
+    for b in cur.fetchall():
+        blocks_by_id[b["id"]] = {"slug": b["slug"], "sort": b["sort"], "segments": []}
+        for sid in (b["shot_ids"] or []):
+            shot_to_block[sid] = b["id"]
+
+    cur.execute(
+        '''
+        SELECT ms.id AS seg_id, ms."blockId" AS block_id, ms."sortOrder" AS sort,
+               ms."durationSec" AS dur_sec, ms."approvedJobId" AS job_id,
+               aj.status AS jstatus, aj."outputFilename" AS file, aj.params AS jparams
+        FROM music_segments ms
+        JOIN narrative_blocks nb ON nb.id = ms."blockId"
+        LEFT JOIN audio_render_jobs aj ON aj.id = ms."approvedJobId"
+        WHERE nb."projectId" = %s
+        ORDER BY ms."blockId", ms."sortOrder"
+        ''',
+        (project_id,),
+    )
+    for r in cur.fetchall():
+        blk = blocks_by_id.get(r["block_id"])
+        if not blk:
+            continue
+        if not r["job_id"] or r["jstatus"] != "completed" or not r["file"]:
+            continue  # unrendered/unapproved segment → no audio to place
+        render_sec = (r["jparams"] or {}).get("renderSec") or r["dur_sec"]
+        blk["segments"].append({
+            "seg_id":     r["seg_id"],
+            "job_id":     r["job_id"],
+            "file":       r["file"],
+            "dur_sec":    r["dur_sec"],
+            "render_sec": render_sec,
+        })
+    return shot_to_block, blocks_by_id
+
+
+def _build_short_music(shot_meta: list, blocks_by_id: dict, data_root: str,
+                       total_us: int, lane: str) -> list:
+    """Pick the act's BGM for a short (user rule): a short that sits in ONE act
+    gets that act's first two music segments (sequential); a short that straddles
+    an act SEAM gets the last segment of the first act + the first of the second,
+    switching at the act boundary. All cues share one audio lane so export_capcut
+    caps each by the next; the manifest's max_timeline_us trims the tail.
+
+    shot_meta: [{block_id, start_us}] in play order (block_id may be None)."""
+    def flac(seg):
+        p = os.path.join(data_root, "bgm", blocks_by_id[seg["_bid"]]["slug"], seg["file"])
+        return p if os.path.exists(p) else None
+
+    def cue(seg, start_us):
+        slug = blocks_by_id[seg["_bid"]]["slug"]
+        path = os.path.join(data_root, "bgm", slug, seg["file"])
+        if not os.path.exists(path):
+            _log(f"WARN bgm flac missing, skipping: {path}")
+            return None
+        return {
+            "blockSlug":          slug,
+            "act":                lane,   # single lane → cap-by-next handles order
+            "segmentId":          seg["seg_id"],
+            "jobId":              seg["job_id"],
+            "path":               path,
+            "start_us":           int(start_us),
+            "duration_us":        int(seg["dur_sec"] * 1_000_000),
+            "render_duration_us": int(seg["render_sec"] * 1_000_000),
+        }
+
+    # Distinct blocks in order of appearance (shots are in play order).
+    order = []
+    for m in shot_meta:
+        b = m["block_id"]
+        if b and b in blocks_by_id and blocks_by_id[b]["segments"] and b not in order:
+            order.append(b)
+    if not order:
+        return []
+
+    def tag(b):  # remember which block a segment came from
+        for s in blocks_by_id[b]["segments"]:
+            s["_bid"] = b
+        return blocks_by_id[b]["segments"]
+
+    cues = []
+    if len(order) == 1:
+        # Single act → first two segments, sequential from 0.
+        segs = tag(order[0])[:2]
+        cursor = 0
+        for s in segs:
+            c = cue(s, cursor)
+            if c:
+                cues.append(c)
+            cursor += int(s["render_sec"] * 1_000_000)   # next starts after this flac
+    else:
+        # Seam → last of first act + first of second act, switching at the boundary.
+        first, second = order[0], order[1]
+        boundary = next((m["start_us"] for m in shot_meta if m["block_id"] == second), 0)
+        seg_a = tag(first)[-1]
+        seg_b = tag(second)[0]
+        c = cue(seg_a, 0)
+        if c:
+            cues.append(c)
+        c = cue(seg_b, boundary)
+        if c:
+            cues.append(c)
+
+    # Drop cues that would start at/after the short's end.
+    return [c for c in cues if c["start_us"] < total_us]
 
 
 def _resolve_shot_entry(shot: dict, data_root: str) -> dict:
@@ -191,7 +309,8 @@ def _capcut_drafts_root(output_root: str) -> str:
 
 
 def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
-                         width: int, height: int, fps: int, bg: str, fill: str, ts: str) -> dict:
+                         width: int, height: int, fps: int, bg: str, fill: str, ts: str,
+                         shot_to_block: dict, blocks_by_id: dict) -> dict:
     short_slug = short["slug"]
     codes = short.get("shots") or []
     if not codes:
@@ -199,11 +318,19 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
 
     data_root = os.path.join(APP_ROOT, "data", slug)
     entries = []
+    shot_meta = []   # [{block_id, start_us}] in play order — for BGM placement
+    running = 0
     for code in codes:
         shot = shots_by_code.get(code)
         if not shot:
             sys.exit(f"short '{short_slug}': shot '{code}' not found in project '{slug}'")
-        entries.append(_resolve_shot_entry(shot, data_root))
+        entry = _resolve_shot_entry(shot, data_root)
+        shot_meta.append({"block_id": shot_to_block.get(shot.get("shot_id")), "start_us": running})
+        running += entry["duration_us"]
+        entries.append(entry)
+
+    total_us = running
+    music = _build_short_music(shot_meta, blocks_by_id, data_root, total_us, short_slug)
 
     draft_name  = f"{slug}_short_{short_slug}_{ts}"
     output_root = os.path.join(APP_ROOT, "data", slug, "exports", "shorts")
@@ -220,6 +347,9 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
         "background_fill":    bg,
         "fill":               fill,
         "transition_preset":  "default",
+        # Cap the timeline to the video length so BGM doesn't extend past the
+        # last shot (cues otherwise play their full ~140s flac).
+        "max_timeline_us": total_us,
         # One scene per short — its shots play in the plan's given order.
         "scenes": [{
             "sceneKey":  short_slug,
@@ -227,7 +357,8 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
             "narration": None,
             "shots":     entries,
         }],
-        "music_tracks": [],
+        # The act's music (first-two / seam last+first per the user rule).
+        "music_tracks": music,
     }
 
 
@@ -265,6 +396,7 @@ def main() -> int:
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     project_id, slug = _resolve_project(cur, id_or_slug)
     shots_by_code = _load_shots(cur, project_id)
+    shot_to_block, blocks_by_id = _load_bgm(cur, project_id)
     cur.close()
     conn.close()
 
@@ -272,13 +404,15 @@ def main() -> int:
     results = []
     for short in shorts:
         manifest = build_short_manifest(short, shots_by_code, slug,
-                                        width, height, fps, bg, fill, ts)
+                                        width, height, fps, bg, fill, ts,
+                                        shot_to_block, blocks_by_id)
         n_shots = len(manifest["scenes"][0]["shots"])
         total_us = sum(s["duration_us"] for s in manifest["scenes"][0]["shots"])
+        n_bgm = len(manifest["music_tracks"])
         mpath = os.path.join(manifest["output_root"], manifest["draft_name"], "manifest.json")
         with open(mpath, "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)
-        _log(f"{manifest['draft_name']}: {n_shots} shots, ~{total_us/1e6:.1f}s "
+        _log(f"{manifest['draft_name']}: {n_shots} shots, ~{total_us/1e6:.1f}s, {n_bgm} bgm cue(s) "
              f"({width}x{height}, fill={fill or bg or 'fit'})")
 
         row_base = {"slug": short["slug"], "title": short.get("title") or short["slug"]}

@@ -592,6 +592,10 @@ def build_draft(manifest: dict) -> Path:
     # crop the overflow (content is big, no letterbox) — the default for Shorts.
     # "" / "fit" = contain (letterbox), optionally paired with background_fill.
     fill_mode = str(manifest.get("fill") or "").strip().lower()
+    # Optional hard ceiling on the timeline (microseconds). Shorts set it to the
+    # total video duration so BGM cues — which otherwise play their full flac —
+    # don't extend the project past the last shot. Absent → 0 → no cap.
+    max_timeline_us = int(manifest.get("max_timeline_us") or 0)
 
     # `maintrack_adsorb=False` — we lay clips sequentially with explicit
     # timeranges, so we don't need JianYing's auto-snap behavior.
@@ -973,6 +977,11 @@ def build_draft(manifest: dict) -> Path:
                     bgm_dur = min(bgm_dur, flac_us)
             else:
                 bgm_dur = flac_us if flac_us > 0 else playback_us
+            # Shorts: never let a cue run past the (short) timeline end.
+            if max_timeline_us > 0:
+                if start_us >= max_timeline_us:
+                    continue
+                bgm_dur = min(bgm_dur, max_timeline_us - start_us)
             if bgm_dur <= 0:
                 continue
             material = draft.AudioMaterial(
