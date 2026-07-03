@@ -1,0 +1,45 @@
+{
+  "project": "announcer",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "A0_SH01",
+        "A0_SH03",
+        "A0_SH07",
+        "A0_SH10",
+        "A0_SH16",
+        "A0_SH21"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "CA_SH01",
+        "CA_SH04",
+        "CA_SH11",
+        "CA_SH12",
+        "CA_SH18",
+        "CA_SH21"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "CO_SH04",
+        "CO_SH09",
+        "CO_SH12",
+        "CO_SH13",
+        "CO_SH14",
+        "CO_SH18"
+      ]
+    }
+  ]
+}

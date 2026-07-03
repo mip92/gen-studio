@@ -1,0 +1,45 @@
+{
+  "project": "gaz",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "C_SH02",
+        "C_SH04",
+        "C_SH06",
+        "C_SH07",
+        "C_SH08",
+        "C_SH09"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A7_SH07",
+        "A7_SH10",
+        "A7_SH18",
+        "A7_SH19",
+        "A7_SH21",
+        "A7_SH22"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "CODA_SH01",
+        "CODA_SH02",
+        "CODA_SH09",
+        "CODA_SH10",
+        "CODA_SH14",
+        "CODA_SH16"
+      ]
+    }
+  ]
+}

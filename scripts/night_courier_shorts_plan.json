@@ -1,0 +1,45 @@
+{
+  "project": "night_courier",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "S01_SH01",
+        "S01_SH02",
+        "S01_SH03",
+        "S01_SH04",
+        "S01_SH05",
+        "S01_SH06"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "S04_SH01",
+        "S04_SH02",
+        "S04_SH03",
+        "S04_SH04",
+        "S04_SH05",
+        "S04_SH06"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "S05_SH01",
+        "S05_SH02",
+        "S05_SH03",
+        "S05_SH04",
+        "S05_SH05",
+        "S05_SH06"
+      ]
+    }
+  ]
+}

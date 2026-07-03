@@ -1,0 +1,45 @@
+{
+  "project": "mascot",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "M0_SH01",
+        "M0_SH05",
+        "M0_SH08",
+        "M0_SH10",
+        "M0_SZ01",
+        "M0_SZ02"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "M8_SH01",
+        "M8_SH02",
+        "M8_SH04",
+        "M8_SH05",
+        "M8_SH08",
+        "M8_SH11"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "M12_SH01",
+        "M12_SH03",
+        "M12_SH04",
+        "M12_SH05",
+        "M12_SH06",
+        "M12_SH07"
+      ]
+    }
+  ]
+}

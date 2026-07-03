@@ -1,0 +1,44 @@
+{
+  "project": "beauty",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "B_SH00",
+        "B_SH01",
+        "B_SH02",
+        "B_SH05",
+        "B_SH06",
+        "B_SH11"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "CH29_SH01",
+        "CH29_SH02",
+        "CH29_SH03",
+        "CH29_SH05",
+        "CH29_SH08",
+        "CH29_SH09"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "O_SH01",
+        "O_SH02",
+        "O_SH03",
+        "O_SH04",
+        "O_SH05"
+      ]
+    }
+  ]
+}

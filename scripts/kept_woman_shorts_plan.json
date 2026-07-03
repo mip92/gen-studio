@@ -1,0 +1,45 @@
+{
+  "project": "kept_woman",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "A0_SH01",
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH07",
+        "A0_SH14"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A7_SH01",
+        "A7_SH02",
+        "A7_SH03",
+        "A7_SH17",
+        "A7_SH18",
+        "A7_SH24"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "A11_SH01",
+        "A11_SH02",
+        "A11_SH03",
+        "A11_SH04",
+        "A11_SH07",
+        "A11_SH12"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "project": "fortune",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "F0_SH01",
+        "F0_SH02",
+        "F0_SH06",
+        "F0_SH08",
+        "F0_SH10",
+        "F0_SZ01"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "F10_SH01",
+        "F10_SH02",
+        "F10_SH04",
+        "F10_SH06",
+        "F10_SH07",
+        "F10_SH12"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "F12_SH01",
+        "F12_SH03",
+        "F12_SH05",
+        "F12_SH06",
+        "F12_SH08",
+        "F12_SH16"
+      ]
+    }
+  ]
+}

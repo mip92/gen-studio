@@ -1,0 +1,44 @@
+{
+  "project": "wall",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "B_SH01",
+        "B_SH02",
+        "B_SH03",
+        "B_SH04",
+        "B_SH08",
+        "B_SH12"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "CH37_SH01",
+        "CH37_SH02",
+        "CH37_SH03",
+        "CH37_SH05",
+        "CH37_SH08",
+        "CH37_SH10"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "O_SH01",
+        "O_SH02",
+        "O_SH03",
+        "O_SH04",
+        "O_SH05"
+      ]
+    }
+  ]
+}

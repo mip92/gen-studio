@@ -1,0 +1,45 @@
+{
+  "project": "cat_lady",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "C_SH01",
+        "C_SH02",
+        "C_SH03",
+        "C_SH04",
+        "C_SH05",
+        "C_SH08"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A6_SH09",
+        "A6_SH11",
+        "A6_SH16",
+        "A6_SH20",
+        "A6_SH26",
+        "A6_SH33"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "F_SH06",
+        "F_SH08",
+        "F_SH12",
+        "F_SH18",
+        "F_SH25",
+        "F_SH29"
+      ]
+    }
+  ]
+}

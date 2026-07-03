@@ -1,0 +1,45 @@
+{
+  "project": "cloakroom",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "M0_SH01",
+        "M0_SH02",
+        "M0_SH05",
+        "M0_SH08",
+        "M0_SH16",
+        "M0_SH21"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A1_SH06",
+        "A1_SH08",
+        "A1_SH15",
+        "A1_SH17",
+        "A1_SH26",
+        "A1_SH31"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "CO_SH01",
+        "CO_SH04",
+        "CO_SH12",
+        "CO_SH13",
+        "CO_SH14",
+        "CO_SH18"
+      ]
+    }
+  ]
+}

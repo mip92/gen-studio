@@ -1,0 +1,45 @@
+{
+  "project": "divorce",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "A0_SH01",
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH08"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A6_SH01",
+        "A6_SH02",
+        "A6_SH03",
+        "A6_SH04",
+        "A6_SH20",
+        "A6_SH22"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "A7_SH01",
+        "A7_SH02",
+        "A7_SH03",
+        "A7_SH10",
+        "A7_SH11",
+        "A7_SH14"
+      ]
+    }
+  ]
+}

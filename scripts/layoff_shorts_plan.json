@@ -1,0 +1,45 @@
+{
+  "project": "layoff",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "A0_SH01",
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH08"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A5_SH01",
+        "A5_SH10",
+        "A5_SH15",
+        "A5_SH18",
+        "A5_SH21",
+        "A5_SH22"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "A7_SH01",
+        "A7_SH02",
+        "A7_SH03",
+        "A7_SH04",
+        "A7_SH10",
+        "A7_SH14"
+      ]
+    }
+  ]
+}

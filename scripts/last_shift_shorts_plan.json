@@ -1,0 +1,45 @@
+{
+  "project": "last_shift",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "A1_SH01",
+        "A1_SH02",
+        "A1_SH03",
+        "A1_SH04",
+        "A1_SH14",
+        "A1_SH22"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A7_SH01",
+        "A7_SH02",
+        "A7_SH20",
+        "A7_SH22",
+        "A7_SH25",
+        "A7_SH35"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "A8_SH01",
+        "A8_SH07",
+        "A8_SH14",
+        "A8_SH15",
+        "A8_SH23",
+        "A8_SH26A"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "project": "honeywagon",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "C_SH01",
+        "C_SH02",
+        "C_SH03",
+        "C_SH04",
+        "C_SH07",
+        "C_SH12"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A5_SH01",
+        "A5_SH02",
+        "A5_SH03",
+        "A5_SH04",
+        "A5_SH09",
+        "A5_SH15"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "F_SH01",
+        "F_SH02",
+        "F_SH03",
+        "F_SH04",
+        "F_SH04B",
+        "F_SH08"
+      ]
+    }
+  ]
+}

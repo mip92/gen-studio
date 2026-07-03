@@ -1,0 +1,45 @@
+{
+  "project": "webcam",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "A0_SH01",
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH14"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A1_SH01",
+        "A1_SH02",
+        "A1_SH03",
+        "A1_SH04",
+        "A1_SH16",
+        "A1_SH24"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "A11_SH01",
+        "A11_SH02",
+        "A11_SH03",
+        "A11_SH04",
+        "A11_SH06",
+        "A11_SH14"
+      ]
+    }
+  ]
+}

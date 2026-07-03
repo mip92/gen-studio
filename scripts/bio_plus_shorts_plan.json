@@ -1,0 +1,45 @@
+{
+  "project": "bio_plus",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "shots": [
+        "C_SH00",
+        "C_SH01",
+        "C_SH02",
+        "C_SH03",
+        "C_SH11",
+        "C_SH12"
+      ]
+    },
+    {
+      "slug": "mid",
+      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
+      "shots": [
+        "A7_SH01",
+        "A7_SH04",
+        "A7_SH06",
+        "A7_SH12",
+        "A7_SH16",
+        "A7_SH22"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "shots": [
+        "CD_SH00",
+        "CD_SH01",
+        "CD_SH04",
+        "CD_SH08",
+        "CD_SH09",
+        "CD_SH10"
+      ]
+    }
+  ]
+}
