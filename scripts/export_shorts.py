@@ -230,6 +230,8 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--plan", required=True, help="path to the shorts plan json")
+    ap.add_argument("--out", help="write the result json ({project,shorts:[...]}) to this "
+                                  "path (the backend reads it instead of parsing stdout)")
     ap.add_argument("--dry-run", action="store_true",
                     help="write manifests but do not spawn the CapCut exporter")
     args = ap.parse_args()
@@ -272,8 +274,9 @@ def main() -> int:
         _log(f"{manifest['draft_name']}: {n_shots} shots, ~{total_us/1e6:.1f}s "
              f"({width}x{height}, fill={bg or 'none'})")
 
+        row_base = {"slug": short["slug"], "title": short.get("title") or short["slug"]}
         if args.dry_run:
-            results.append({"draft_name": manifest["draft_name"], "manifest": mpath,
+            results.append({**row_base, "draft_name": manifest["draft_name"], "manifest": mpath,
                             "shots": n_shots, "seconds": round(total_us / 1e6, 1)})
             continue
 
@@ -288,10 +291,14 @@ def main() -> int:
             sys.exit(1)
         draft_path = os.path.join(manifest["capcut_drafts_root"], manifest["draft_name"])
         _log(f"  -> draft ready: {draft_path}")
-        results.append({"draft_name": manifest["draft_name"], "draft_path": draft_path,
+        results.append({**row_base, "draft_name": manifest["draft_name"], "draft_path": draft_path,
                         "shots": n_shots, "seconds": round(total_us / 1e6, 1)})
 
-    print(json.dumps({"project": slug, "shorts": results}, ensure_ascii=False, indent=2))
+    out_obj = {"project": slug, "shorts": results}
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(out_obj, f, ensure_ascii=False, indent=2)
+    print(json.dumps(out_obj, ensure_ascii=False, indent=2))
     return 0
 
 

@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { spawn } from 'child_process';
-import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -9,6 +9,19 @@ const KOHYA_DIR  = process.env.KOHYA_DIR  ?? 'E:\\kohya_ss';
 const PYTHON_BIN = process.env.EXPORT_PYTHON ?? process.env.PYTHON_BIN
                  ?? path.join(KOHYA_DIR, 'venv', 'Scripts', 'python.exe');
 const EXPORT_SCRIPT = path.join(APP_ROOT, 'scripts', 'export_capcut.py');
+
+// ── YouTube-Shorts export ───────────────────────────────────────────────────
+// The shorts builder (scripts/export_shorts.py) reads the DB directly via
+// psycopg2, so it needs a python that HAS psycopg2 — the backend's pyJianYingDraft
+// python (PYTHON_BIN, kohya venv) does NOT. Default to the system `python`
+// (Python312 on PATH has psycopg2); export_shorts.py in turn re-spawns
+// export_capcut.py with EXPORT_PYTHON. Override with SHORTS_PYTHON if needed.
+const SHORTS_SCRIPT = path.join(APP_ROOT, 'scripts', 'export_shorts.py');
+const SHORTS_PYTHON = process.env.SHORTS_PYTHON ?? 'python';
+/** Curated per-project shorts plan lives here (versioned in git). The endpoint
+ *  reads it when no plan is POSTed in the request body. */
+const shortsPlanPath = (slug: string) =>
+  path.join(APP_ROOT, 'scripts', `${slug}_shorts_plan.json`);
 
 /** Stable export resolution. CapCut accepts arbitrary sizes; 1080p is what
  *  our FHD upscale produces, so matching it avoids per-clip rescale on import. */
@@ -612,6 +625,111 @@ export class ExportsService {
       music_tracks:       musicTracks,
       transition_preset:  transitionPreset,
     };
+  }
+
+  // ── YouTube-Shorts export ─────────────────────────────────────────────────
+
+  /**
+   * Read the project's curated shorts plan (scripts/<slug>_shorts_plan.json) so
+   * the UI can show what's planned and enable/disable the button. Never throws
+   * for a missing/invalid plan — returns hasPlan:false.
+   */
+  async getShortsPlan(idOrSlug: string): Promise<{
+    hasPlan: boolean;
+    shorts:  Array<{ slug: string; title: string; shots: number }>;
+  }> {
+    const project  = await this.findProject(idOrSlug);
+    const planPath = shortsPlanPath(project.slug);
+    if (!existsSync(planPath)) return { hasPlan: false, shorts: [] };
+    try {
+      const plan = JSON.parse(readFileSync(planPath, 'utf-8')) as {
+        shorts?: Array<{ slug: string; title?: string; shots?: string[] }>;
+      };
+      const shorts = (plan.shorts ?? []).map((s) => ({
+        slug:  s.slug,
+        title: s.title ?? s.slug,
+        shots: (s.shots ?? []).length,
+      }));
+      return { hasPlan: shorts.length > 0, shorts };
+    } catch (e) {
+      this.logger.warn(`shorts plan for ${project.slug} unreadable: ${String(e)}`);
+      return { hasPlan: false, shorts: [] };
+    }
+  }
+
+  /**
+   * Build the project's YouTube Shorts — vertical 9:16 CapCut drafts, one per
+   * short — from a hand-picked subset of already-rendered shots. Spawns
+   * scripts/export_shorts.py, which resolves media from the DB and drives the
+   * same export_capcut.py machinery as the full film (with a blurred canvas
+   * fill so a 16:9 clip sits centered in the 9:16 frame).
+   *
+   * Plan source: the request body when it carries `shorts` (the future LLM
+   * curator posts one), otherwise the versioned scripts/<slug>_shorts_plan.json.
+   */
+  async exportShorts(
+    idOrSlug: string,
+    body?: {
+      shorts?: Array<{ slug: string; title?: string; shots: string[] }>;
+      background_fill?: string;
+      width?: number;
+      height?: number;
+      fps?: number;
+    },
+  ): Promise<{
+    shorts: Array<{ slug?: string; title?: string; draft_name: string; draft_path?: string; shots: number; seconds: number }>;
+  }> {
+    const project = await this.findProject(idOrSlug);
+    if (!existsSync(SHORTS_SCRIPT)) {
+      throw new BadRequestException(`export_shorts.py missing: ${SHORTS_SCRIPT}`);
+    }
+
+    // Resolve the plan file to feed the script: POSTed body wins, else the
+    // versioned per-project plan.
+    let planPath: string;
+    if (body && Array.isArray(body.shorts) && body.shorts.length > 0) {
+      const plan = {
+        project:         project.slug,
+        background_fill: body.background_fill ?? 'blur',
+        width:           body.width  ?? 1080,
+        height:          body.height ?? 1920,
+        fps:             body.fps    ?? 30,
+        shorts:          body.shorts,
+      };
+      const dir = path.join(APP_ROOT, 'data', project.slug, 'exports');
+      mkdirSync(dir, { recursive: true });
+      planPath = path.join(dir, 'shorts_plan_request.json');
+      writeFileSync(planPath, JSON.stringify(plan, null, 2), 'utf-8');
+    } else {
+      planPath = shortsPlanPath(project.slug);
+      if (!existsSync(planPath)) {
+        throw new BadRequestException(
+          `No shorts plan for ${project.slug}. Create scripts/${project.slug}_shorts_plan.json `
+          + `(which shots go into each short) or POST a plan body.`,
+        );
+      }
+    }
+
+    // The script writes its result json to --out so we don't parse stdout.
+    const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports');
+    mkdirSync(outDir, { recursive: true });
+    const outPath = path.join(outDir, 'shorts_result.json');
+
+    this.logger.log(`Spawning shorts exporter for ${project.slug} (plan ${path.basename(planPath)})`);
+    const { code, stderr } = await runPython(SHORTS_PYTHON, [
+      '-X', 'utf8', SHORTS_SCRIPT, '--plan', planPath, '--out', outPath,
+    ]);
+    if (code !== 0) {
+      throw new BadRequestException(`export_shorts.py exited ${code}: ${stderr.trim().slice(-800)}`);
+    }
+    if (!existsSync(outPath)) {
+      throw new BadRequestException(`shorts exporter finished but wrote no result at ${outPath}`);
+    }
+    const result = JSON.parse(readFileSync(outPath, 'utf-8')) as {
+      shorts?: Array<{ slug?: string; title?: string; draft_name: string; draft_path?: string; shots: number; seconds: number }>;
+    };
+    this.logger.log(`shorts export for ${project.slug}: ${result.shorts?.length ?? 0} draft(s)`);
+    return { shorts: result.shorts ?? [] };
   }
 }
 
