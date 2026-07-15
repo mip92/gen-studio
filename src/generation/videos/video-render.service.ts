@@ -29,9 +29,14 @@ const WORKFLOW_FILENAME = 'video_wan22_i2v_api.json';
 // speed LoRA, 20 steps @ cfg=4.0 → the negative prompt actually fires. ~5×
 // slower than the fast 4-step default. Selected via StartVideoInput.mode='cfg'.
 const CFG_WORKFLOW_FILENAME = 'video_wan22_i2v_cfg_api.json';
+// lightx2v full-distill fp8 checkpoints (Oct-2025 gen): distillation baked into
+// the model weights instead of applied as a rank-64 LoRA. Same 4 steps / cfg=1
+// / render time as the fast default, slightly higher quality ceiling.
+// Selected via StartVideoInput.mode='distill'.
+const DISTILL_WORKFLOW_FILENAME = 'video_wan22_i2v_distill_api.json';
 // Allowlist of i2v workflow files the service is permitted to load — guards
 // loadTemplate against a row carrying an unexpected workflowFilename value.
-const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME]);
+const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME, DISTILL_WORKFLOW_FILENAME]);
 const UPSCALE_WORKFLOW_FILENAME = 'video_upscale_4x_api.json';
 // FPS interpolation (RIFE/FILM → 2× framerate). Mandatory final step, runs on
 // the FHD-upscaled clip. The model file (e.g. rife47.pth) must live in
@@ -320,6 +325,8 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   /**
    * Resolve the i2v workflow file — a BINARY, explicit per-shot choice:
    *   'cfg'        → cfg workflow (20 steps, cfg=4, negative fires) = «качество».
+   *   'distill'    → full-distill fp8 checkpoints, 4 steps / cfg=1 — same speed
+   *                  as fast, distill baked into weights (no LoRA approximation).
    *   else / fast  → fast workflow (4-step lightx2v, cfg=1, negative ignored)
    *                  = «быстро», the DEFAULT.
    * cfg is ~5× slower, so it is ONLY ever used when the user explicitly picks it
@@ -328,8 +335,10 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
    * has a baked motionNegative). Engine family (Wan/Flux/SDXL) is decided once
    * per project via project.visualStyle, not here.
    */
-  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | undefined): string {
-    return mode === 'cfg' ? CFG_WORKFLOW_FILENAME : WORKFLOW_FILENAME;
+  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | 'distill' | undefined): string {
+    if (mode === 'cfg')     return CFG_WORKFLOW_FILENAME;
+    if (mode === 'distill') return DISTILL_WORKFLOW_FILENAME;
+    return WORKFLOW_FILENAME;
   }
 
   private loadTemplate(projectSlug: string, workflowFilename?: string | null): Record<string, any> {

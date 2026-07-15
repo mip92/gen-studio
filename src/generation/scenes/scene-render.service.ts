@@ -53,6 +53,10 @@ export interface RenderShotInput {
    *  Default false: renders ACCUMULATE so the "+ ещё 5 вариантов" button adds
    *  to the candidate pool instead of replacing it. */
   replace?:        boolean;
+  /** If true, auto-enqueue an image-validation pass (vision QC) after this
+   *  batch is harvested. Default false — validation is strictly opt-in via the
+   *  checkbox next to the render buttons (user 2026-07-04: no auto-validation). */
+  validate?:       boolean;
 }
 
 export interface RenderResult {
@@ -122,7 +126,7 @@ export class SceneRenderService {
    * anything. Skips shots that already have renders (awaiting approval), are
    * approved (chosenRender set), or already have a pending/running job.
    */
-  async enqueuePendingForProject(projectOrSlug: string) {
+  async enqueuePendingForProject(projectOrSlug: string, opts?: { validate?: boolean }) {
     const project = await this.prisma.project.findFirst({
       where:  { OR: [{ id: projectOrSlug }, { slug: projectOrSlug }] },
       select: { id: true },
@@ -144,7 +148,11 @@ export class SceneRenderService {
     `;
     if (eligible.length === 0) return { enqueued: 0 };
     await this.prisma.sceneRenderJob.createMany({
-      data: eligible.map((e) => ({ shotId: e.id, status: 'pending', params: {} as any })),
+      data: eligible.map((e) => ({
+        shotId: e.id,
+        status: 'pending',
+        params: (opts?.validate === true ? { validate: true } : {}) as any,
+      })),
     });
     return { enqueued: eligible.length };
   }
@@ -248,12 +256,14 @@ export class SceneRenderService {
         // renumber filenames on collision, so we record the post-move names.
         const finalFilenames = await this.moveOutputsToShotDir(j.shotId, filenames);
         await this.appendShotRenders(j.shotId, finalFilenames, j.comfyPromptId);
-        // Auto-queue an image-validation pass so the vision model picks the best
-        // of the shot's candidates against what the frame was asked to depict.
-        // No-op when there are <2 candidates or one is already queued/running.
-        const resolvedPositive = ((j.params ?? {}) as any)?._resolvedPositive ?? null;
-        await this.validation.enqueue(j.shotId, resolvedPositive).catch((e: any) =>
-          this.logger.warn(`validation enqueue for shot ${j.shotId} failed: ${e?.message ?? e}`));
+        // Vision QC is OPT-IN: only when the render was enqueued with
+        // `validate: true` (the checkbox next to the render buttons). No
+        // unconditional auto-validation (user 2026-07-04).
+        if (((j.params ?? {}) as any)?.validate === true) {
+          const resolvedPositive = ((j.params ?? {}) as any)?._resolvedPositive ?? null;
+          await this.validation.enqueue(j.shotId, resolvedPositive).catch((e: any) =>
+            this.logger.warn(`validation enqueue for shot ${j.shotId} failed: ${e?.message ?? e}`));
+        }
       }
       await this.prisma.sceneRenderJob.update({
         where: { id: j.id },
@@ -460,8 +470,6 @@ export class SceneRenderService {
       where:   { id: input.shotId },
       include: {
         project:      true,
-        // Scene carries the canonical act-level lightingMood / palette / time-of-day
-        // defaults used as fallback when the shot's promptFields don't override them.
         scene:        true,
         participants: {
           include: {
@@ -576,38 +584,17 @@ export class SceneRenderService {
 
     // ── 4. Build params ──────────────────────────────────────────────────────
     const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
-    // If the user wrote `pf.positive` themselves it's canonical — don't touch.
-    // Otherwise concat the structured fields and prepend a framing directive
-    // translated from `pf.camera.framing`. The directive carries explicit
-    // composition language (rule of thirds, shot size, environment visibility)
-    // so SDXL doesn't default to face-fills-frame.
-    // Lighting fallback: per-shot override beats the act-level canonical value
-    // (`Scene.lightingMood`). One edit in `Scene.lightingMood` shifts every
-    // shot in that act that hasn't explicitly overridden it.
-    const shotLighting   = pf.lightingMood as string | undefined;
-    const sceneLighting  = shot.scene?.lightingMood ?? null;
-    const effectiveLight = (shotLighting && shotLighting.trim().length > 0)
-      ? shotLighting
-      : sceneLighting;
-
+    // `pf.positive` is canonical — every shot carries a hand-written positive
+    // (VO↔image strict match). The old empty-positive composer that assembled
+    // structured fields (frameDescription / positiveEnvironment / camera.framing
+    // / lightingMood) was dead code — 0 of 7464 shots used it — removed 2026-07-04.
     const userPositive = pf.positive as string | undefined;
-    let positive: string;
-    if (userPositive && userPositive.trim().length > 0) {
-      positive = userPositive;
-    } else {
-      // Composition mode — used when the shot has no baked positive yet (new
-      // shots or freshly cleared). Pull the act-level lighting as the lighting
-      // fragment so a new shot doesn't have to repeat tokens already written
-      // once at the scene level.
-      const camera = pf.camera as { framing?: string } | undefined;
-      const framingDirective = framingPromptFor(camera?.framing);
-      const parts: string[] = [];
-      if (framingDirective) parts.push(framingDirective);
-      for (const f of [pf.narrativeBeat, pf.frameDescription, pf.positiveEnvironment, pf.positiveCharacterLocks, effectiveLight]) {
-        if (typeof f === 'string' && f.trim().length > 0) parts.push(f);
-      }
-      positive = parts.join(', ');
+    if (!userPositive || userPositive.trim().length === 0) {
+      throw new BadRequestException(
+        `Shot ${shot.shotCode} has no promptFields.positive — write the positive prompt before rendering`,
+      );
     }
+    let positive: string = userPositive;
 
     // Location injection: APPEND the Location.description to the end of the
     // positive. Order matters for CLIP-G conditioning — tokens nearest the
@@ -817,59 +804,6 @@ export function resolveVisualStyle(
 export function normalizeFluxBase(settings: unknown): string | null {
   const s = (settings as { fluxBaseModel?: unknown } | null | undefined)?.fluxBaseModel;
   return typeof s === 'string' && s.trim().length > 0 ? s.trim() : null;
-}
-
-/**
- * Translate `shot.promptFields.camera.framing` into explicit composition
- * language SDXL responds to. Keys match what the UI lets the user pick.
- * Unknown / missing values get a sensible "balanced framing" default rather
- * than nothing, so face-fills-frame is never the implicit default.
- */
-function framingPromptFor(framing: string | undefined | null): string {
-  switch ((framing ?? '').toLowerCase()) {
-    case 'extreme_wide':
-    case 'establishing':
-      return 'extreme wide establishing shot, subject occupies one-tenth of the frame, environment dominates, rule of thirds composition';
-    case 'wide':
-      return 'wide shot, full body visible, subject framed at left third, environment fully visible behind, rule of thirds composition';
-    case 'medium_or_wide':
-    case 'medium-wide':
-      return 'medium-wide shot, subject from waist up, environment fully visible behind, subject offset to one third following rule of thirds';
-    case 'medium':
-      return 'medium shot, subject from chest up, environment partially visible behind, balanced rule of thirds composition';
-    case 'medium_close':
-    case 'medium-close':
-      return 'medium close-up, subject head and shoulders, soft environment behind subject, rule of thirds composition';
-    case 'close-up':
-    case 'closeup':
-      return 'close-up shot, subject head and shoulders, shallow depth of field, environment softly blurred behind';
-    case 'tight_close_up':
-    case 'tight-close-up':
-      return 'tight close-up, head fills the upper-third of frame, shallow depth of field';
-    case 'extreme_close_up':
-    case 'extreme-close-up':
-      return 'extreme close-up macro detail, single feature dominates the frame';
-    case 'pov':
-    case 'first_person':
-      return 'first-person POV from subject perspective, no subject visible, looking forward at the scene, immersive environment-only composition';
-    case 'over_shoulder':
-    case 'over-shoulder':
-      return 'over-the-shoulder shot, back of subject in immediate foreground out of focus, environment in focus beyond';
-    case 'low_angle':
-      return 'low-angle shot, camera below eye level looking up, subject from chest up, sky or ceiling above';
-    case 'high_angle':
-      return 'high-angle shot, camera above looking down, subject from above with floor / ground visible, rule of thirds composition';
-    case 'aerial':
-    case 'birds_eye':
-      return 'aerial top-down shot, environment dominates, subject very small, rule of thirds composition';
-    case '':
-    case undefined as any:
-    case null as any:
-      // No explicit framing — use a balanced default that AVOIDS face-fills-frame.
-      return 'medium-wide shot, subject from waist up at the right third, environment fully visible behind, rule of thirds composition';
-    default:
-      return 'medium-wide shot, environment visible, rule of thirds composition';
-  }
 }
 
 /**

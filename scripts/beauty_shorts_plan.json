@@ -4,10 +4,11 @@
   "width": 1080,
   "height": 1920,
   "fps": 30,
+  "_note": "2 teaser reels: hook = opening scene, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots (chosenVideoId), at most one static per short.",
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "ОНА ЗАПРЕТИЛА СЕБЕ УЛЫБАТЬСЯ 💉",
       "shots": [
         "B_SH00",
         "B_SH01",
@@ -18,26 +19,15 @@
       ]
     },
     {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "CH29_SH01",
-        "CH29_SH02",
-        "CH29_SH03",
-        "CH29_SH05",
-        "CH29_SH08",
-        "CH29_SH09"
-      ]
-    },
-    {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "В ДОЛГАХ РАДИ ЧУЖОГО ЛИЦА 💉",
       "shots": [
-        "O_SH01",
-        "O_SH02",
-        "O_SH03",
-        "O_SH04",
-        "O_SH05"
+        "CH17_SH10",
+        "CH18_SH07",
+        "CH18_SH10",
+        "CH19_SH10",
+        "CH22_SH09",
+        "CH25_SH05"
       ]
     }
   ]

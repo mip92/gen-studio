@@ -7,39 +7,28 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "АКТЁР БЕЗ ГОЛОСА. ЗАЛ БЕЗ ЛЮДЕЙ 🎭",
       "shots": [
-        "M0_SH01",
         "M0_SH02",
-        "M0_SH05",
-        "M0_SH08",
-        "M0_SH16",
-        "M0_SH21"
-      ]
-    },
-    {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "A1_SH06",
-        "A1_SH08",
-        "A1_SH15",
-        "A1_SH17",
-        "A1_SH26",
-        "A1_SH31"
+        "M0_SH03",
+        "M0_SH04",
+        "M0_SH06",
+        "M0_SH07",
+        "M0_SH09"
       ]
     },
     {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "ОН НАДЕЛ ЧУЖУЮ ЖИЗНЬ 🎭",
       "shots": [
-        "CO_SH01",
-        "CO_SH04",
-        "CO_SH12",
-        "CO_SH13",
-        "CO_SH14",
-        "CO_SH18"
+        "A1_SH42",
+        "A1_SH44",
+        "A1_SH45",
+        "A1_SH46",
+        "A1_SH48",
+        "A1_SH49"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

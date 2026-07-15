@@ -6,9 +6,10 @@ import { ProfilesController } from './profiles.controller';
 import { AnchorRenderService } from './anchor-render.service';
 import { ComfyModule } from '../comfy/comfy.module';
 import { TrainingModule } from '../training/training.module';
+import { ValidationModule } from '../validation/validation.module';
 
 @Module({
-  imports:     [TrainingModule, ComfyModule],
+  imports:     [TrainingModule, ComfyModule, ValidationModule],
   controllers: [CharactersController, CharacterLibraryController, ProfilesController],
   providers:   [CharactersService, AnchorRenderService],
   exports:     [CharactersService, AnchorRenderService],

@@ -9,12 +9,14 @@ export interface YoutubeMain {
 }
 /** Packaging for one short. Two descriptions: `descBefore` for while the main
  *  video isn't published yet (teaser, "полная версия скоро"), `descAfter` for
- *  after it's up — the UI substitutes the main-video link into `{{main_url}}`. */
+ *  after it's up — the UI substitutes the main-video link into `{{main_url}}`.
+ *  `url` is the short's own published YouTube link (empty until posted). */
 export interface YoutubeShort {
   title:      string;
   descBefore: string;
   descAfter:  string;
   tags:       string[];
+  url:        string;
 }
 export interface YoutubePackage {
   youtubeUrl: string | null;
@@ -23,7 +25,7 @@ export interface YoutubePackage {
 }
 
 const EMPTY_MAIN:  YoutubeMain  = { title: '', description: '', tags: [] };
-const emptyShort = (): YoutubeShort => ({ title: '', descBefore: '', descAfter: '', tags: [] });
+const emptyShort = (): YoutubeShort => ({ title: '', descBefore: '', descAfter: '', tags: [], url: '' });
 
 /**
  * YouTube publishing metadata (title / description(s) / tags) for a project's

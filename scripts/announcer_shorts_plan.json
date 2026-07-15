@@ -7,39 +7,28 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "40 ЛЕТ ГОЛОС БЕЗ ЛИЦА 🎙️",
       "shots": [
-        "A0_SH01",
-        "A0_SH03",
+        "A0_SH02",
+        "A0_SH04",
+        "A0_SH06",
         "A0_SH07",
-        "A0_SH10",
-        "A0_SH16",
-        "A0_SH21"
-      ]
-    },
-    {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "CA_SH01",
-        "CA_SH04",
-        "CA_SH11",
-        "CA_SH12",
-        "CA_SH18",
-        "CA_SH21"
+        "A0_SH08"
       ]
     },
     {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "ТВОЙ ГОЛОС УЖЕ ЗАМЕНЯЮТ 💔",
       "shots": [
-        "CO_SH04",
-        "CO_SH09",
-        "CO_SH12",
-        "CO_SH13",
-        "CO_SH14",
-        "CO_SH18"
+        "GE_SH28",
+        "GE_SH29",
+        "GE_SH34",
+        "GE_SH35",
+        "GE_SH36",
+        "GE_SH37",
+        "GE_SH38"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

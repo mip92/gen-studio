@@ -7,39 +7,30 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "В ДВЕРЬ СТУЧАТ. В ДОМЕ 23 КОШКИ 🐾",
       "shots": [
-        "C_SH01",
-        "C_SH02",
         "C_SH03",
-        "C_SH04",
+        "C_SH06",
         "C_SH05",
-        "C_SH08"
-      ]
-    },
-    {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "A6_SH09",
-        "A6_SH11",
-        "A6_SH16",
-        "A6_SH20",
-        "A6_SH26",
-        "A6_SH33"
+        "C_SH07",
+        "C_SH08",
+        "C_SH11",
+        "C_SH14"
       ]
     },
     {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "ПЕРВАЯ ПОТЕРЯ. НЕ ПОСЛЕДНЯЯ 💔",
       "shots": [
-        "F_SH06",
-        "F_SH08",
-        "F_SH12",
-        "F_SH18",
-        "F_SH25",
-        "F_SH29"
+        "A1_SH08",
+        "A1_SH10",
+        "A1_SH15",
+        "A1_SH17",
+        "A1_SH21",
+        "A1_SH23",
+        "A1_SH24"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

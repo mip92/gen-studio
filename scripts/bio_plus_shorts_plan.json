@@ -7,39 +7,32 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "КВАРТИРА МАТЕРИ ЗА 142 000 😨",
       "shots": [
-        "C_SH00",
         "C_SH01",
         "C_SH02",
         "C_SH03",
+        "C_SH06",
+        "C_SH09",
+        "C_SH10",
         "C_SH11",
         "C_SH12"
       ]
     },
     {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "A7_SH01",
-        "A7_SH04",
-        "A7_SH06",
-        "A7_SH12",
-        "A7_SH16",
-        "A7_SH22"
-      ]
-    },
-    {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "У ТЕБЯ ЖЕ ЕСТЬ КВАРТИРА МАТЕРИ… 😨",
       "shots": [
-        "CD_SH00",
-        "CD_SH01",
-        "CD_SH04",
-        "CD_SH08",
-        "CD_SH09",
-        "CD_SH10"
+        "A5_SH15",
+        "A5_SH16",
+        "A5_SH17",
+        "A5_SH18",
+        "A5_SH19",
+        "A5_SH22",
+        "A5_SH23",
+        "A5_SH25"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

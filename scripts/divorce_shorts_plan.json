@@ -7,39 +7,28 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "12 ЛЕТ. НИ СКАНДАЛА, НИ ИЗМЕНЫ 💔",
       "shots": [
         "A0_SH01",
         "A0_SH02",
         "A0_SH03",
         "A0_SH04",
         "A0_SH05",
-        "A0_SH08"
-      ]
-    },
-    {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "A6_SH01",
-        "A6_SH02",
-        "A6_SH03",
-        "A6_SH04",
-        "A6_SH20",
-        "A6_SH22"
+        "A0_SH06"
       ]
     },
     {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "ОДНО КАСАНИЕ МОГЛО ВСЁ СПАСТИ 💔",
       "shots": [
-        "A7_SH01",
-        "A7_SH02",
-        "A7_SH03",
-        "A7_SH10",
-        "A7_SH11",
-        "A7_SH14"
+        "A4_SH08",
+        "A4_SH09",
+        "A4_SH11",
+        "A4_SH12",
+        "A4_SH13",
+        "A4_SH15"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

@@ -76,6 +76,12 @@ DB = dict(
 # Vertical Shorts default canvas.
 DEF_WIDTH, DEF_HEIGHT, DEF_FPS = 1080, 1920, 30
 
+# Full-length channel badge in the upper-right corner of every short — tells
+# the viewer the full film is already on the channel. Rendered by
+# export_capcut.py (_inject_text_overlay) with the style/placement the user
+# set by hand once. Per-plan override: "overlay_text": "..." ("" disables).
+DEF_OVERLAY_TEXT = "видео\nуже на\nканале"
+
 # Narration-timing constants — identical to ExportsService.buildManifest.
 TAIL_US     = 500_000      # breathing pause held after the VO line ends
 MIN_SHOT_US = 2_500_000    # floor so a one-word line isn't a flash
@@ -310,7 +316,8 @@ def _capcut_drafts_root(output_root: str) -> str:
 
 def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
                          width: int, height: int, fps: int, bg: str, fill: str, ts: str,
-                         shot_to_block: dict, blocks_by_id: dict) -> dict:
+                         shot_to_block: dict, blocks_by_id: dict,
+                         overlay_text: str = DEF_OVERLAY_TEXT) -> dict:
     short_slug = short["slug"]
     codes = short.get("shots") or []
     if not codes:
@@ -324,7 +331,12 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
         shot = shots_by_code.get(code)
         if not shot:
             sys.exit(f"short '{short_slug}': shot '{code}' not found in project '{slug}'")
-        entry = _resolve_shot_entry(shot, data_root)
+        try:
+            entry = _resolve_shot_entry(shot, data_root)
+        except RuntimeError as e:
+            # One clean line instead of a traceback — the backend surfaces the
+            # tail of stderr in its 400, so this is what the user actually sees.
+            sys.exit(f"short '{short_slug}': {e}")
         shot_meta.append({"block_id": shot_to_block.get(shot.get("shot_id")), "start_us": running})
         running += entry["duration_us"]
         entries.append(entry)
@@ -350,6 +362,8 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
         # Cap the timeline to the video length so BGM doesn't extend past the
         # last shot (cues otherwise play their full ~140s flac).
         "max_timeline_us": total_us,
+        # «видео уже на канале» badge over the whole short ("" = none).
+        "overlay_text": overlay_text,
         # One scene per short — its shots play in the plan's given order.
         "scenes": [{
             "sceneKey":  short_slug,
@@ -384,6 +398,7 @@ def main() -> int:
     width  = int(plan.get("width", DEF_WIDTH))
     height = int(plan.get("height", DEF_HEIGHT))
     fps    = int(plan.get("fps", DEF_FPS))
+    overlay = str(plan.get("overlay_text", DEF_OVERLAY_TEXT))
     shorts = plan.get("shorts") or []
     if not shorts:
         sys.exit("plan has no shorts")
@@ -411,7 +426,8 @@ def main() -> int:
     for short in shorts:
         manifest = build_short_manifest(short, shots_by_code, slug,
                                         width, height, fps, bg, fill, ts,
-                                        shot_to_block, blocks_by_id)
+                                        shot_to_block, blocks_by_id,
+                                        overlay_text=overlay)
         n_shots = len(manifest["scenes"][0]["shots"])
         total_us = sum(s["duration_us"] for s in manifest["scenes"][0]["shots"])
         n_bgm = len(manifest["music_tracks"])

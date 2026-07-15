@@ -1,0 +1,32 @@
+{
+  "project": "shuttle",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "МАМ, РАССКАЖИ ПРО СУМКУ 👜",
+      "shots": [
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH09"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ТЫ МЕНЯ НА СУМКИ ПРОМЕНЯЛА 💔",
+      "shots": [
+        "A9_SH04",
+        "A9_SH05",
+        "A9_SH06",
+        "A9_SH07",
+        "A9_SH08",
+        "A9_SH09"
+      ]
+    }
+  ]
+}

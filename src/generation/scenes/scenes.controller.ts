@@ -57,8 +57,11 @@ export class ScenesController {
       '(awaiting approval), approved (chosenRender set), or already have a pending/running job. ' +
       'projectId may be the project UUID or slug. Returns { enqueued }.',
   })
-  enqueueProjectPending(@Param('projectId') projectId: string) {
-    return this.render.enqueuePendingForProject(projectId);
+  enqueueProjectPending(
+    @Param('projectId') projectId: string,
+    @Body() body?: { validate?: boolean },
+  ) {
+    return this.render.enqueuePendingForProject(projectId, { validate: body?.validate === true });
   }
 
   @Get('strategies')

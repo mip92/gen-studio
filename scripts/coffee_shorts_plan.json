@@ -1,0 +1,33 @@
+{
+  "project": "coffee",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ЕЁ СОЛНЫШКО ЗНАЕТ ВСЯ СТРАНА ☕",
+      "shots": [
+        "A0_SH02",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH07",
+        "A0_SH08",
+        "A0_SH09"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ПРОДАТЬ БАБУШКИНУ ТУРКУ? ☕",
+      "shots": [
+        "A5_SH02",
+        "A5_SH04",
+        "A5_SH06",
+        "A5_SH09",
+        "A5_SH15",
+        "A5_SH17"
+      ]
+    }
+  ]
+}

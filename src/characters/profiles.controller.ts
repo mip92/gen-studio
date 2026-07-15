@@ -5,6 +5,7 @@ import { Response } from 'express';
 import { createReadStream, statSync } from 'fs';
 import { CharactersService } from './characters.service';
 import { AnchorRenderService } from './anchor-render.service';
+import { AnchorValidationService } from '../validation/anchor-validation.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 
 @ApiTags('Profiles')
@@ -13,6 +14,7 @@ export class ProfilesController {
   constructor(
     private readonly chars:  CharactersService,
     private readonly anchor: AnchorRenderService,
+    private readonly anchorVal: AnchorValidationService,
   ) {}
 
   @Get(':profileId')
@@ -88,6 +90,47 @@ export class ProfilesController {
     return this.anchor.list(profileId);
   }
 
+  // ── Anchor NEURAL VALIDATION (Ollama vision QC of the anchor candidates) ─────
+
+  @Get(':profileId/anchor-validation-jobs')
+  @ApiOperation({
+    summary: 'List anchor-validation jobs (vision QC of anchor candidates), newest first',
+    description: 'Each completed job holds per-candidate verdicts (score / matchesPrompt / severe / anime issues) '
+      + 'and either chosenFilename (installed as the anchor) or a suggestedPrompt when nothing passed.',
+  })
+  listAnchorValidationJobs(@Param('profileId') profileId: string) {
+    return this.anchorVal.list(profileId);
+  }
+
+  @Post(':profileId/validate-anchor')
+  @ApiOperation({
+    summary: 'Re-run vision validation over the anchor candidates on disk',
+    description: 'Scores the candidate portraits against the character identity spec, HARD-rejects anime, '
+      + 'and installs the best clean portrait as the anchor. Queued (ComfyUI stopped during scoring). '
+      + 'No-op with a reason if there are no candidates on disk yet.',
+  })
+  validateAnchor(@Param('profileId') profileId: string) {
+    return this.anchorVal.revalidate(profileId);
+  }
+
+  @Post(':profileId/apply-suggested-anchor-prompt')
+  @ApiOperation({
+    summary: 'Apply an improved promptBase (from anchor validation) to the profile; optionally re-render',
+    description: 'When validation found no acceptable portrait it proposes a better promptBase. The user '
+      + 'reviews/edits it and applies it here — it is written to CharacterProfile.promptBase. With '
+      + 'rerender=true, a fresh anchor render is queued using the new promptBase.',
+  })
+  async applySuggestedAnchorPrompt(
+    @Param('profileId') profileId: string,
+    @Body() body: { prompt?: string; rerender?: boolean },
+  ) {
+    const prompt = (body?.prompt ?? '').trim();
+    if (!prompt) throw new BadRequestException('prompt is required');
+    const profile = await this.chars.updateProfile(profileId, { promptBase: prompt });
+    const rerenderJob = body?.rerender ? await this.anchor.enqueue(profileId) : null;
+    return { profile, rerenderJob };
+  }
+
   @Get(':profileId/anchor')
   @ApiOperation({
     summary: 'Get anchor portrait path for a profile (if it exists)',
@@ -96,6 +139,54 @@ export class ProfilesController {
   async getAnchor(@Param('profileId') profileId: string) {
     const p = await this.anchor.getAnchorPath(profileId);
     return { profileId, anchorPath: p, exists: p !== null };
+  }
+
+  // ── Anchor CANDIDATES (best-of-N gallery + manual selection) ────────────────
+
+  @Get(':profileId/anchor-candidates')
+  @ApiOperation({
+    summary: 'List anchor candidate portraits with validation verdicts and current selection',
+    description: 'Every portrait the last anchor render produced (reference/_candidates/<code>/), each merged with '
+      + 'its vision-QC verdict (score / issues / severe / anime), the validator\'s own pick (chosenByAI) and the '
+      + 'currently installed anchor (selected, by content hash). The user reviews this gallery and can install '
+      + 'any candidate via POST /profiles/:id/anchor/select.',
+  })
+  listAnchorCandidates(@Param('profileId') profileId: string) {
+    return this.anchor.listCandidates(profileId);
+  }
+
+  @Get(':profileId/anchor-candidates/:filename/raw')
+  @ApiOperation({
+    summary: 'Stream one anchor candidate image (for <img src=...>)',
+  })
+  async getAnchorCandidateRaw(
+    @Param('profileId') profileId: string,
+    @Param('filename')  filename:  string,
+    @Res()              res:       Response,
+  ) {
+    const p = await this.anchor.getCandidatePath(profileId, filename);
+    const stat = statSync(p);
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Length', stat.size);
+    // Candidates are immutable per render batch (re-render replaces the dir),
+    // so a longer client cache is safe; the UI keys by filename anyway.
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    createReadStream(p).pipe(res);
+  }
+
+  @Post(':profileId/anchor/select')
+  @ApiOperation({
+    summary: 'Manually install one anchor candidate as the profile anchor',
+    description: 'The user\'s override of the validator\'s automatic pick: copies the candidate portrait over '
+      + 'data/<slug>/reference/<profileCode>_anchor.png. The gallery recomputes "selected" by content hash.',
+  })
+  async selectAnchorCandidate(
+    @Param('profileId') profileId: string,
+    @Body() body: { filename?: string },
+  ) {
+    const filename = (body?.filename ?? '').trim();
+    if (!filename) throw new BadRequestException('filename is required');
+    return this.anchor.selectCandidate(profileId, filename);
   }
 
   @Delete(':profileId/anchor')

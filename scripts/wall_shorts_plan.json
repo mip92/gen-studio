@@ -7,38 +7,26 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "ЧУЖОЙ КЛЮЧ ОНА ХРАНИТ ПОЛВЕКА 🗝️",
       "shots": [
-        "B_SH01",
         "B_SH02",
         "B_SH03",
         "B_SH04",
-        "B_SH08",
-        "B_SH12"
-      ]
-    },
-    {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "CH37_SH01",
-        "CH37_SH02",
-        "CH37_SH03",
-        "CH37_SH05",
-        "CH37_SH08",
-        "CH37_SH10"
+        "B_SH05",
+        "B_SH06"
       ]
     },
     {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "«ОДИН И НАВСЕГДА» НЕ ПРО НЕЁ 🗝️",
       "shots": [
-        "O_SH01",
-        "O_SH02",
-        "O_SH03",
-        "O_SH04",
-        "O_SH05"
+        "CH08_SH09",
+        "CH08_SH10",
+        "CH09_SH01",
+        "CH09_SH02",
+        "CH09_SH06"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

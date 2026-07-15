@@ -198,7 +198,9 @@ export class CharactersService {
         // identity-pipeline badge (LoRA for photoreal, anchor for cartoon)
         projectLinks: { include: { project: { select: { id: true, slug: true, name: true, visualStyle: true } } } },
       },
-      orderBy: { code: 'asc' },
+      // Newest first (user 2026-07-04) — freshly created characters surface at
+      // the top of the /characters grid instead of drowning in the code sort.
+      orderBy: { createdAt: 'desc' },
     });
   }
 
@@ -212,7 +214,7 @@ export class CharactersService {
           profiles:     true,
           projectLinks: { include: { project: { select: { id: true, slug: true, name: true, visualStyle: true } } } },
         },
-        orderBy: { code: 'asc' },
+        orderBy: { createdAt: 'desc' },
         skip,
         take,
       }),

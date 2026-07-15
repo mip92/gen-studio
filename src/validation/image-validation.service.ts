@@ -13,6 +13,10 @@ const OLLAMA_URL   = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
 /** Vision model tag. qwen3-vl:8b fits entirely in 16 GB VRAM (≈6 GB) so it runs
  *  ~10× faster than the 30B MoE which partially offloads to CPU. Overridable. */
 const VALIDATION_MODEL = process.env.OLLAMA_VALIDATION_MODEL ?? 'qwen3-vl:8b';
+/** Comparative judge model — picks the best frame among the QC survivors in ONE
+ *  multi-image call. Defaults to the validation model; point it at a bigger
+ *  model if you ever want a stronger judge. */
+const JUDGE_MODEL = process.env.OLLAMA_JUDGE_MODEL ?? VALIDATION_MODEL;
 /** Longest-side px we downscale candidates to before scoring — see vision_resize.py. */
 const VISION_MAX_DIM   = Number(process.env.VISION_MAX_DIM ?? 768);
 /** Keep the model resident between per-candidate calls so we pay the load once. */
@@ -20,6 +24,13 @@ const KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE ?? '5m';
 /** Per-image request ceiling. A warm 8B answers in a few seconds; the 30B on
  *  CPU-offload can take ~35s. Generous so a slow card doesn't false-fail. */
 const REQUEST_TIMEOUT_MS = Number(process.env.VALIDATION_TIMEOUT_MS ?? 180_000);
+/** Early exit: once a FRESH candidate scores at least this (clean + matching),
+ *  the remaining unscored candidates are skipped — they keep no verdict and can
+ *  be scored by a later validation run if ever needed. */
+const EARLY_EXIT_SCORE = Number(process.env.VALIDATION_EARLY_EXIT_SCORE ?? 90);
+/** Judge input cap — multi-image context gets heavy; we compare the top-N by
+ *  QC score and log when candidates were left out. */
+const JUDGE_MAX_IMAGES = Number(process.env.VALIDATION_JUDGE_MAX_IMAGES ?? 8);
 
 /** One candidate's verdict as returned by the vision model. */
 export interface CandidateVerdict {
@@ -29,8 +40,19 @@ export interface CandidateVerdict {
   severe:        boolean;         // unusable: anatomy horror / wrong or missing subject / intruder
   issues:        string[];        // concrete defects (bad hands, garbled text, wrong subject…)
   error?:        string;          // set if this candidate could not be scored
+  /** True when this verdict was carried over from an earlier validation job —
+   *  the file was NOT re-sent to the model. Validation is incremental: each run
+   *  scores only the files that have never been scored. */
+  cached?:       boolean;
 }
 
+/** Structured prompt suggestion — each part targets its own promptFields key. */
+export interface SuggestedFields {
+  /** Full rewritten positive prompt (goes to promptFields.positive). */
+  positive: string | null;
+  /** Defect tokens to APPEND to the shot's negative (promptFields.negative). */
+  negative: string | null;
+}
 
 @Injectable()
 export class ImageValidationService {
@@ -52,18 +74,23 @@ export class ImageValidationService {
   }
 
   /**
-   * Enqueue a validation pass for a shot: snapshots the current candidate pool
-   * and the expected prompt/narration so the queue worker can score it later.
-   * No-op (returns null) if there are fewer than 2 candidates — nothing to pick
-   * between — or if a validation for this shot is already pending/running.
+   * Enqueue a validation pass for a shot. INCREMENTAL: only candidates that
+   * have never been scored are sent to the model — verdicts from earlier jobs
+   * are carried over. No-op (returns null) when every candidate already has a
+   * verdict, or when a validation for this shot is already pending/running.
+   * Validation NEVER generates images — it only reads files and writes verdicts.
    */
   async enqueue(shotId: string, expectedPrompt: string | null) {
     const shot = await this.prisma.shot.findUnique({ where: { id: shotId } });
     if (!shot) return null;
-    const candidates = ((shot.renderedImages as Array<{ filename: string }> | null) ?? [])
+    const pool = ((shot.renderedImages as Array<{ filename: string }> | null) ?? [])
       .map((r) => r.filename)
       .filter(Boolean);
-    if (candidates.length < 2) return null;
+    if (pool.length === 0) return null;
+
+    const prev = await this.previousVerdicts(shotId);
+    const unscored = pool.filter((f) => !prev.has(f));
+    if (unscored.length === 0) return null;
 
     const inflight = await this.db.imageValidationJob.count({
       where: { shotId, status: { in: ['pending', 'running'] } },
@@ -82,16 +109,24 @@ export class ImageValidationService {
         status:         'pending',
         expectedPrompt: expected ?? undefined,
         narration:      shot.narrationText ?? undefined,
-        candidates:     candidates as any,
+        candidates:     unscored as any,
       },
     });
   }
 
   /**
-   * Score every candidate of a validation job and set the winner as the shot's
-   * chosenRender. Assumes the caller (PipelineQueueService.dispatchValidation)
-   * has already marked the job `running` and stopped ComfyUI so the GPU is free.
-   * Sets the job `completed`/`failed` on the way out.
+   * Validate a shot's candidate pool and set the winner as chosenRender.
+   * Assumes the caller (PipelineQueueService.dispatchValidation) has already
+   * marked the job `running` and stopped ComfyUI so the GPU is free.
+   *
+   * Two stages:
+   *  1. QC — every candidate WITHOUT a prior verdict is scored one-by-one
+   *     (thinking on). Early exit: once a fresh candidate is clean and scores
+   *     ≥ EARLY_EXIT_SCORE the remaining unscored files are skipped.
+   *  2. Judge — when >1 candidate passes QC (cached survivors included), ONE
+   *     comparative multi-image call picks the best frame.
+   * When nothing passes, a structured {positive, negative} suggestion is
+   * generated instead of settling for a bad frame.
    */
   async run(jobId: string): Promise<void> {
     const job = await this.db.imageValidationJob.findUnique({ where: { id: jobId } });
@@ -100,7 +135,7 @@ export class ImageValidationService {
       const shot = await this.prisma.shot.findUnique({
         where:   { id: job.shotId },
         include: {
-          project: { select: { slug: true } },
+          project: { select: { slug: true, defaultNegative: true } },
           // Participants → each character's canonical look (promptBase). Fed to
           // the validator so it does NOT flag intended features (tattoos, marks,
           // hair, outfit) as defects, and CAN check the right person is shown.
@@ -122,15 +157,25 @@ export class ImageValidationService {
         .filter(Boolean)
         .join(' | ') || null;
 
-      // Re-read the live candidate pool (a render may have appended more since
-      // enqueue) and intersect with what still exists on disk.
+      // Live candidate pool ∩ what still exists on disk (a render may have
+      // appended more since enqueue; the user may have deleted some by hand).
       const shotDir = path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode);
       const pool = ((shot.renderedImages as Array<{ filename: string }> | null) ?? [])
         .map((r) => r.filename)
         .filter((f) => f && existsSync(path.join(shotDir, f)));
       if (pool.length === 0) throw new Error('no candidate files on disk to validate');
 
-      const verdicts = await this.scoreCandidates(shotDir, pool, job.expectedPrompt, job.narration, characterNotes);
+      // Stage 1 — incremental QC: carry over prior verdicts, score only new files.
+      const prev = await this.previousVerdicts(job.shotId, jobId);
+      const cached: CandidateVerdict[] = pool
+        .filter((f) => prev.has(f))
+        .map((f) => ({ ...prev.get(f)!, cached: true }));
+      const toScore = pool.filter((f) => !prev.has(f));
+      const fresh = await this.scoreCandidates(shotDir, toScore, job.expectedPrompt, job.narration, characterNotes);
+      const verdicts: CandidateVerdict[] = [...cached, ...fresh];
+      if (cached.length > 0) {
+        this.logger.log(`Validation ${jobId}: reused ${cached.length} cached verdict(s), scored ${fresh.length} new file(s)`);
+      }
 
       // A candidate is ACCEPTABLE only if it scored without error, has no severe
       // defect, and actually matches the prompt. We never "settle" for the
@@ -139,12 +184,27 @@ export class ImageValidationService {
       const acceptable = verdicts
         .filter((v) => !v.error && !v.severe && v.matchesPrompt)
         .sort((a, b) => b.score - a.score);
-      const winner = acceptable[0] ?? null;
 
-      let suggestedPrompt: string | null = null;
+      // Stage 2 — comparative judge when there is a real choice to make.
+      let winner: CandidateVerdict | null = acceptable[0] ?? null;
+      let judgeReason: string | null = null;
+      if (acceptable.length > 1) {
+        const judged = await this.judgeBest(shotDir, acceptable, job.expectedPrompt, job.narration, characterNotes)
+          .catch((e) => {
+            this.logger.warn(`judge failed (falling back to top QC score): ${e?.message ?? e}`);
+            return null;
+          });
+        if (judged) {
+          winner      = acceptable.find((v) => v.filename === judged.filename) ?? winner;
+          judgeReason = judged.reason;
+        }
+      }
+
+      let suggested: SuggestedFields | null = null;
       if (!winner) {
-        suggestedPrompt = await this.suggestPrompt(job.expectedPrompt, job.narration, verdicts).catch((e) => {
-          this.logger.warn(`suggestPrompt failed: ${e?.message ?? e}`);
+        const currentNegative = this.resolveNegative(shot);
+        suggested = await this.suggestFields(job.expectedPrompt, currentNegative, job.narration, verdicts).catch((e) => {
+          this.logger.warn(`suggestFields failed: ${e?.message ?? e}`);
           return null;
         });
       }
@@ -155,7 +215,10 @@ export class ImageValidationService {
           status:          'completed',
           result:          verdicts as any,
           chosenFilename:  winner?.filename ?? null,
-          suggestedPrompt: suggestedPrompt ?? null,
+          judgeReason:     judgeReason,
+          suggestedFields: (suggested as any) ?? null,
+          // Legacy mirror so pre-rebuild UI still shows the positive part.
+          suggestedPrompt: suggested?.positive ?? null,
           completedAt:     new Date(),
         },
       });
@@ -166,9 +229,9 @@ export class ImageValidationService {
         data:  { chosenRender: winner?.filename ?? null },
       });
       if (winner) {
-        this.logger.log(`Validation ${jobId}: picked ${winner.filename} (score ${winner.score}) for shot ${shot.shotCode} out of ${pool.length}`);
+        this.logger.log(`Validation ${jobId}: picked ${winner.filename} (score ${winner.score}${judgeReason ? ', judge' : ''}) for shot ${shot.shotCode} out of ${pool.length}`);
       } else {
-        this.logger.warn(`Validation ${jobId}: NO acceptable candidate for shot ${shot.shotCode} (${pool.length} scored) — cleared chosenRender, ${suggestedPrompt ? 'suggested a new prompt' : 'no suggestion generated'}`);
+        this.logger.warn(`Validation ${jobId}: NO acceptable candidate for shot ${shot.shotCode} (${verdicts.length} verdict(s)) — cleared chosenRender, ${suggested ? 'suggested prompt fields' : 'no suggestion generated'}`);
       }
     } catch (e: any) {
       this.logger.error(`Validation ${jobId} failed: ${e?.message ?? e}`);
@@ -177,6 +240,35 @@ export class ImageValidationService {
         data:  { status: 'failed', errorMessage: String(e?.message ?? e), completedAt: new Date() },
       }).catch(() => {});
     }
+  }
+
+  // ── Incremental-verdict store ───────────────────────────────────────────────
+
+  /**
+   * Latest verdict per filename from this shot's earlier completed jobs.
+   * Verdicts that errored are NOT carried over (so the file gets re-scored).
+   */
+  private async previousVerdicts(shotId: string, excludeJobId?: string): Promise<Map<string, CandidateVerdict>> {
+    const jobs = await this.db.imageValidationJob.findMany({
+      where:   { shotId, status: 'completed', ...(excludeJobId ? { id: { not: excludeJobId } } : {}) },
+      orderBy: { queuedAt: 'asc' },
+      select:  { result: true },
+    });
+    const map = new Map<string, CandidateVerdict>();
+    for (const j of jobs) {
+      for (const v of ((j.result as CandidateVerdict[] | null) ?? [])) {
+        if (!v?.filename || v.error) continue;
+        map.set(v.filename, { filename: v.filename, score: v.score, matchesPrompt: v.matchesPrompt, severe: v.severe, issues: v.issues ?? [] });
+      }
+    }
+    return map;
+  }
+
+  /** Per-shot negative override, falling back to the project-wide default. */
+  private resolveNegative(shot: { promptFields: unknown; project: { defaultNegative?: string | null } | null }): string | null {
+    const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
+    const own = typeof pf.negative === 'string' && pf.negative.trim() ? pf.negative.trim() : null;
+    return own ?? (shot.project?.defaultNegative?.trim() || null);
   }
 
   // ── Scoring internals ───────────────────────────────────────────────────────
@@ -188,6 +280,7 @@ export class ImageValidationService {
     narration: string | null,
     characterNotes: string | null,
   ): Promise<CandidateVerdict[]> {
+    if (filenames.length === 0) return [];
     // Downscale all candidates in one Python pass → a temp dir on E: (never C:).
     const tmpDir = path.join(os.tmpdir(), 'gen-studio-vision', `${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
     mkdirSync(tmpDir, { recursive: true });
@@ -201,7 +294,16 @@ export class ImageValidationService {
       const verdicts: CandidateVerdict[] = [];
       for (const p of pairs) {
         const imgPath = existsSync(p.small) ? p.small : path.join(shotDir, p.filename); // fall back to full-res
-        verdicts.push(await this.scoreOne(p.filename, imgPath, sys));
+        const v = await this.scoreOne(p.filename, imgPath, sys);
+        verdicts.push(v);
+        // Early exit: a clean, matching, high-scoring frame means the batch has
+        // a keeper — don't burn GPU-minutes scoring the rest. Skipped files keep
+        // no verdict and get scored by a future run only if it ever matters.
+        if (!v.error && !v.severe && v.matchesPrompt && v.score >= EARLY_EXIT_SCORE) {
+          const skipped = filenames.length - verdicts.length;
+          if (skipped > 0) this.logger.log(`early exit: ${p.filename} scored ${v.score} ≥ ${EARLY_EXIT_SCORE} — skipped ${skipped} unscored candidate(s)`);
+          break;
+        }
       }
       return verdicts;
     } finally {
@@ -281,24 +383,96 @@ export class ImageValidationService {
     return { filename, score: -1, matchesPrompt: false, severe: false, issues: [], error: lastErr };
   }
 
+  // ── Comparative judge ───────────────────────────────────────────────────────
+
   /**
-   * When no candidate passed, ask the model to rewrite the positive prompt so a
-   * re-render fixes the recurring failures. Text-only (no image) → fast. Returns
-   * the improved prompt text, or null if the model gave nothing useful.
+   * ONE multi-image call that compares every QC survivor (this session's fresh
+   * passes + previously validated ones) side by side and picks the best frame.
+   * Purely a chooser — it cannot un-fail QC'd frames or generate anything.
    */
-  private async suggestPrompt(
+  private async judgeBest(
+    shotDir: string,
+    acceptable: CandidateVerdict[],
     expectedPrompt: string | null,
     narration: string | null,
+    characterNotes: string | null,
+  ): Promise<{ filename: string; reason: string | null } | null> {
+    let pool = acceptable;
+    if (pool.length > JUDGE_MAX_IMAGES) {
+      this.logger.log(`judge: comparing top ${JUDGE_MAX_IMAGES} of ${pool.length} acceptable candidates (by QC score)`);
+      pool = pool.slice(0, JUDGE_MAX_IMAGES); // acceptable arrives sorted desc
+    }
+
+    const tmpDir = path.join(os.tmpdir(), 'gen-studio-vision', `judge-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
+    mkdirSync(tmpDir, { recursive: true });
+    try {
+      const pairs = pool.map((v) => ({ filename: v.filename, small: path.join(tmpDir, v.filename) }));
+      await this.resize(pairs.map((p) => [path.join(shotDir, p.filename), p.small] as [string, string]));
+      const images = pairs.map((p) => readFileSync(existsSync(p.small) ? p.small : path.join(shotDir, p.filename)).toString('base64'));
+
+      const parts: string[] = [
+        `You are picking the SINGLE best frame for a video shot. You are shown ${pool.length} candidate images, numbered 1..${pool.length} in the order given. All already passed defect QC — your job is COMPARATIVE: composition, readability of the action, expressiveness, natural anatomy, overall craft.`,
+      ];
+      if (expectedPrompt?.trim()) parts.push(`The frame should depict: "${expectedPrompt.trim()}". Prefer the candidate that shows this most clearly.`);
+      if (narration?.trim())      parts.push(`It accompanies this narration: "${narration.trim()}".`);
+      if (characterNotes?.trim()) parts.push(`Canonical character design (intentional, not defects): "${characterNotes.trim()}".`);
+      parts.push(`Return JSON: "best" (integer 1..${pool.length} — the number of the winning image) and "reason" (ONE short sentence why it wins).`);
+
+      const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({
+          model:      JUDGE_MODEL,
+          stream:     false,
+          format:     'json',
+          keep_alive: KEEP_ALIVE,
+          messages:   [{ role: 'user', content: parts.join(' '), images }],
+        }),
+        // N images in one request — give it proportionally more headroom.
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS * 2),
+      });
+      if (!res.ok) throw new Error(`Ollama ${res.status}: ${await res.text()}`);
+      const data = (await res.json()) as { message?: { content?: string } };
+      const content = (data.message?.content ?? '').trim();
+      if (!content) throw new Error('empty content from judge');
+      const parsed = JSON.parse(content) as { best?: unknown; reason?: unknown };
+      const idx = Math.round(Number(parsed.best));
+      if (!Number.isFinite(idx) || idx < 1 || idx > pool.length) throw new Error(`judge returned invalid index: ${String(parsed.best)}`);
+      return {
+        filename: pool[idx - 1].filename,
+        reason:   typeof parsed.reason === 'string' && parsed.reason.trim() ? parsed.reason.trim() : null,
+      };
+    } finally {
+      try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  }
+
+  // ── Structured suggestion ───────────────────────────────────────────────────
+
+  /**
+   * When no candidate passed, ask the model to rewrite the prompts so a
+   * re-render fixes the recurring failures. Text-only (no image) → fast.
+   * Returns {positive, negative}: positive is the full rewritten positive,
+   * negative is ONLY the defect tokens to APPEND to the shot's negative.
+   */
+  private async suggestFields(
+    expectedPrompt: string | null,
+    currentNegative: string | null,
+    narration: string | null,
     verdicts: CandidateVerdict[],
-  ): Promise<string | null> {
+  ): Promise<SuggestedFields | null> {
     const issues = Array.from(new Set(verdicts.flatMap((v) => v.issues))).slice(0, 12);
     if (!expectedPrompt?.trim() && issues.length === 0) return null;
     const ask = [
       'An image generator produced several candidates for one shot and ALL of them failed quality control.',
-      expectedPrompt?.trim() ? `The intended positive prompt was: "${expectedPrompt.trim()}".` : '',
+      expectedPrompt?.trim() ? `The intended POSITIVE prompt was: "${expectedPrompt.trim()}".` : '',
+      currentNegative?.trim() ? `The current NEGATIVE prompt is: "${currentNegative.trim()}".` : '',
       narration?.trim() ? `The frame accompanies this narration: "${narration.trim()}".` : '',
       issues.length ? `The recurring problems across the candidates were: ${issues.join('; ')}.` : '',
-      'Rewrite the POSITIVE prompt so a re-render fixes these specific problems while keeping the original intent, subject, and visual style. Be concrete and visual; explicitly state what each subject is doing and any element the generator kept getting wrong. Return ONLY the rewritten positive prompt as plain text — no preamble, no quotes, no explanation.',
+      'Propose fixes for a re-render, keeping the original intent, subject and visual style. Return JSON with exactly two string fields: ' +
+      '"positive" — the FULL rewritten positive prompt (concrete and visual; explicitly state what each subject is doing and any element the generator kept getting wrong); ' +
+      '"negative" — ONLY new comma-separated tokens to ADD to the negative prompt that name what must NOT appear (e.g. "extra person, deformed hands, elongated limbs"); do NOT repeat tokens already present in the current negative; use "" if nothing to add. ' +
+      'No preamble, no explanations — JSON only.',
     ].filter(Boolean).join(' ');
 
     const res = await fetch(`${OLLAMA_URL}/api/generate`, {
@@ -306,14 +480,19 @@ export class ImageValidationService {
       headers: { 'Content-Type': 'application/json' },
       // think:false — qwen3-vl is a reasoning model; with thinking on it can burn
       // the whole output on the `thinking` field and return an EMPTY `response`.
-      // We only want the rewritten prompt, so answer directly.
-      body:    JSON.stringify({ model: VALIDATION_MODEL, prompt: ask, stream: false, think: false, keep_alive: KEEP_ALIVE }),
+      // We only want the rewritten prompts, so answer directly.
+      body:    JSON.stringify({ model: VALIDATION_MODEL, prompt: ask, stream: false, think: false, format: 'json', keep_alive: KEEP_ALIVE }),
       signal:  AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`Ollama ${res.status}: ${await res.text()}`);
     const data = (await res.json()) as { response?: string };
-    const text = (data.response ?? '').trim().replace(/^["'`]+|["'`]+$/g, '').trim();
-    return text.length > 0 ? text : null;
+    const text = (data.response ?? '').trim();
+    if (!text) return null;
+    const parsed = JSON.parse(text) as { positive?: unknown; negative?: unknown };
+    const positive = typeof parsed.positive === 'string' && parsed.positive.trim() ? parsed.positive.trim() : null;
+    const negative = typeof parsed.negative === 'string' && parsed.negative.trim() ? parsed.negative.trim() : null;
+    if (!positive && !negative) return null;
+    return { positive, negative };
   }
 
   /** Spawn vision_resize.py once for all [src,dest] pairs. Best-effort: on any

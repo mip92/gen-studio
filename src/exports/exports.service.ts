@@ -23,6 +23,13 @@ const SHORTS_PYTHON = process.env.SHORTS_PYTHON ?? 'python';
 const shortsPlanPath = (slug: string) =>
   path.join(APP_ROOT, 'scripts', `${slug}_shorts_plan.json`);
 
+/** Shape of scripts/<slug>_shorts_plan.json. Extra keys (top-level _note,
+ *  per-short _why) are hand-written commentary — preserved verbatim on writes. */
+interface ShortsPlanFile {
+  shorts?: Array<{ slug: string; title?: string; shots?: string[] } & Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
 /** Stable export resolution. CapCut accepts arbitrary sizes; 1080p is what
  *  our FHD upscale produces, so matching it avoids per-clip rescale on import. */
 const EXPORT_WIDTH  = 1920;
@@ -636,7 +643,14 @@ export class ExportsService {
    */
   async getShortsPlan(idOrSlug: string): Promise<{
     hasPlan: boolean;
-    shorts:  Array<{ slug: string; title: string; shots: number }>;
+    shorts:  Array<{
+      slug:    string;
+      title:   string;
+      shots:   number;
+      /** Planned shots in plan order, with the chosen render (when one exists)
+       *  so the UI can show real frame thumbnails on the shorts cards. */
+      preview: Array<{ shotId: string | null; shotCode: string; image: string | null }>;
+    }>;
   }> {
     const project  = await this.findProject(idOrSlug);
     const planPath = shortsPlanPath(project.slug);
@@ -645,16 +659,116 @@ export class ExportsService {
       const plan = JSON.parse(readFileSync(planPath, 'utf-8')) as {
         shorts?: Array<{ slug: string; title?: string; shots?: string[] }>;
       };
+      const codes = [...new Set((plan.shorts ?? []).flatMap((s) => s.shots ?? []))];
+      const rows  = codes.length
+        ? await this.prisma.shot.findMany({
+            where:  { projectId: project.id, shotCode: { in: codes } },
+            select: { id: true, shotCode: true, chosenRender: true },
+          })
+        : [];
+      const byCode = new Map(rows.map((r) => [r.shotCode, r]));
       const shorts = (plan.shorts ?? []).map((s) => ({
-        slug:  s.slug,
-        title: s.title ?? s.slug,
-        shots: (s.shots ?? []).length,
+        slug:    s.slug,
+        title:   s.title ?? s.slug,
+        shots:   (s.shots ?? []).length,
+        preview: (s.shots ?? []).map((code) => {
+          const row = byCode.get(code);
+          return { shotId: row?.id ?? null, shotCode: code, image: row?.chosenRender ?? null };
+        }),
       }));
       return { hasPlan: shorts.length > 0, shorts };
     } catch (e) {
       this.logger.warn(`shorts plan for ${project.slug} unreadable: ${String(e)}`);
       return { hasPlan: false, shorts: [] };
     }
+  }
+
+  /** Read the raw plan file; null when absent, 400 when present but corrupt —
+   *  never silently overwrite a hand-curated file we couldn't parse. */
+  private readShortsPlanFile(planPath: string): ShortsPlanFile | null {
+    if (!existsSync(planPath)) return null;
+    try {
+      return JSON.parse(readFileSync(planPath, 'utf-8')) as ShortsPlanFile;
+    } catch {
+      throw new BadRequestException(
+        `${path.basename(planPath)} is not valid JSON — fix it by hand before editing the plan via the API`,
+      );
+    }
+  }
+
+  /**
+   * Add a short to the versioned plan, or replace the same-slug entry (title
+   * and shots are overwritten; hand-written extras like `_why` stay). Creates
+   * the plan file with our standard vertical defaults when it doesn't exist.
+   */
+  async upsertShortPlanEntry(
+    idOrSlug: string,
+    body: { slug?: string; title?: string; shots?: string[] },
+  ) {
+    const project = await this.findProject(idOrSlug);
+    const slug = (body.slug ?? '').trim();
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(slug)) {
+      throw new BadRequestException('slug: lowercase latin letters/digits/_/-, e.g. "hook"');
+    }
+    const shots = (body.shots ?? []).map((s) => s.trim().toUpperCase()).filter(Boolean);
+    if (!shots.length) throw new BadRequestException('shots: at least one shot code required');
+
+    // Catch typos now, not at export time: every planned code must be a real shot.
+    const rows = await this.prisma.shot.findMany({
+      where:  { projectId: project.id, shotCode: { in: shots } },
+      select: { shotCode: true },
+    });
+    const known   = new Set(rows.map((r) => r.shotCode));
+    const unknown = shots.filter((c) => !known.has(c));
+    if (unknown.length) {
+      throw new BadRequestException(`unknown shot codes: ${unknown.join(', ')}`);
+    }
+
+    const planPath = shortsPlanPath(project.slug);
+    const plan = this.readShortsPlanFile(planPath) ?? {
+      project: project.slug,
+      fill:    'cover',
+      width:   1080,
+      height:  1920,
+      fps:     30,
+      shorts:  [],
+    };
+    plan.shorts = plan.shorts ?? [];
+    const title    = (body.title ?? '').trim() || slug;
+    const existing = plan.shorts.find((s) => s.slug === slug);
+    if (existing) {
+      existing.title = title;
+      existing.shots = shots;
+    } else {
+      plan.shorts.push({ slug, title, shots });
+    }
+    writeFileSync(planPath, JSON.stringify(plan, null, 2) + '\n', 'utf-8');
+    return this.getShortsPlan(idOrSlug);
+  }
+
+  /** Remove a short from the plan. Also drops its packaging texts from
+   *  Project.settings.youtube.shorts so the tab doesn't keep orphan records. */
+  async deleteShortPlanEntry(idOrSlug: string, shortSlug: string) {
+    const project  = await this.findProject(idOrSlug);
+    const planPath = shortsPlanPath(project.slug);
+    const plan     = this.readShortsPlanFile(planPath);
+    if (!plan || !(plan.shorts ?? []).some((s) => s.slug === shortSlug)) {
+      throw new NotFoundException(`short "${shortSlug}" is not in the plan`);
+    }
+    plan.shorts = (plan.shorts ?? []).filter((s) => s.slug !== shortSlug);
+    writeFileSync(planPath, JSON.stringify(plan, null, 2) + '\n', 'utf-8');
+
+    const settings = (project.settings ?? {}) as Record<string, unknown> & {
+      youtube?: { shorts?: Record<string, unknown> };
+    };
+    if (settings.youtube?.shorts && shortSlug in settings.youtube.shorts) {
+      delete settings.youtube.shorts[shortSlug];
+      await this.prisma.project.update({
+        where: { id: project.id },
+        data:  { settings: settings as object },
+      });
+    }
+    return this.getShortsPlan(idOrSlug);
   }
 
   /**

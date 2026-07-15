@@ -10,6 +10,7 @@ import { TTSService } from '../tts/tts.service';
 import { BgmRenderService } from '../bgm/bgm-render.service';
 import { AnchorRenderService } from '../characters/anchor-render.service';
 import { ImageValidationService } from '../validation/image-validation.service';
+import { AnchorValidationService } from '../validation/anchor-validation.service';
 import { EngineService } from './engine.service';
 
 const POLL_MS = 5_000;
@@ -47,6 +48,7 @@ export class PipelineQueueService {
     private readonly bgm:      BgmRenderService,
     private readonly anchors:  AnchorRenderService,
     private readonly validation: ImageValidationService,
+    private readonly anchorValidation: AnchorValidationService,
     private readonly engine:   EngineService,
   ) {}
 
@@ -110,10 +112,15 @@ export class PipelineQueueService {
     const validationActive = await (this.prisma as any).imageValidationJob.count({
       where: { status: 'running' },
     });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0 || validationActive > 0) return;
+    // Anchor-validation (Ollama vision) shares the same single GPU slot — same
+    // ComfyUI-off arbitration as image-validation.
+    const anchorValidationActive = await (this.prisma as any).anchorValidationJob.count({
+      where: { status: 'running' },
+    });
+    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0 || validationActive > 0 || anchorValidationActive > 0) return;
 
     // ── 3. Pick oldest pending across all queues ───────────────────────────
-    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextInterp, nextTTS, nextBgm, nextAnchor, nextValidation] = await Promise.all([
+    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextInterp, nextTTS, nextBgm, nextAnchor, nextValidation, nextAnchorValidation] = await Promise.all([
       this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
       this.datasets.findNextPending(),
       this.scenes.findNextPending(),
@@ -124,9 +131,10 @@ export class PipelineQueueService {
       this.bgm.findNextPending(),
       this.anchors.findNextPending(),
       this.validation.findNextPending(),
+      this.anchorValidation.findNextPending(),
     ]);
 
-    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation'; id: string; ts: number };
+    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation' | 'anchor_validation'; id: string; ts: number };
     const candidates: Pick[] = [];
     if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
@@ -150,6 +158,7 @@ export class PipelineQueueService {
     if (nextBgm)      candidates.push({ type: 'bgm',      id: nextBgm.id,      ts: nextBgm.queuedAt.getTime() });
     if (nextAnchor)   candidates.push({ type: 'anchor',   id: nextAnchor.id,   ts: nextAnchor.queuedAt.getTime() });
     if (nextValidation) candidates.push({ type: 'validation', id: nextValidation.id, ts: nextValidation.queuedAt.getTime() });
+    if (nextAnchorValidation) candidates.push({ type: 'anchor_validation', id: nextAnchorValidation.id, ts: nextAnchorValidation.queuedAt.getTime() });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
@@ -164,7 +173,30 @@ export class PipelineQueueService {
     else if (winner.type === 'tts')           await this.dispatchTTS(winner.id);
     else if (winner.type === 'bgm')           await this.dispatchBgm(winner.id);
     else if (winner.type === 'anchor')        await this.dispatchAnchor(winner.id);
-    else                                       await this.dispatchValidation(winner.id);
+    else if (winner.type === 'validation')    await this.dispatchValidation(winner.id);
+    else                                       await this.dispatchAnchorValidation(winner.id);
+  }
+
+  /**
+   * Dispatch an anchor-validation job. Same OPPOSITE arbitration as image
+   * validation: stop ComfyUI so the whole GPU is free for the Ollama vision
+   * model, mark running synchronously so the next tick sees the held slot, then
+   * fire the async scoring (which self-updates the row to completed/failed).
+   */
+  private async dispatchAnchorValidation(jobId: string): Promise<void> {
+    this.logger.log(`Dispatching anchor validation ${jobId} — stopping ComfyUI first to free the GPU`);
+    try {
+      await this.engine.stopComfy();
+    } catch (e: any) {
+      this.logger.warn(`stopComfy failed (proceeding anyway): ${e.message}`);
+    }
+    await (this.prisma as any).anchorValidationJob.update({
+      where: { id: jobId },
+      data:  { status: 'running', startedAt: new Date() },
+    });
+    void this.anchorValidation.run(jobId).catch((e) => {
+      this.logger.error(`anchor validation run ${jobId} threw: ${e?.message ?? e}`);
+    });
   }
 
   /**

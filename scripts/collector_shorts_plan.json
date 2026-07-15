@@ -1,0 +1,34 @@
+{
+  "project": "collector",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "В БАЗЕ ДОЛЖНИКОВ ТВОЯ МАТЬ 😨",
+      "shots": [
+        "A0_SH02",
+        "A0_SH06",
+        "A0_SH07",
+        "A0_SH08",
+        "A0_SH09",
+        "A0_SH10"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "БАНК ИЛИ КОЛЛЕКТОРЫ? 💔",
+      "shots": [
+        "A7_SH06",
+        "A7_SH07",
+        "A7_SH08",
+        "A7_SH12",
+        "A7_SH13",
+        "A7_SH18",
+        "A7_SH19"
+      ]
+    }
+  ]
+}

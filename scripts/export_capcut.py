@@ -434,6 +434,207 @@ def _inject_subtitles(data: Dict[str, Any], cues: List[tuple],
     return len(segments)
 
 
+# ── «видео уже на канале» overlay ───────────────────────────────────────────
+# Shorts carry a permanent tilted text badge in the upper-right corner telling
+# the viewer the full film is already on the channel. All values below are
+# cloned field-for-field from a hand-made draft
+# (honeywagon_short_hook_20260710_1647) where the user placed and styled the
+# text once in CapCut; every export reproduces that exact material + segment,
+# spanning the whole timeline. Gated by manifest["overlay_text"] (set by
+# export_shorts.py; absent on full-film exports → no-op). The pink text effect
+# must sit in CapCut's local effect cache (it does — the user applied it by
+# hand); if the cache entry ever disappears we inject plain white text and log.
+_OVERLAY_EFFECT_ID   = '7592575945140309253'   # CapCut text effect «粉色爱心巧克力»
+_OVERLAY_EFFECT_NAME = '粉色爱心巧克力'
+_OVERLAY_CATEGORY_ID = '2037703895'            # its panel category ("hot")
+_OVERLAY_FONT_SIZE   = 15.0
+_OVERLAY_SCALE       = 0.7825962403387248
+_OVERLAY_ROTATION    = 14.974092236899061      # degrees clockwise
+_OVERLAY_TRANSFORM_X = 0.6958637469586375      # half-canvas units → upper-right
+_OVERLAY_TRANSFORM_Y = 0.7931506849315069
+
+
+def _build_overlay_material(mat_id: str, text: str, font_path: str,
+                            effect_path) -> Dict[str, Any]:
+    """The overlay's text material. Unlike the subtitle materials above this is
+    plain type='text' (loose text, no group), white fill + the cached text
+    effect; `use_effect_default_color` lets the effect supply its gradient."""
+    style: Dict[str, Any] = {
+        "fill":  {"content": {"render_type": "solid",
+                  "solid": {"color": [1.0, 1.0, 1.0]}}},
+        "size":  _OVERLAY_FONT_SIZE,
+        "range": [0, len(text)],
+    }
+    if font_path:
+        style["font"] = {"id": "", "path": font_path}
+    if effect_path:
+        style["effectStyle"] = {"id": _OVERLAY_EFFECT_ID, "path": effect_path}
+    content = json.dumps({"text": text, "styles": [style]}, ensure_ascii=False)
+    return {
+        "id":                mat_id,
+        "type":              "text",
+        "content":           content,
+        "base_content":      "",
+        "recognize_task_id": "",
+        "recognize_text":    "",
+        "recognize_model":   "",
+        "punc_model":        "",
+        "recognize_type":    0,
+        "add_type":          0,
+        "group_id":          "",
+        "language":          "",
+        "words":             {"start_time": [], "end_time": [], "text": []},
+        "current_words":     {"start_time": [], "end_time": [], "text": []},
+        "alignment":         1,
+        "typesetting":       0,
+        "line_feed":         1,
+        "line_spacing":      0.02,
+        "letter_spacing":    0.0,
+        "line_max_width":    0.82,
+        "force_apply_line_max_width": False,
+        "text_color":        "#FFFFFF",
+        "text_alpha":        1.0,
+        "border_color":      "",
+        "border_alpha":      1.0,
+        "border_width":      0.08,
+        "border_mode":       0,
+        "font_size":         _OVERLAY_FONT_SIZE,
+        "font_path":         font_path,
+        "font_id":           "",
+        "font_title":        "none",
+        "use_effect_default_color": True,
+        "has_shadow":        False,
+        "underline":         False,
+        "italic_degree":     0,
+        "bold_width":        0.0,
+        "check_flag":        7,
+        "text_size":         30,
+        "global_alpha":      1.0,
+        "combo_info":            {"text_templates": []},
+        "caption_template_info": {"resource_id": "", "third_resource_id": "",
+            "resource_name": "", "category_id": "", "category_name": "",
+            "effect_id": "", "request_id": "", "path": "", "is_new": False,
+            "source_platform": 0},
+        "name":              "",
+        "style_name":        "",
+        "sub_type":          0,
+        "layer_weight":      1,
+        "initial_scale":     1.0,
+        "is_rich_text":      False,
+        "fixed_width":       -1.0,
+        "fixed_height":      -1.0,
+    }
+
+
+def _inject_text_overlay(data: Dict[str, Any], text: str, dur_us: int,
+                         drafts_root: Path) -> None:
+    """Mutate a loaded draft_content.json dict: add the channel badge as its
+    own text track — one material + one full-length segment parked tilted in
+    the upper-right corner, exactly where the user placed it by hand."""
+    materials = data.setdefault("materials", {})
+    texts     = materials.setdefault("texts", [])
+    anims     = materials.setdefault("material_animations", [])
+    effects   = materials.setdefault("effects", [])
+    tracks    = data.setdefault("tracks", [])
+
+    font_path   = _resolve_capcut_font(drafts_root)
+    effect_path = _capcut_effect_path(str(drafts_root), _OVERLAY_EFFECT_ID)
+    if effect_path is None:
+        _log(f'overlay text effect {_OVERLAY_EFFECT_ID} not in CapCut effect '
+             f'cache — injecting plain white text')
+
+    max_ri = 0
+    for tr in tracks:
+        for s in tr.get("segments", []):
+            max_ri = max(max_ri, int(s.get("render_index") or 0))
+
+    mat_id  = uuid.uuid4().hex
+    anim_id = uuid.uuid4().hex
+    texts.append(_build_overlay_material(mat_id, text, font_path, effect_path))
+    anims.append({"id": anim_id, "type": "sticker_animation",
+                  "animations": [], "multi_language_current": "none"})
+    extra_refs = [anim_id]
+    if effect_path:
+        eff_id = uuid.uuid4().hex
+        effects.append({
+            "id":                eff_id,
+            "type":              "text_effect",
+            "effect_id":         _OVERLAY_EFFECT_ID,
+            "resource_id":       _OVERLAY_EFFECT_ID,
+            "third_resource_id": "0",
+            "name":              _OVERLAY_EFFECT_NAME,
+            "path":              effect_path,
+            "source_platform":   1,
+            "platform":          "all",
+            "category_id":       _OVERLAY_CATEGORY_ID,
+            "category_name":     "hot",
+            "sub_category_id":   "",
+            "sub_category_name": "",
+            "value":             1.0,
+            "visible":           True,
+            "apply_target_type": 0,
+            "item_effect_type":  0,
+            "adjust_params":     [],
+            "time_range":        None,
+            "request_id":        "",
+        })
+        # CapCut's own writer lists the effect ref twice in
+        # extra_material_refs; mirror it so the draft matches byte-for-shape.
+        extra_refs += [eff_id, eff_id]
+
+    segment = {
+        "id":               uuid.uuid4().hex,
+        "material_id":      mat_id,
+        "extra_material_refs": extra_refs,
+        "target_timerange": {"start": 0, "duration": int(dur_us)},
+        "source_timerange": None,
+        "render_timerange": {"start": 0, "duration": 0},
+        "render_index":     max_ri + 1,
+        "track_render_index": 0,
+        "track_attribute":  0,
+        "clip": {
+            "scale":     {"x": _OVERLAY_SCALE, "y": _OVERLAY_SCALE},
+            "rotation":  _OVERLAY_ROTATION,
+            "transform": {"x": _OVERLAY_TRANSFORM_X, "y": _OVERLAY_TRANSFORM_Y},
+            "flip":      {"vertical": False, "horizontal": False},
+            "alpha":     1.0,
+        },
+        "uniform_scale":    {"on": True, "value": 1.0},
+        "speed":            1.0,
+        "volume":           1.0,
+        "last_nonzero_volume": 1.0,
+        "visible":          True,
+        "state":            0,
+        "desc":             "",
+        "group_id":         "",
+        "is_placeholder":   False,
+        "is_loop":          False,
+        "is_tone_modify":   False,
+        "reverse":          False,
+        "intensifies_audio": False,
+        "cartoon":          False,
+        "enable_adjust":    False,
+        "enable_lut":       False,
+        "keyframe_refs":    [],
+        "common_keyframes": [],
+        "caption_info":     None,
+        "template_id":      "",
+        "template_scene":   "default",
+        "source":           "segmentsourcenormal",
+        "responsive_layout": {"enable": False, "target_follow": "",
+            "size_layout": 0, "horizontal_pos_layout": 0, "vertical_pos_layout": 0},
+    }
+    tracks.append({
+        "id":              uuid.uuid4().hex,
+        "type":            "text",
+        "flag":            0,
+        "attribute":       0,
+        "name":            "",
+        "is_default_name": True,
+        "segments":        [segment],
+    })
+
+
 def _capcut_effect_path(capcut_drafts_root: str, resource_id: str):
     """Locate the local cache folder of a downloaded CapCut transition effect.
 
@@ -700,11 +901,23 @@ def build_draft(manifest: dict) -> Path:
                              f'(VO {dur/1e6:.1f}s on a {native/1e6:.1f}s clip) — '
                              f'consider splitting this shot')
                 else:
-                    # legacy / native-length path (speed 1.0) — byte-unchanged
-                    segment = draft.VideoSegment(
-                        material=material,
-                        target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
-                    )
+                    # legacy / native-length path (speed 1.0) — byte-unchanged.
+                    # The interpolated mp4 can be a hair shorter than the
+                    # manifest's frames/fps math (RIFE 2x yields 2n-1 frames),
+                    # so clamp here too: hold the timeline slot but only pull
+                    # the frames the file really has (imperceptible slow-down).
+                    native = material.duration
+                    if native and dur > native:
+                        segment = draft.VideoSegment(
+                            material=material,
+                            target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
+                            source_timerange=draft.Timerange(start=0, duration=native),
+                        )
+                    else:
+                        segment = draft.VideoSegment(
+                            material=material,
+                            target_timerange=draft.Timerange(start=cursor_video_us, duration=dur),
+                        )
 
             if fill_mode == "cover":
                 # Enlarge the animated clip to fill the vertical frame, cropping
@@ -1028,6 +1241,8 @@ def build_draft(manifest: dict) -> Path:
         out_path,
         subtitle_cues if embed_subtitles else None,
         drafts_root,
+        overlay_text=str(manifest.get("overlay_text") or ""),
+        overlay_dur_us=cursor_video_us,
     )
 
     # ── Subtitles sidecar (.srt) ──────────────────────────────────────────
@@ -1059,7 +1274,9 @@ def build_draft(manifest: dict) -> Path:
 
 def rewrite_for_capcut_international(draft_content_path: Path,
                                     subtitle_cues: "List[tuple] | None" = None,
-                                    drafts_root: "Path | None" = None) -> int:
+                                    drafts_root: "Path | None" = None,
+                                    overlay_text: str = "",
+                                    overlay_dur_us: int = 0) -> int:
     """Post-process pyJianYingDraft's draft_content.json so CapCut International
     will open it. Patches:
 
@@ -1074,6 +1291,9 @@ def rewrite_for_capcut_international(draft_content_path: Path,
     3. When `subtitle_cues` is given, inject a recognised-subtitle group built
        from them (see `_inject_subtitles`). Done here because it operates on the
        loaded dict and uses fields outside pyJianYingDraft's model.
+    4. When `overlay_text` is non-empty, inject the full-length channel badge
+       («видео уже на канале») in the upper-right corner (see
+       `_inject_text_overlay`). Shorts-only — set via manifest["overlay_text"].
 
     Returns the number of subtitle segments injected (0 if none).
     """
@@ -1107,6 +1327,18 @@ def rewrite_for_capcut_international(draft_content_path: Path,
             for x in o:
                 normalise_slashes(x)
     normalise_slashes(data)
+
+    # Overlay injection runs AFTER the slash pass on purpose: the multi-line
+    # badge text is stored as an embedded JSON string, where "\n" is the two
+    # characters backslash+n — the blanket pass would mangle it into "/n".
+    # Every path the injector writes is already forward-slash.
+    if overlay_text and overlay_dur_us > 0:
+        try:
+            _inject_text_overlay(data, overlay_text, overlay_dur_us,
+                                 drafts_root or draft_content_path.parent)
+            _log(f'injected channel overlay: {overlay_text!r}')
+        except Exception as e:  # noqa: BLE001
+            _log(f'overlay injection failed ({e!r}) — draft is fine, no overlay')
 
     # 2. Tag the draft as CapCut International. These values were lifted from
     # a working CapCut-authored draft on the same machine (0518). The

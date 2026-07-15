@@ -45,3 +45,13 @@ data/*/comfy/*.bak
 /.hf_cache/
 /.torch_cache/
 data/*/tts/
+
+# Final montage exports (multi-GB mp4s) + «понь» trim backups (wav) + shared voice refs
+data/*/final/
+data/*/_pon_backup/
+data/_voices/
+
+# stray local artifacts
+.next/
+backend_stdout.log
+backend_stderr.log

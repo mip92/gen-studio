@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ExportsService } from './exports.service';
 
@@ -53,6 +53,37 @@ export class ExportsController {
   })
   shortsPlan(@Param('idOrSlug') idOrSlug: string) {
     return this.exports.getShortsPlan(idOrSlug);
+  }
+
+  @Post('shorts/plan')
+  @ApiOperation({
+    summary: 'Add a short to the plan (or replace the same-slug entry)',
+    description:
+      'Upserts one {slug, title, shots[]} entry in scripts/<slug>_shorts_plan.json '
+      + '(creating the file with the standard 1080x1920/cover defaults when it '
+      + 'doesn\'t exist). Shot codes are validated against the project\'s shots. '
+      + 'Returns the updated plan.',
+  })
+  upsertShortPlan(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() body: { slug?: string; title?: string; shots?: string[] },
+  ) {
+    return this.exports.upsertShortPlanEntry(idOrSlug, body);
+  }
+
+  @Delete('shorts/plan/:shortSlug')
+  @ApiOperation({
+    summary: 'Remove a short from the plan',
+    description:
+      'Deletes the entry from scripts/<slug>_shorts_plan.json and drops its '
+      + 'YouTube packaging texts from Project.settings.youtube.shorts. Returns '
+      + 'the updated plan.',
+  })
+  deleteShortPlan(
+    @Param('idOrSlug') idOrSlug: string,
+    @Param('shortSlug') shortSlug: string,
+  ) {
+    return this.exports.deleteShortPlanEntry(idOrSlug, shortSlug);
   }
 
   @Post('shorts')

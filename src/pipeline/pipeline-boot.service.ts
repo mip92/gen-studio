@@ -90,5 +90,13 @@ export class PipelineBootService implements OnModuleInit {
       data:  { status: 'failed', errorMessage: reason, completedAt },
     });
     if (val.count > 0) this.logger.warn(`Boot: failed ${val.count} zombie image-validation job(s)`);
+
+    // Anchor-validation: same in-process Ollama pattern — orphaned 'running' rows
+    // jam the single-slot gate, so fail them on boot (cheap to re-trigger).
+    const anchorVal = await (this.prisma as any).anchorValidationJob.updateMany({
+      where: { status: 'running' },
+      data:  { status: 'failed', errorMessage: reason, completedAt },
+    });
+    if (anchorVal.count > 0) this.logger.warn(`Boot: failed ${anchorVal.count} zombie anchor-validation job(s)`);
   }
 }

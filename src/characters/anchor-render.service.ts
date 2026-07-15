@@ -1,12 +1,18 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, unlinkSync, rmSync, readdirSync, statSync } from 'fs';
+import { createHash } from 'crypto';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { ComfyService } from '../comfy/comfy.service';
 import { normalizeStyleLora } from '../generation/scenes/scene-render.service';
+import { AnchorValidationService, anchorCandidateDir } from '../validation/anchor-validation.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? 'E:\\ComfyUI\\gen-studio';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
+
+/** How many anchor candidates to render per job so the vision model has a pool
+ *  to pick the best clean, on-model, non-anime portrait from (best-of-N). */
+const ANCHOR_CANDIDATES = Math.max(1, Number(process.env.ANCHOR_CANDIDATES ?? 4));
 
 /**
  * Anchor portrait rendering for cartoon-style projects (graphic_novel_cell_shaded etc.).
@@ -67,6 +73,7 @@ export class AnchorRenderService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly comfy:  ComfyService,
+    private readonly anchorValidation: AnchorValidationService,
   ) {}
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -221,6 +228,9 @@ export class AnchorRenderService {
     if (wf['4']?.inputs) wf['4'].inputs.text = negative;
     if (wf['6']?.inputs) wf['6'].inputs.seed = Math.floor(Math.random() * 2 ** 31);
     if (wf['8']?.inputs) wf['8'].inputs.filename_prefix = `anchor_${profile.profileCode}`;
+    // Best-of-N: render a batch of candidates (node 5 EmptyLatentImage) so the
+    // vision validator can pick the best clean, on-model, non-anime portrait.
+    if (wf['5']?.inputs) wf['5'].inputs.batch_size = ANCHOR_CANDIDATES;
 
     let promptId: string;
     try {
@@ -254,11 +264,13 @@ export class AnchorRenderService {
         continue;
       }
 
-      // Pull the file path + copy into data/<slug>/reference/.
+      // Copy ALL candidate portraits into the per-profile candidates dir; the
+      // anchor-validation job then scores them, rejects anime, and installs the
+      // best clean on-model portrait as <profileCode>_anchor.png.
       try {
         const outputs = h.outputs as Record<string, { images?: Array<{ filename: string }> }>;
-        const img     = outputs?.['8']?.images?.[0];
-        if (!img) {
+        const imgs    = (outputs?.['8']?.images ?? []).filter((im) => im?.filename);
+        if (imgs.length === 0) {
           await this.failJob(j.id, 'ComfyUI marked success but produced no images');
           continue;
         }
@@ -271,20 +283,33 @@ export class AnchorRenderService {
           await this.failJob(j.id, 'Profile or attached project disappeared mid-render');
           continue;
         }
-        const srcPath  = path.join(COMFY_OUTPUT, img.filename);
-        const destDir  = path.join(APP_ROOT, 'data', project.slug, 'reference');
-        const destPath = path.join(destDir, `${profile.profileCode}_anchor.png`);
-        mkdirSync(destDir, { recursive: true });
-        if (!existsSync(srcPath)) {
-          await this.failJob(j.id, `ComfyUI output not found at ${srcPath}`);
+        const candDir = anchorCandidateDir(project.slug, profile.profileCode);
+        try { rmSync(candDir, { recursive: true, force: true }); } catch { /* stale candidates */ }
+        mkdirSync(candDir, { recursive: true });
+        const candidates: string[] = [];
+        for (const im of imgs) {
+          const src = path.join(COMFY_OUTPUT, im.filename);
+          if (!existsSync(src)) continue;
+          copyFileSync(src, path.join(candDir, im.filename));
+          candidates.push(im.filename);
+        }
+        if (candidates.length === 0) {
+          await this.failJob(j.id, `ComfyUI outputs not found under ${COMFY_OUTPUT}`);
           continue;
         }
-        copyFileSync(srcPath, destPath);
         await (this.prisma as any).anchorRenderJob.update({
           where: { id: j.id },
-          data:  { status: 'completed', outputPath: destPath, completedAt: new Date() },
+          data:  { status: 'completed', outputPath: candDir, completedAt: new Date() },
         });
-        this.logger.log(`Anchor completed: jobId=${j.id} profile=${profile.profileCode} → ${destPath}`);
+        // Queue neural validation (runs later in the single-slot pipeline, ComfyUI
+        // off). Best-effort: a failure here must NOT fail the render — the
+        // candidates are on disk and can be re-validated manually.
+        try {
+          await this.anchorValidation.enqueue(profile.id, candidates, profile.promptBase ?? null);
+        } catch (e: any) {
+          this.logger.warn(`anchor validation enqueue failed for ${profile.profileCode}: ${e?.message ?? e}`);
+        }
+        this.logger.log(`Anchor render completed: jobId=${j.id} profile=${profile.profileCode} → ${candidates.length} candidate(s), queued validation`);
       } catch (e: any) {
         await this.failJob(j.id, e?.message ?? String(e));
       }
@@ -352,6 +377,117 @@ export class AnchorRenderService {
     writeFileSync(destPath, buffer);
     this.logger.log(`Uploaded anchor for ${profile.profileCode} → ${destPath} (${buffer.length} bytes)`);
     return destPath;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // CANDIDATE gallery + manual anchor selection.
+  //
+  // Anchor render produces ANCHOR_CANDIDATES portraits per job (best-of-N);
+  // the vision validator installs its pick automatically, but the final say is
+  // the user's: the UI lists every candidate with its verdict and lets the
+  // user install ANY of them as the anchor. "Which one is currently the
+  // anchor" is computed by content hash (the installed anchor.png is a byte
+  // copy of one candidate), so no schema change is needed and manual uploads
+  // (which match no candidate) simply show no selection highlight.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  private async profileWithProject(profileId: string) {
+    const profile = await this.prisma.characterProfile.findUnique({
+      where:   { id: profileId },
+      include: { character: { include: { projectLinks: { include: { project: true } } } } },
+    });
+    if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
+    const project = profile.character.projectLinks[0]?.project;
+    if (!project) {
+      throw new BadRequestException(`Character ${profile.character.code} is not attached to any project. Attach it first.`);
+    }
+    return { profile, project };
+  }
+
+  private md5(file: string): string {
+    return createHash('md5').update(readFileSync(file)).digest('hex');
+  }
+
+  /**
+   * Candidate portraits on disk + the latest validation verdicts, merged per
+   * filename. `selected` marks the candidate whose bytes are the currently
+   * installed anchor.png; `chosenByAI` marks the validator's own pick.
+   */
+  async listCandidates(profileId: string) {
+    const { profile, project } = await this.profileWithProject(profileId);
+    const candDir = anchorCandidateDir(project.slug, profile.profileCode);
+    const files = existsSync(candDir)
+      ? readdirSync(candDir).filter((f) => /\.(png|jpe?g|webp)$/i.test(f)).sort()
+      : [];
+
+    const valJobs = await (this.prisma as any).anchorValidationJob.findMany({
+      where:   { profileId },
+      orderBy: { queuedAt: 'desc' },
+      take:    10,
+    });
+    const lastCompleted = valJobs.find((v: any) => v.status === 'completed') ?? null;
+    const valActive     = valJobs.some((v: any) => v.status === 'pending' || v.status === 'running');
+    const verdicts = new Map<string, any>(
+      (Array.isArray(lastCompleted?.result) ? lastCompleted.result : []).map((v: any) => [v.filename, v]),
+    );
+
+    const anchorPath = await this.getAnchorPath(profileId);
+    const anchorHash = anchorPath ? this.md5(anchorPath) : null;
+
+    const candidates = files.map((f) => {
+      const full = path.join(candDir, f);
+      const st   = statSync(full);
+      return {
+        filename:   f,
+        size:       st.size,
+        mtime:      st.mtimeMs,
+        verdict:    verdicts.get(f) ?? null,
+        chosenByAI: lastCompleted?.chosenFilename === f,
+        selected:   anchorHash !== null && this.md5(full) === anchorHash,
+      };
+    });
+
+    return {
+      profileId,
+      profileCode:      profile.profileCode,
+      anchorExists:     anchorPath !== null,
+      /** true when the installed anchor matches none of the candidates (manual upload / older render) */
+      anchorIsExternal: anchorPath !== null && candidates.every((c) => !c.selected),
+      validationActive: valActive,
+      validation: lastCompleted ? {
+        jobId:           lastCompleted.id,
+        completedAt:     lastCompleted.completedAt,
+        chosenFilename:  lastCompleted.chosenFilename ?? null,
+        suggestedPrompt: lastCompleted.suggestedPrompt ?? null,
+      } : null,
+      candidates,
+    };
+  }
+
+  /** Absolute path of one candidate file, with traversal protection. */
+  async getCandidatePath(profileId: string, filename: string): Promise<string> {
+    if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+      throw new BadRequestException('bad filename');
+    }
+    const { profile, project } = await this.profileWithProject(profileId);
+    const full = path.join(anchorCandidateDir(project.slug, profile.profileCode), filename);
+    if (!existsSync(full)) throw new NotFoundException(`Candidate ${filename} not found for ${profile.profileCode}`);
+    return full;
+  }
+
+  /**
+   * Manually install one candidate as the profile's anchor.png — the user's
+   * override of (or agreement with) the validator's pick.
+   */
+  async selectCandidate(profileId: string, filename: string): Promise<{ anchorPath: string }> {
+    const src = await this.getCandidatePath(profileId, filename);
+    const { profile, project } = await this.profileWithProject(profileId);
+    const destDir  = path.join(APP_ROOT, 'data', project.slug, 'reference');
+    const destPath = path.join(destDir, `${profile.profileCode}_anchor.png`);
+    mkdirSync(destDir, { recursive: true });
+    copyFileSync(src, destPath);
+    this.logger.log(`Anchor manually selected for ${profile.profileCode}: ${filename} → ${destPath}`);
+    return { anchorPath: destPath };
   }
 
   // ─────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,138 @@
+# -*- coding: utf-8 -*-
+"""collector atmosphere breathers — act tails A1..A10, id_region='a'.
+§5.1a: EVERY act has its OWN scale scheme, angles, moves and subject pool — no shared template.
+Every insert carries a concrete VO beat (feedback-broll-must-carry-vo). All env -> static.
+PYTHONIOENCODING=utf-8 python scripts/_seed_collector_atmo.py"""
+from _collector_engine import seed_act
+
+# (scene_key, act_idx, palette, [(subj, st, ang, mv, tod, narr), ...])
+ACTS=[
+ ("origin",1,"faded warm nineties palette, worn browns and dim bulb yellow against winter grey, threadbare domestic warmth",[
+  ("an extreme close-up insert of a folded newspaper page with exchange-rate columns and a pencil underline","ECU","top","static","day",
+   "курс в газете за ту зиму меняется трижды, и отец подчёркивает его карандашом каждое утро."),
+  ("a wide view of an empty clothes market, rows of bare stalls, traders' fires burning in steel barrels","WS","eye","pull_out","day",
+   "вещевой рынок стоит рядами пустых прилавков, и торговцы греют руки у костров в железных бочках."),
+  ("a medium view of the family supper table set with soup and bread, an old radio where the television used to murmur","MS","high","pan_left","evening",
+   "ужин теперь без телевизора: суп, хлеб и радио, которое ловит только одну волну."),
+  ("an extreme close-up insert of an old tea tin holding small coins on a kitchen shelf","ECU","eye","push_in","evening",
+   "в жестяной банке из-под чая мать держит мелочь на хлеб до конца недели."),
+  ("a wide view of a snowy courtyard with children sledding down an ice slide on flattened cardboard","WS","low","static","day",
+   "во дворе дети катаются с ледяной горки на картонках, и ты среди них самый тихий."),
+ ]),
+ ("callcenter",2,"recession palette, drained office greys and fluorescent white with sickly warm accents, cheap and tense",[
+  ("a medium view of the evening call floor, half the cubicles dark, a few hunched figures still dialing under the tubes","MS","high","pan_right","night",
+   "после девяти в зале остаются самые голодные до бонусов, и ты всегда среди них."),
+  ("an extreme close-up insert of a cooling paper cup of instant coffee beside a worn keyboard","ECU","pov","static","night",
+   "на столах стынут стаканы с растворимым кофе, смены меряют не часами, а количеством номеров."),
+  ("a wide view of the recession city at night from an office window, blocks of windows going dark early","WS","eye","tilt_up","night",
+   "за окнами кризисный город гасит окна раньше обычного, здесь экономят уже даже на свете."),
+  ("an extreme close-up insert of a printed debtor list, a young thumb sliding down a column of sums","ECU","top","static","day",
+   "в списках должников той осени всё чаще попадаются твои ровесники с первыми кредитными картами."),
+  ("a medium view of the office porch with two distant figures smoking apart from each other in flat light","MS","dutch","push_in","day",
+   "на крыльце операторы курят молча и коротко, разговаривать про эту работу здесь не принято."),
+ ]),
+ ("talent",3,"ascending cold palette, steel grey and monitor blue gaining polish, small gold accents of first money",[
+  ("a wide view of a growing city skyline with construction cranes standing over every third block","WS","eye","push_in","day",
+   "город тем временем строится и берёт в долг: краны стоят над каждым третьим кварталом."),
+  ("an extreme close-up insert of a whiteboard marker worn flat beside an eraser smudged with old names","ECU","top","static","day",
+   "маркер у доски бонусов стирается за месяц до основания, фамилии переписывают каждую пятницу."),
+  ("a medium view of a first dark suit on a hanger by a rented room window, trousers pressed under gauze","MS","eye","pan_left","evening",
+   "первый костюм висит на плечиках у окна, и ты гладишь брюки через марлю, как учила мать."),
+  ("a wide view of the empty midnight call floor, one desk lamp left on, a cleaner's cart between the rows","WS","high","static","night",
+   "к полуночи зал пустеет, и уборщица обходит столы, собирая стаканы и обрывки скриптов."),
+  ("an extreme close-up insert of a tie knot being drawn tight and square at a young man's collar","ECU","eye","push_in","day",
+   "узел галстука ты перевязываешь трижды каждое утро, пока он не встаёт идеально ровно."),
+ ]),
+ ("field",4,"door-to-door palette, damp stairwell green-grey and steel, one aggressive yellow accent, hard flat light",[
+  ("an extreme close-up insert of a set of service car keys on a folder of addresses with a pack of wet wipes","ECU","top","static","day",
+   "служебные ключи, папка адресов и влажные салфетки для рук — весь твой рабочий набор."),
+  ("a medium view of a battered elevator interior, scorched buttons and scratched steel walls","MS","eye","static","day",
+   "лифты в этих домах пахнут железом и куревом, и кнопки в них вечно подожжены."),
+  ("a wide view of a rainy empty courtyard, children's bicycles chained and soaked by the entrances","WS","eye","tilt_down","day",
+   "в дождь дворы пустеют, и только у подъездов мокнут детские велосипеды на цепных замках."),
+  ("a medium view of an apartment door with a yellow sticker half torn away, a pale glue ghost across the seam","MS","dutch","push_in","day",
+   "жёлтые стикеры срывают к вечеру, но след от клея остаётся на двери неделями."),
+  ("an extreme close-up insert of a small paper envelope wrapped in a handkerchief lying in a cash tray","ECU","eye","static","day",
+   "конверты от старушек ты сдаёшь в кассу не пересчитывая, кассирша пересчитывает их за тебя."),
+  ("a wide view of an evening street with minibuses full of lit windows rolling home through slush","WS","low","track","evening",
+   "город к вечеру едет домой в жёлтых окнах маршруток, и у каждого пятого там кредит."),
+ ]),
+ ("career",5,"settled success palette, warm home amber against corporate glass grey, clean and comfortable",[
+  ("a medium view of a half-assembled white baby crib in a warm-lit room, tools laid neatly on the floor","MS","eye","push_in","evening",
+   "кроватку для дочери ты собираешь сам за один вечер, инструкцию так и не открыв."),
+  ("a wide view from an apartment balcony over a green park at dusk, strings of lights between the trees","WS","eye","pan_right","evening",
+   "с балкона вашей двушки виден парк, и по выходным там пахнет шашлыком и сахарной ватой."),
+  ("an extreme close-up insert of a plain wedding band on a man's hand resting on a leather folder","ECU","top","static","day",
+   "обручальное кольцо ты не снимаешь даже на переговорах, оно работает на образ надёжности."),
+  ("a medium view of a family table by a cafe window, a high chair drawn up, steam on the glass","MS","eye","static","evening",
+   "по воскресеньям вы ужинаете в том самом кафе, и официанты помнят ваш столик у окна."),
+  ("a wide view of the agency floor emptying at seven, coats going over shoulders, the dashboard resting green","WS","high","pull_out","evening",
+   "работа отпускает тебя ровно в семь, и два года подряд это кажется навсегда."),
+ ]),
+ ("no_return",6,"verdict palette, cold document white and steel grey, a dying warm bulb accent, airless and heavy",[
+  ("a wide view of the night floor with a doubled duty row lit, headsets bent to screens under the dimmed panels","WS","high","push_in","night",
+   "после подписания регламента ночная смена расширяется вдвое, и звонки заканчиваются без двадцати полночь."),
+  ("an extreme close-up insert of an intensive-call roster on a monitor, names packed dense as a school register","ECU","pov","static","night",
+   "в таблице интенсива фамилии должников стоят плотно, как в школьном журнале, только без оценок."),
+  ("a medium view of the dim hallway with the empty stool under the telephone shelf, the receiver at rest","MS","eye","static","day",
+   "табурет под телефонной полкой так и стоит в пустой квартире, которую продаёт его дочь."),
+  ("an extreme close-up insert of a legal file being shelved into a row of identical binders","ECU","eye","push_in","day",
+   "заключение юристов подшивают в папку, папку ставят на полку, полку запирают на ключ."),
+  ("a wide view of the credit-lit city at night beyond the office glass, calm rows of sleeping windows","WS","eye","static","night",
+   "город за окнами отдела живёт в кредит и спит спокойно, пока кто-то не позвонит."),
+ ]),
+ ("empire",7,"glass empire palette, blue dashboard glow and night office black, home amber shrinking to one doorway",[
+  ("an extreme close-up insert of a child's crayon drawing on a fridge held by a single magnet","ECU","eye","static","day",
+   "рисунок дочери так и висит на холодильнике, но держит его теперь один магнит."),
+  ("a wide view of the immaculate living room, cushions squared, one lamp on, nothing out of place","WS","eye","pan_left","evening",
+   "в квартире теперь всегда идеальный порядок, потому что беспорядок в ней делать больше некому."),
+  ("a medium view of a suit jacket hanging on the back of an office chair in a dark glass office","MS","eye","push_in","night",
+   "пиджак ночует на спинке кресла чаще, чем ты дома, и это никого не удивляет."),
+  ("a wide view of distant fireworks over the city seen through the office window, the floor dark behind","WS","low","static","night",
+   "новый год ты дважды встречаешь в кабинете, глядя на чужие салюты через стекло."),
+  ("an extreme close-up insert of a phone alarm screen set to six thirty, weekend toggles all off","ECU","top","static","night",
+   "будильник в телефоне стоит на шесть тридцать, и выходные в нём не отмечены."),
+ ]),
+ ("father",8,"mourning palette, black cloth and birch white against wet grey, one warm kitchen amber far away",[
+  ("an extreme close-up insert of an old enamel mug washed and set upside down on a drying rack","ECU","eye","static","evening",
+   "отцовскую кружку она моет и ставит на сушилку, хотя пить из неё некому."),
+  ("a medium view of the yellow kitchen with only the stove light on, the rest of the flat dark","MS","eye","push_in","night",
+   "мать теперь живёт одна и по вечерам зажигает свет только на кухне."),
+  ("a wide view of the winter cemetery, the numbered metal marker dusted with snow among fenced plots","WS","eye","static","day",
+   "до весны на могиле только табличка с номером, и мать ездит туда по воскресеньям."),
+  ("an extreme close-up insert of a paper bus timetable pinned by a door, one line worn from a tracing finger","ECU","pov","static","day",
+   "автобус до кладбища ходит дважды в день, и расписание она знает наизусть."),
+  ("a medium view of a push-button phone lying face-up on the kitchen oilcloth beside a folded newspaper","MS","top","pan_right","evening",
+   "кнопочный телефон лежит на клеёнке экраном вверх, и звонит он теперь совсем редко."),
+ ]),
+ ("catastrophe",9,"reckoning palette, ice-blue monitor light cutting into warm kitchen yellow, night and verdict",[
+  ("a wide view of the microloan storefront glowing at night, percent posters lit brighter than the pharmacy beside it","WS","eye","push_in","night",
+   "точка «Деньги сразу» светится до одиннадцати, ярче аптеки и продуктового вместе взятых."),
+  ("a medium view of the night duty row working steadily, headsets and scripts under the dimmed panels","MS","high","static","night",
+   "ночная смена работает штатно: у операторов наушники, скрипты и норма в шесть обещаний."),
+  ("an extreme close-up insert of a tidy folder of receipts and pharmacy cheques bound with an elastic band","ECU","top","static","day",
+   "в её папке всё по порядку: квитанции, чеки за лекарства и график, который поехал."),
+  ("a wide view of the empty dawn street, traffic lights blinking amber over bare asphalt","WS","eye","pan_left","dawn",
+   "к рассвету улицы ещё пустые, и светофоры мигают жёлтым на холостом ходу."),
+  ("an extreme close-up insert of an audio player interface, a cursor hovering over the same dated recording","ECU","pov","push_in","night",
+   "запись от третьего октября ты переслушиваешь четыре раза, дальше листать не можешь."),
+ ]),
+ ("aftermath",10,"settling palette, washed morning grey and paper white, the office blue draining out of the world",[
+  ("a medium view of the open van interior with tools racked in strict order, a level laid true on a shelf","MS","eye","pan_right","day",
+   "в фургоне у тебя теперь порядок, как когда-то в отчётах: каждый ключ на своём месте."),
+  ("a wide view of the workman's van parked by a panel-block entrance, a new door leaning against it in film","WS","eye","static","day",
+   "заказчики в спальных районах предлагают чай, и ты соглашаешься чаще, чем отказываешься."),
+  ("an extreme close-up insert of a new lock set in an opened box, keys fanned on the cardboard","ECU","top","push_in","day",
+   "замки ты советуешь, как когда-то советовал графики платежей: спокойно и со знанием дела."),
+  ("a medium view of a fresh steel door fitted in an old stairwell frame, shavings swept into a neat pile","MS","low","static","day",
+   "двери ты ставишь по три в день, и каждая запирается изнутри, а не снаружи."),
+  ("a wide view of the ordinary evening city, lit windows stacked into the dusk above moving traffic","WS","eye","tilt_up","evening",
+   "город живёт, как жил: берёт в долг, отдаёт, не отдаёт, и кому-то опять звонят."),
+ ]),
+]
+
+if __name__=="__main__":
+    for sk,ai,pal,items in ACTS:
+        shots=[("A%d_SZ5%d"%(ai,i+1), None, None, subj, st, ang, mv, tod, True, False, narr)
+               for i,(subj,st,ang,mv,tod,narr) in enumerate(items[:4])]  # max 4 per act tail (user 2026-07-04)
+        seed_act(sk, pal, shots, render_mode="static", id_region="a")

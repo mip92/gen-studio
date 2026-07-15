@@ -2,7 +2,7 @@ import { BadRequestException, Body, Controller, Get, NotFoundException, Param, P
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '../prisma/prisma.service';
 
-type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation';
+type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation' | 'anchor_validation';
 
 interface QueueRow {
   type:          JobType;
@@ -110,7 +110,7 @@ export class PipelineController {
     // without N+1 queries.
     const bgmInclude     = { segment: { include: { block: { include: { project: true } } } } };
 
-    const [trA, dsA, scA, vrA, ttsA, bgmA, anA, valA] = await Promise.all([
+    const [trA, dsA, scA, vrA, ttsA, bgmA, anA, valA, avA] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.datasetJob.findMany({     where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.sceneRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
@@ -127,9 +127,10 @@ export class PipelineController {
       this.prisma.audioRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: bgmInclude, orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).imageValidationJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: shotInclude, orderBy: { queuedAt: 'asc' } }),
+      (this.prisma as any).anchorValidationJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
     ]);
 
-    const [trR, dsR, scR, vrR, vrUR, vrIR, ttsR, bgmR, anR, valR] = await Promise.all([
+    const [trR, dsR, scR, vrR, vrUR, vrIR, ttsR, bgmR, anR, valR, avR] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.datasetJob.findMany({     where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.sceneRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude,    orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
@@ -145,6 +146,7 @@ export class PipelineController {
       this.prisma.audioRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: bgmInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       (this.prisma as any).imageValidationJob.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
+      (this.prisma as any).anchorValidationJob.findMany({ where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
     ]);
 
     // Each VideoRender row can contribute three queue rows (main + upscale + interp).
@@ -168,6 +170,7 @@ export class PipelineController {
       ...bgmA.map(normalizeBgm),
       ...anA.map(normalizeAnchor),
       ...valA.map(normalizeValidation),
+      ...avA.map(normalizeAnchorValidation),
       ...trR.map(normalizeTraining),
       ...dsR.map(normalizeDataset),
       ...scR.map(normalizeScene),
@@ -176,6 +179,7 @@ export class PipelineController {
       ...bgmR.map(normalizeBgm),
       ...anR.map(normalizeAnchor),
       ...valR.map(normalizeValidation),
+      ...avR.map(normalizeAnchorValidation),
     ];
 
     // ── 1b. Pending FIFO position ──────────────────────────────────────────
@@ -372,6 +376,15 @@ export class PipelineController {
         data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
       });
     }
+    if (type === 'anchor_validation') {
+      const j = await (this.prisma as any).anchorValidationJob.findUnique({ where: { id } });
+      if (!j) throw new NotFoundException(`anchor validation job ${id} not found`);
+      if (TERMINAL.includes(j.status)) return j;
+      return (this.prisma as any).anchorValidationJob.update({
+        where: { id },
+        data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
+      });
+    }
     const job = await this.fetchOne(type, id);
     if (TERMINAL.includes(job.status)) return job;
     const data = { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' };
@@ -491,6 +504,25 @@ export class PipelineController {
       if (!j) throw new NotFoundException(`validation job ${id} not found`);
       return normalizeValidation(j);
     }
+    if (type === 'anchor_validation') {
+      const j = await (this.prisma as any).anchorValidationJob.findUnique({
+        where: { id },
+        include: {
+          profile: {
+            include: {
+              character: {
+                include: {
+                  project:      true,
+                  projectLinks: { include: { project: { select: { id: true, slug: true, name: true } } } },
+                },
+              },
+            },
+          },
+        },
+      });
+      if (!j) throw new NotFoundException(`anchor validation job ${id} not found`);
+      return normalizeAnchorValidation(j);
+    }
     const v = await this.prisma.videoRender.findUnique({
       where: { id },
       include: { shot: { include: { project: true, scene: true } } },
@@ -524,7 +556,7 @@ export class PipelineController {
       shot:  { include: { project: true, scene: true } },
     };
     const bgmInclude = { segment: { include: { block: { include: { project: true } } } } };
-    const [tr, ds, sc, vr, vrU, vrI, tts, bgm, an, val] = await Promise.all([
+    const [tr, ds, sc, vr, vrU, vrI, tts, bgm, an, val, av] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.datasetJob.findMany({     where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.sceneRenderJob.findMany({ where: { status: 'pending' },        include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
@@ -535,6 +567,7 @@ export class PipelineController {
       this.prisma.audioRenderJob.findMany({ where: { status: 'pending' },        include: bgmInclude,     orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: 'pending' }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).imageValidationJob.findMany({ where: { status: 'pending' }, include: shotInclude, orderBy: { queuedAt: 'asc' } }),
+      (this.prisma as any).anchorValidationJob.findMany({ where: { status: 'pending' }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
     ]);
     return [
       ...tr.map(normalizeTraining),
@@ -547,6 +580,7 @@ export class PipelineController {
       ...bgm.map(normalizeBgm),
       ...an.map(normalizeAnchor),
       ...val.map(normalizeValidation),
+      ...av.map(normalizeAnchorValidation),
     ].sort((a, b) => a.queuedAt.getTime() - b.queuedAt.getTime());
   }
 
@@ -561,6 +595,7 @@ export class PipelineController {
     if (type === 'bgm')           return this.prisma.audioRenderJob.update({ where: { id }, data: { queuedAt } });
     if (type === 'anchor')        return (this.prisma as any).anchorRenderJob.update({ where: { id }, data: { queuedAt } });
     if (type === 'validation')    return (this.prisma as any).imageValidationJob.update({ where: { id }, data: { queuedAt } });
+    if (type === 'anchor_validation') return (this.prisma as any).anchorValidationJob.update({ where: { id }, data: { queuedAt } });
     return this.prisma.tTSJob.update({ where: { id }, data: { queuedAt } });
   }
 }
@@ -568,7 +603,7 @@ export class PipelineController {
 function isJobType(t: string): t is JobType {
   return t === 'training' || t === 'dataset' || t === 'scene'
       || t === 'video'    || t === 'video_upscale' || t === 'video_interp' || t === 'tts'
-      || t === 'bgm'      || t === 'anchor'  || t === 'validation';
+      || t === 'bgm'      || t === 'anchor'  || t === 'validation' || t === 'anchor_validation';
 }
 
 function cmp(a: QueueRow, b: QueueRow, field: SortField, order: 'asc' | 'desc'): number {
@@ -777,6 +812,29 @@ function normalizeAnchor(j: any): QueueRow {
     id:            j.id,
     status:        j.status,
     profileCode:   `🎭 ${j.profile?.profileCode ?? '—'}`,
+    characterCode: j.profile?.character?.code ?? '—',
+    projectSlug:   j.profile?.character?.project?.slug ?? j.profile?.character?.projectLinks?.[0]?.project?.slug ?? null,
+    projectId:     j.profile?.character?.project?.id   ?? j.profile?.character?.projectLinks?.[0]?.project?.id   ?? null,
+    shotId:        null,
+    triggerToken:  j.profile?.triggerToken ?? null,
+    queuedAt:      j.queuedAt,
+    startedAt:     j.startedAt ?? null,
+    completedAt:   j.completedAt ?? null,
+    errorMessage:  j.errorMessage ?? null,
+    isFirstPending: false,
+    isLastPending:  false,
+  };
+}
+
+function normalizeAnchorValidation(j: any): QueueRow {
+  // Anchor validation (Ollama vision) — scores a profile's anchor candidates,
+  // rejects anime, installs the best. Per-profile like the anchor render row;
+  // 🔎🎭 marks it in the queue UI.
+  return {
+    type:          'anchor_validation',
+    id:            j.id,
+    status:        j.status,
+    profileCode:   `🔎🎭 ${j.profile?.profileCode ?? '—'}`,
     characterCode: j.profile?.character?.code ?? '—',
     projectSlug:   j.profile?.character?.project?.slug ?? j.profile?.character?.projectLinks?.[0]?.project?.slug ?? null,
     projectId:     j.profile?.character?.project?.id   ?? j.profile?.character?.projectLinks?.[0]?.project?.id   ?? null,

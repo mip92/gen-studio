@@ -7,39 +7,29 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "У ДВОРНИКА ЛИНЕЙКА С БАЙКОНУРА 🚀",
       "shots": [
-        "C_SH01",
         "C_SH02",
         "C_SH03",
-        "C_SH06",
-        "C_SH09",
-        "C_SH12"
-      ]
-    },
-    {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "A6_SH01",
-        "A6_SH02",
-        "A6_SH03",
-        "A6_SH08",
-        "A6_SH09",
-        "A6_SH13"
+        "C_SH04",
+        "C_SH05",
+        "C_SH06"
       ]
     },
     {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "ПО ТЕЛЕВИЗОРУ ЛЕБЕДИНОЕ ОЗЕРО 📺",
       "shots": [
-        "Z_SH02",
-        "Z_SH04",
-        "Z_SH09",
-        "Z_SH12",
-        "Z_SH13",
-        "Z_SH18"
+        "L_SH26",
+        "L_SH27",
+        "L_SH29",
+        "L_SH32",
+        "L_SH37",
+        "L_SH38",
+        "L_SH40",
+        "A2_SH03"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

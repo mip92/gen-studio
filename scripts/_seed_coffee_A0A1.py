@@ -1,0 +1,88 @@
+# -*- coding: utf-8 -*-
+"""coffee A0 cold_open + A1 origin. Run: PYTHONIOENCODING=utf-8 python scripts/_seed_coffee_A0A1.py"""
+from _coffee_engine import seed_act
+
+P_COLD="golden opening-morning palette, honey sunlight and copper gleam, orange cups against cream, festive warm"
+P_ORIGIN="childhood summer palette, amber kitchen light and green courtyard, copper and cinnamon browns, storybook warm"
+
+COLD=[
+ ("A0_SH01",None,"new_cafe47","a wide establishing view of a brand-new corner cafe on opening morning, a ribbon on the door, orange balloons, a cheerful queue down the sunny pavement","WS","eye","push_in","day",True,False,
+  "утро, лента на дверях, шары, и очередь к сорок седьмой кофейне твоей сети стоит до самого угла."),
+ ("A0_SH02","ASYA_ADULT","new_cafe47","a medium shot of a radiant copper-haired woman of thirty-one in a yellow apron working the espresso machine behind the new counter","MS","eye","static","day",False,False,
+  "тебе тридцать один, и ты сама встаёшь за машину на каждом открытии, это твоё железное правило."),
+ ("A0_SH03","OBJ:cinnamon",None,"an extreme close-up macro insert of a squat glass cinnamon jar with a hand-written label standing beside a steaming espresso machine","ECU","eye","static","day",True,False,
+  "баночка корицы с рукописной этикеткой стоит у машины, как стояла когда-то на бабушкиной кухне."),
+ ("A0_SH04","ASYA_ADULT","new_cafe47","a medium close-up of the woman drawing on milk foam with a tiny spoon of cinnamon, tongue-tip concentration and a smile","MCU","high","push_in","day",False,True,
+  "ты ведёшь ложечкой по пенке первого капучино и выводишь корицей маленькое ровное солнышко."),
+ ("A0_SH05",None,None,"an extreme close-up insert of a cappuccino cup with a cinnamon sun drawn on the white foam, steam curling in sunlight","ECU","top","static","day",True,True,
+  "это солнышко знает вся страна: его рисуют в сорока семи кофейнях в двенадцати городах."),
+ ("A0_SH06",None,"new_cafe47","a wide view of the happy queue outside the glass, breath steaming, phones out photographing the balloons","WS","eye","pan_right","day",True,False,
+  "в очереди смеются, дышат паром и фотографируют шары, и никто никуда не спешит."),
+ ("A0_SH07","ASYA_ADULT","new_cafe47","a medium shot of the woman glancing toward a lit shelf where a small copper pot stands behind glass","MS","eye","static","day",False,False,
+  "на полке за стеклом стоит медная турка с гнутой ручкой, и она старше тебя почти вдвое."),
+ ("A0_SH08","OBJ:cezve",None,"an extreme close-up macro insert of the copper cezve on a lit shelf, its hammered sides catching the morning sun","ECU","eye","push_in","day",True,False,
+  "с этой турки началось всё, что у тебя есть, включая запах этого самого утра."),
+ ("A0_SH09",None,"new_cafe47","a close-up view of hands passing an orange cup with a cinnamon-stick emblem through the takeaway window into mittened hands","CU","eye","static","day",True,False,
+  "первый оранжевый стакан этого утра уходит в варежки, и очередь встречает его аплодисментами."),
+ ("A0_SH10","ASYA_ADULT","new_cafe47","a medium close-up of the copper-haired woman turning warmly toward the viewer over the counter steam","MCU","eye","push_in","day",False,False,
+  "останься со мной до конца, я расскажу, как картонная коробка из двора выросла в сеть кофеен."),
+ ("A0_SH11","ASYA_ADULT","new_cafe47","a close-up of the woman's freckled smiling face, morning sun in her copper hair","CU","eye","push_in","day",False,False,
+  "подпишись, эта история тёплая, как правильный капучино, и в ней всё получилось не сразу."),
+ ("A0_SH12",None,"new_cafe47","a wide view of the sunlit new cafe interior, copper lamps, yellow accents, the queue flowing in through the open door","WS","low","pull_out","day",True,False,
+  "а начиналась она на кухне, где солнце вставало прямо в медных боках посуды, когда тебе восемь."),
+]
+
+ORIGIN=[
+ ("A1_SH01",None,"gran_kitchen","a wide establishing view of a small sunlit grandmother's kitchen, copper pots glowing on open shelves, lace curtains full of morning light","WS","eye","push_in","day",True,False,
+  "тебе восемь, и лучшее место на свете — бабушкина кухня, где на полках блестит медь."),
+ ("A1_SH02","GRAN_BASE","gran_kitchen","a medium shot of a warm round grandmother in a red polka-dot headscarf tending a tiny copper pot on a gas ring","MS","eye","static","day",False,False,
+  "бабушка варит тебе какао в маленькой медной турке и никому не доверяет эту работу."),
+ ("A1_SH03","OBJ:cezve",None,"an extreme close-up macro insert of the copper cezve on a blue gas flame, cocoa rising slowly to the brim","ECU","eye","static","day",True,False,
+  "у турки гнутая деревянная ручка и бока в мелких вмятинах, и каждая вмятина — со своей историей."),
+ ("A1_SH04","GRAN_BASE","gran_kitchen","a medium close-up of the grandmother sprinkling a pinch of cinnamon over a steaming cup, ceremonious and sly","MCU","eye","static","day",False,True,
+  "сверху она всегда сыплет щепотку корицы и говорит своё главное: кофе должен пахнуть домом."),
+ ("A1_SH05","ASYA_KID","gran_kitchen","a close-up of a freckled eight-year-old girl in a yellow beret breathing in the steam over a cup, eyes closed with pleasure","CU","eye","push_in","day",False,False,
+  "ты втягиваешь этот запах носом и решаешь про себя, что будешь заниматься им всю жизнь."),
+ ("A1_SH06",None,"yard_home","a wide view of a green summer courtyard with a big cardboard box set up as a play cafe, chalk drawings on the paving","WS","eye","pan_left","day",True,False,
+  "летом во дворе ты строишь из большой картонной коробки собственную кофейню с настоящим окошком."),
+ ("A1_SH07","OBJ:box_cafe",None,"an extreme close-up macro insert of a crooked marker-drawn menu taped to a cardboard box, childish letters and prices","ECU","eye","static","day",True,True,
+  "меню написано фломастером криво, зато честно: какао, компот и печенье, всё по две монетки."),
+ ("A1_SH08","ASYA_KID","yard_home","a medium shot of the girl in the yellow beret standing proudly behind the cardboard serving window","MS","low","static","day",False,False,
+  "первым гостем становится отец: он покупает какао и с серьёзным лицом просит книгу жалоб."),
+ ("A1_SH09","DAD_BASE","yard_home","a medium close-up of a big flannel-shirted father drinking from a tiny toy cup with exaggerated care","MCU","eye","static","day",False,False,
+  "отец мягко смеётся, что кофейня — это не профессия, но выпивает всё до самого дна."),
+ ("A1_SH10",None,None,"an extreme close-up insert of small child hands counting a pile of small coins on a sunny windowsill","ECU","top","static","day",True,False,
+  "за воскресенье ты зарабатываешь четырнадцать монеток и пересчитываешь их одиннадцать раз подряд."),
+ ("A1_SH11",None,"family_flat","a wide view of a warm family flat in the evening, tea things on a round table under a fabric-shaded lamp","WS","eye","static","evening",True,False,
+  "вечером вы всей семьёй пьёте чай, и ты объявляешь торжественно, что у тебя теперь дело."),
+ ("A1_SH12","GRAN_BASE","family_flat","a medium shot of the grandmother listening to the child across the table, chin on her hand, entirely serious","MS","eye","static","evening",False,False,
+  "одна бабушка не смеётся: она слушает тебя так, как слушают взрослых компаньонов."),
+ ("A1_SH13","GRAN_BASE","family_flat","a close-up of the grandmother's warm wrinkled eyes under the polka-dot headscarf, lamplight soft on her face","CU","eye","push_in","evening",False,False,
+  "она говорит: запомни, внучка, люди приходят не за кофе, а за тем, как их встречают."),
+ ("A1_SH14","ASYA_KID","gran_kitchen","a medium shot of the girl on a stool at the stove stirring the cezve under the grandmother's guiding eye","MS","over","static","day",False,False,
+  "с того лета бабушка учит тебя варить по-настоящему: не спешить, слушать пенку и не убегать."),
+ ("A1_SH15",None,None,"an extreme close-up insert of a child's hand sprinkling cinnamon over foam, a lopsided sun taking shape","ECU","top","push_in","day",True,True,
+  "корицу ты сыплешь уже сама, и первое солнышко на пенке выходит кривым, как твоё меню."),
+ ("A1_SH16","ASYA_KID","yard_home","a medium close-up of the girl handing a toy cup through the cardboard window to unseen hands, beaming","MCU","eye","static","day",False,False,
+  "к августу у твоей коробки есть постоянные гости: соседка, почтальон и два голубя без денег."),
+ ("A1_SH17",None,"yard_home","a wide view of the courtyard in late golden afternoon, the cardboard cafe throwing a long important shadow","WS","eye","tilt_down","evening",True,False,
+  "голубям ты наливаешь воду в блюдце бесплатно, потому что постоянным гостям положены привилегии."),
+ ("A1_SH18","GRAN_BASE","gran_kitchen","a medium shot of the grandmother setting the copper cezve down in front of the girl with both hands, like a medal","MS","eye","static","evening",False,True,
+  "в конце лета бабушка ставит турку перед тобой и говорит просто: теперь она твоя."),
+ ("A1_SH19","ASYA_KID","gran_kitchen","a close-up of the girl hugging the copper pot to her chest, cheek against the cool metal","CU","eye","push_in","evening",False,False,
+  "ты обещаешь, что когда вырастешь, сваришь ей первый настоящий кофе в собственной кофейне."),
+ ("A1_SH20",None,"gran_kitchen","a wide view of the kitchen at sunset, low sun landing exactly in the copper sides of pots and the little cezve","WS","eye","static","evening",True,False,
+  "это обещание вы скрепляете какао, и солнце садится этим вечером прямо в медные бока турки."),
+ ("A1_SH21","ASYA_KID","family_flat","a medium shot of the girl drawing at the round table, tongue out, ruler and coloured pencils in action","MS","high","static","evening",False,False,
+  "в тетради по математике с задней стороны появляется первый чертёж кофейни твоей мечты."),
+ ("A1_SH22",None,None,"an extreme close-up insert of a child's drawing of a cafe: six tables, a huge window, a sign with a cinnamon stick for a letter","ECU","top","static","evening",True,False,
+  "на рисунке шесть столиков, большое окно и вывеска, где вместо одной буквы — палочка корицы."),
+ ("A1_SH23","DAD_BASE","family_flat","a medium close-up of the father looking at the drawing over the girl's shoulder, scepticism losing to a smile","MCU","over","static","evening",False,False,
+  "отец разглядывает чертёж, хмыкает про несущие стены и втихаря подписывает внизу: одобрено."),
+ ("A1_SH24",None,"city_bright","a wide view of the cheerful pastel main street of a small city in summer light, striped awnings and bicycles","WS","eye","pan_right","day",True,False,
+  "город за окном пока прекрасно обходится без твоей кофейни, но это, честно говоря, вопрос времени."),
+]
+
+if __name__=="__main__":
+    seed_act("cold_open",P_COLD,COLD)
+    seed_act("origin",P_ORIGIN,ORIGIN)

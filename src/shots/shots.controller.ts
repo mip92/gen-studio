@@ -150,29 +150,37 @@ export class ShotsStandaloneController {
   }
 
   @Post(':shotId/validate')
-  @ApiOperation({ summary: 'Queue an image-validation pass: the vision model re-scores the current candidates and picks the best' })
+  @ApiOperation({ summary: 'Queue an image-validation pass. INCREMENTAL: only candidates that have never been scored are sent to the model; earlier verdicts are reused. No-op when every candidate already has a verdict.' })
   async validate(@Param('shotId') shotId: string) {
     const job = await this.validation.enqueue(shotId, null);
     // Re-checking invalidates whatever was chosen before (by the AI or by hand):
     // clear it so the shot shows "under review" and the fresh pass decides anew.
     if (job) await this.shotsService.setChosenRender(shotId, null);
-    return { queued: !!job, jobId: job?.id ?? null };
+    return {
+      queued: !!job,
+      jobId:  job?.id ?? null,
+      reason: job ? null : 'все кандидаты уже проверены (или проверка уже в очереди)',
+    };
   }
 
   @Post(':shotId/apply-suggested-prompt')
-  @ApiOperation({ summary: 'Approve the vision model\'s suggested positive prompt (optionally wipe candidates + re-render)' })
+  @ApiOperation({ summary: 'Approve the vision model\'s structured suggestion — positive replaces promptFields.positive, negative tokens append to promptFields.negative (optionally queue an ADDITIVE re-render)' })
   async applySuggestedPrompt(
     @Param('shotId') shotId: string,
-    @Body() body: { prompt: string; rerender?: boolean },
+    @Body() body: { positive?: string; negative?: string; prompt?: string; rerender?: boolean; validate?: boolean },
   ) {
-    if (!body?.prompt || !body.prompt.trim()) {
-      throw new BadRequestException('prompt is required');
+    // `prompt` is the legacy flat-positive body — treat it as `positive`.
+    const positive = (body?.positive ?? body?.prompt)?.trim() || undefined;
+    const negative = body?.negative?.trim() || undefined;
+    if (!positive && !negative) {
+      throw new BadRequestException('positive and/or negative is required');
     }
-    const shot = await this.shotsService.setPositivePrompt(shotId, body.prompt.trim());
+    const shot = await this.shotsService.applySuggestedFields(shotId, { positive, negative });
     if (body.rerender) {
-      // Deliberate rework: wipe the failed candidates and queue a fresh batch
-      // with the approved prompt (see feedback: invalidate stale renders).
-      await this.sceneRender.enqueueRender({ shotId, replace: true });
+      // ADDITIVE re-render: previous candidates and their verdicts stay (user
+      // 2026-07-04: a new render must never delete the NN's comments or the
+      // already-generated photos). Validation of the new batch is opt-in.
+      await this.sceneRender.enqueueRender({ shotId, validate: body.validate === true });
     }
     return shot;
   }

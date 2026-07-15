@@ -190,6 +190,7 @@ model CharacterProfile {
   trainingJobs     TrainingJob[]
   shotParticipants ShotParticipant[]
   anchorRenderJobs AnchorRenderJob[]
+  anchorValidationJobs AnchorValidationJob[]
 
   @@unique([characterId, profileCode])
   @@map("character_profiles")
@@ -551,7 +552,15 @@ model ImageValidationJob {
   /// When no candidate passed, the vision model's proposed improved positive
   /// prompt to fix the failures. The user reviews/edits/approves it in the UI,
   /// which writes it into Shot.promptFields.positive for the next render.
+  /// LEGACY (flat positive-only) — new jobs write `suggestedFields` instead.
   suggestedPrompt String?
+  /// Structured suggestion when no candidate passed:
+  /// {"positive": full rewritten positive, "negative": tokens to APPEND to the
+  /// shot's negative}. Each part goes into its own promptFields key on apply.
+  suggestedFields Json?
+  /// One-line justification from the comparative judge call (which candidate
+  /// won and why) when >1 candidate passed QC.
+  judgeReason    String?
   errorMessage   String?
   queuedAt       DateTime  @default(now())
   startedAt      DateTime?
@@ -562,6 +571,46 @@ model ImageValidationJob {
   @@index([shotId])
   @@index([status, queuedAt])
   @@map("image_validation_jobs")
+}
+
+/// Anchor-validation jobs — the character-portrait analogue of ImageValidationJob.
+/// After an anchor render produces N candidate portraits, the Ollama vision model
+/// scores each against the character's identity spec (promptBase) with a HARD
+/// anti-anime rubric (this pipeline is western graphic-novel; anime = reject) and
+/// picks the best clean single-subject portrait — copying it to the profile's
+/// <profileCode>_anchor.png. If none is acceptable, no anchor is set and the model
+/// proposes an improved promptBase for the user to edit/apply. Same single-slot
+/// pipeline + ComfyUI-off arbitration as ImageValidationJob. See AnchorValidationService.
+model AnchorValidationJob {
+  id             String    @id @default(uuid())
+  profileId      String
+  status         String    @default("pending")   // pending | running | completed | failed
+  /// The character identity spec the portrait must depict — the profile's
+  /// promptBase captured at enqueue (fed to the validator as REQUIRED content).
+  expectedPrompt String?
+  /// Snapshot of the candidate anchor filenames scored, in scoring order. They
+  /// live in data/<slug>/reference/_candidates/<profileCode>/.
+  candidates     Json?
+  /// Full per-candidate result: [{filename, score, matchesPrompt, severe, issues[]}].
+  result         Json?
+  /// Filename the model picked as best (copied to <profileCode>_anchor.png).
+  /// Null when NO candidate was acceptable (all anime/severe / none matched) —
+  /// no anchor is set and suggestedPrompt is filled.
+  chosenFilename String?
+  /// When no candidate passed, the vision model's proposed improved promptBase.
+  /// The user reviews/edits/approves it in the UI, which writes it into
+  /// CharacterProfile.promptBase for the next anchor render.
+  suggestedPrompt String?
+  errorMessage   String?
+  queuedAt       DateTime  @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  profile CharacterProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+  @@index([status, queuedAt])
+  @@map("anchor_validation_jobs")
 }
 
 // ─── Video renders ───────────────────────────────────────────────────────────

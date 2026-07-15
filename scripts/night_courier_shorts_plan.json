@@ -7,7 +7,7 @@
   "shorts": [
     {
       "slug": "hook",
-      "title": "С ЭТОГО ВСЁ НАЧАЛОСЬ 👀",
+      "title": "ЕМУ 15. ОН СЛЫШИТ СЛОВО «ДОЛГИ» 🌃",
       "shots": [
         "S01_SH01",
         "S01_SH02",
@@ -18,28 +18,18 @@
       ]
     },
     {
-      "slug": "mid",
-      "title": "ВОТ ЧТО ПРОИЗОШЛО ДАЛЬШЕ 💔",
-      "shots": [
-        "S04_SH01",
-        "S04_SH02",
-        "S04_SH03",
-        "S04_SH04",
-        "S04_SH05",
-        "S04_SH06"
-      ]
-    },
-    {
       "slug": "finale",
-      "title": "ЧЕМ ВСЁ ЗАКОНЧИЛОСЬ 🥀",
+      "title": "ОДИН ВЗГЛЯД В ЭКРАН НА СВЕТОФОРЕ 🌃",
       "shots": [
-        "S05_SH01",
-        "S05_SH02",
-        "S05_SH03",
-        "S05_SH04",
-        "S05_SH05",
-        "S05_SH06"
+        "S04_SH07",
+        "S04_SH16",
+        "S04_SH21",
+        "S04_SH23",
+        "S04_SH24",
+        "S04_SH27",
+        "S04_SH33"
       ]
     }
-  ]
+  ],
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short."
 }

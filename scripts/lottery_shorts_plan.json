@@ -1,0 +1,33 @@
+{
+  "project": "lottery",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ВЫИГРАЛ 73 МИЛЛИОНА. ВЕРНУЛСЯ К СТАНКУ 🎰",
+      "shots": [
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH07",
+        "A0_SH08"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "«ОТЫГРАТЬ». САМОЕ ДОРОГОЕ СЛОВО 🎰",
+      "shots": [
+        "A6_SH02",
+        "A6_SH03B",
+        "A6_SH04",
+        "A6_SH05",
+        "A6_SH07",
+        "A6_SH08"
+      ]
+    }
+  ]
+}

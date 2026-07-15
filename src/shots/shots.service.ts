@@ -41,7 +41,8 @@ const SHOT_FULL_INCLUDE = {
   validationJobs: {
     select: {
       id: true, status: true, result: true, chosenFilename: true,
-      suggestedPrompt: true, errorMessage: true, completedAt: true,
+      suggestedPrompt: true, suggestedFields: true, judgeReason: true,
+      errorMessage: true, completedAt: true,
     },
     orderBy: { queuedAt: 'desc' as const },
     take: 3,
@@ -100,6 +101,7 @@ export class ShotsService {
         validationJobs: {
           select: {
             id: true, status: true, result: true, chosenFilename: true,
+            suggestedPrompt: true, suggestedFields: true, judgeReason: true,
             errorMessage: true, completedAt: true,
           },
           orderBy: { queuedAt: 'desc' as const },
@@ -260,13 +262,24 @@ export class ShotsService {
     });
   }
 
-  /** Write a positive prompt into the shot's promptFields (merging, so other
-   *  fields like negative/camera survive). Used by the "approve the vision
-   *  model's suggested prompt" flow after a failed validation. */
-  async setPositivePrompt(shotId: string, positive: string) {
+  /** Apply the vision model's structured suggestion — each part into its own
+   *  promptFields key (user 2026-07-04: negatives go to negative, positives to
+   *  positive). `positive` REPLACES promptFields.positive; `negative` tokens
+   *  are APPENDED (deduplicated) to the shot's negative. A shot that had no own
+   *  negative starts from the project default — appending to an empty string
+   *  would otherwise silently DROP the whole default at render time (renderer
+   *  uses pf.negative INSTEAD of the default when non-empty). */
+  async applySuggestedFields(shotId: string, fields: { positive?: string | null; negative?: string | null }) {
     const shot = await this.findById(shotId);
     const pf = { ...((shot.promptFields as Record<string, unknown> | null) ?? {}) };
-    pf.positive = positive;
+    const positive = fields.positive?.trim();
+    const negative = fields.negative?.trim();
+    if (positive) pf.positive = positive;
+    if (negative) {
+      const own  = typeof pf.negative === 'string' && pf.negative.trim() ? pf.negative.trim() : '';
+      const base = own || ((shot.project as { defaultNegative?: string } | null)?.defaultNegative ?? '').trim();
+      pf.negative = appendNegativeTokens(base, negative);
+    }
     return this.prisma.shot.update({
       where: { id: shotId },
       data:  { promptFields: pf as object },
@@ -386,4 +399,13 @@ export class ShotsService {
       include: { character: true },
     });
   }
+}
+
+/** Append comma-separated tokens to a negative prompt, skipping ones already
+ *  present (case-insensitive). Keeps the base order; additions go to the end. */
+function appendNegativeTokens(base: string, additions: string): string {
+  const seen = new Set(base.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
+  const fresh = additions.split(',').map((t) => t.trim()).filter((t) => t && !seen.has(t.toLowerCase()));
+  if (fresh.length === 0) return base;
+  return base ? `${base}, ${fresh.join(', ')}` : fresh.join(', ');
 }

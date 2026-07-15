@@ -4,25 +4,32 @@
   "width": 1080,
   "height": 1920,
   "fps": 30,
-  "_note": "3 vertical teaser reels for «ТЫ — Маляр». Curated by hand for now; a local LLM will score интересность later. Each short is self-contained and drives to the full film without fully spoiling it.",
+  "_note": "2 teaser reels: hook = opening, finale = ending block. Rules: 5-8 shots per short, coherent arc first; prefer animated shots; at most one static per short.",
   "shorts": [
     {
       "slug": "hook",
-      "title": "Серый приговор",
-      "_why": "Cold-open mystery: why is she painting over her own beautiful mural in regulation gray? Ends on the subscribe/watch-to-the-end CTA.",
-      "shots": ["CO_SH01", "CO_SH02", "CO_SH03", "CO_SH05", "CO_SH06", "CO_SH07"]
+      "title": "ЗАЧЕМ ОНА ЗАКРАШИВАЕТ ЭТО СЕРЫМ? 🖤",
+      "shots": [
+        "CO_SH01",
+        "CO_SH02",
+        "CO_SH03",
+        "CO_SH05",
+        "CO_SH06",
+        "CO_SH07"
+      ]
     },
     {
       "slug": "revolt",
-      "title": "Тайный бунт",
-      "_why": "Peak-and-crash: secret night-blooming of a gray stairwell -> caught -> beaten -> the 1840 euro bill. Cliffhanger on the concrete stake.",
-      "shots": ["A6_SH03", "A6_SH05", "A6_SH07", "A7_SH01", "A7_SH07", "A7_SH13"]
-    },
-    {
-      "slug": "one_flower",
-      "title": "Один василёк",
-      "_why": "Heartbreak + hope: she erases her own meadow as the residents watch, but leaves one cornflower hidden behind the radiator — the only thing that survives of her.",
-      "shots": ["A8_SH04", "A8_SH08", "A8_SH09", "A8_SH18", "A8_SH19", "A10_SH11"]
+      "title": "ЗА ОДИН ЦВЕТОК ЕЁ ИЗБИЛИ 💔",
+      "shots": [
+        "A6_SH03",
+        "A6_SH05",
+        "A6_SH07",
+        "A7_SH01",
+        "A7_SH07",
+        "A7_SH13",
+        "A7_SH14"
+      ]
     }
   ]
 }

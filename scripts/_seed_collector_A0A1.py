@@ -1,0 +1,86 @@
+# -*- coding: utf-8 -*-
+"""collector A0 cold_open + A1 origin. Run: PYTHONIOENCODING=utf-8 python scripts/_seed_collector_A0A1.py"""
+from _collector_engine import seed_act
+
+P_COLD="cold institutional palette, deep blue monitor glow against dimmed night office shadow, one warm brass accent"
+P_ORIGIN="faded warm nineties palette, worn browns and dim bulb yellow against winter grey, threadbare domestic warmth"
+
+COLD=[
+ ("A0_SH01",None,"openspace","a wide establishing view of a collections-agency open-plan office at night, ranks of dark desks and one row of monitors glowing blue","WS","high","push_in","night",True,False,
+  "два часа ночи, в зале взысканий сорок столов, и только дежурный ряд ещё светится синим."),
+ ("A0_SH02","HERO_OLD","boss_office","a medium shot of a heavy-shouldered man of thirty-eight standing at the glass wall of his office above the call floor","MS","eye","static","night",False,False,
+  "тебе тридцать восемь, ты начальник отдела взысканий, и твоя ночная смена дожимает чужие долги по графику."),
+ ("A0_SH03","OBJ:lighter",None,"an extreme close-up macro insert of a worn brass petrol lighter turning slowly in a man's fingers","ECU","top","static","night",True,False,
+  "в пальцах у тебя отцовская латунная зажигалка, ты крутишь её на каждом звонке уже восемнадцать лет."),
+ ("A0_SH04","HERO_OLD","boss_office","a medium close-up of the manager at his desk with one headset ear pressed on, listening to call recordings","MCU","over","static","night",False,False,
+  "перед сном смены ты выборочно слушаешь записи, так положено по регламенту, который сам же и подписал."),
+ ("A0_SH05",None,"boss_office","a close-up insert of a desk monitor filled with a fresh debtor database upload, blurred rows of case numbers and sums","CU","pov","static","night",True,False,
+  "по монитору ползёт свежая выгрузка, ночью агентство залило портфель микрозаймов, выкупленный за четверть цены."),
+ ("A0_SH06","HERO_OLD","boss_office","a medium close-up of the manager flicking through debtor cards with a bored practiced hand on the mouse","MCU","eye","static","night",False,False,
+  "ты листаешь карточки должников привычно, как листают ленту, не вглядываясь в имена и суммы."),
+ ("A0_SH07",None,"boss_office","an extreme close-up insert of a single highlighted row on a monitor, one debtor record row glowing brighter than the table around it","ECU","pov","push_in","night",True,True,
+  "и вдруг одна строка: женщина шестидесяти семи лет, займ сорок семь тысяч, просрочка шестьдесят три дня."),
+ ("A0_SH08","HERO_OLD","boss_office","a close-up of the manager's face going still, the blue monitor light flat on his skin","CU","eye","push_in","night",False,False,
+  "этот номер телефона ты знаешь наизусть с самого детства, ты набирал его из всех своих квартир."),
+ ("A0_SH09","HERO_OLD","boss_office","a medium shot of the man from behind, the sleeping call floor beyond the glass wall, a headset waiting on the desk","BACK","low","static","night",False,True,
+  "за стеклом спит зал, который ты выстроил сам, а в наушниках тебя ждёт голос твоей матери."),
+ ("A0_SH10","OBJ:lighter",None,"an extreme close-up macro insert of the worn brass lighter stopped mid-turn, gripped tight in a fist","ECU","eye","static","night",True,False,
+  "зажигалка застывает в пальцах, ты смотришь на кнопку воспроизведения и не решаешься её нажать."),
+ ("A0_SH11",None,"openspace","a wide view of the dark office rows stretching away, dashboard screens dimmed, one desk lamp left on","WS","eye","pan_left","night",True,False,
+  "чтобы объяснить, как её номер оказался в твоей базе, надо вернуться на двадцать восемь лет назад."),
+ ("A0_SH12","HERO_OLD","boss_office","a medium close-up of the weary manager turning from the monitor toward the viewer, grey at his temples","MCU","eye","push_in","night",False,False,
+  "останься со мной до конца, эта история началась зимой девяносто восьмого, когда тебе было десять."),
+ ("A0_SH13","HERO_OLD","boss_office","a close-up of the man looking directly at the viewer, tired and level","CU","eye","push_in","night",False,False,
+  "подпишись на канал, чтобы не потерять её, а я расскажу всё по порядку, ничего не пряча."),
+]
+
+ORIGIN=[
+ ("A1_SH01",None,"street_90s","a wide establishing view of a provincial nineties street in winter, low panel blocks, a battered kiosk, sagging wires under a grey sky","WS","eye","push_in","day",True,False,
+  "зима девяносто восьмого, тебе десять, вы живёте втроём в двухкомнатной на краю областного города."),
+ ("A1_SH02","HERO_KID","flat_98","a medium shot of a thin ten-year-old boy doing homework at a low table, a bulky old tube television murmuring in its wooden cabinet behind him","MS","eye","static","evening",False,False,
+  "по вечерам ты делаешь уроки под бормотание телевизора, огромного «Рубина» в полированном деревянном корпусе."),
+ ("A1_SH03","DAD_BASE","flat_98","a medium close-up of a broad balding man of forty-two lighting a cigarette at a cracked-open window vent with a brass petrol lighter","MCU","eye","static","evening",False,False,
+  "отец прикуривает от латунной зажигалки у форточки, он весь год возит товар на вещевой рынок."),
+ ("A1_SH04","OBJ:lighter",None,"an extreme close-up macro insert of the brass petrol lighter with its lid flipped open, a small steady flame","ECU","eye","static","evening",True,False,
+  "эту зажигалку он привёз из армии, крышка вся исцарапана, латунь протёрта до тусклого тёплого блеска."),
+ ("A1_SH05",None,"flat_98","a wide view of the small nineties flat in warm bulb light, the family table set for supper, the television corner glowing","WS","eye","static","evening",True,False,
+  "в декабре отец занимает у знакомого две тысячи четыреста долларов на партию товара к праздникам."),
+ ("A1_SH06","MOM_MID","flat_98","a medium shot of a kind worn woman of thirty-nine at the supper table, arms crossed, reading glasses on a cord at her chest","MS","eye","static","evening",False,False,
+  "мать против, она откладывает с двух зарплат и не верит людям, которые дают деньги легко."),
+ ("A1_SH07","DAD_BASE","flat_98","a close-up of the father's open confident face laughing off the worry, a hand slapped flat on the table","CU","low","static","evening",False,False,
+  "отец смеётся, что вернёт всё к марту с наваром, и хлопает ладонью по клеёнке стола."),
+ ("A1_SH08",None,"street_90s","a wide view of an empty winter market street, a shuttered metal kiosk crusted with snow, one weak streetlight","WS","eye","pan_right","night",True,False,
+  "в январе рынок стоит пустой, товар не уходит, а долг растёт на десять процентов в месяц."),
+ ("A1_SH09","HERO_KID","flat_98","a medium close-up of the boy lying in bed pretending to sleep, eyes open toward the strip of kitchen light under the door","MCU","high","static","night",False,False,
+  "ты слышишь ночами, как родители считают на кухне вполголоса, и делаешь вид, что спишь."),
+ ("A1_SH10",None,None,"an extreme close-up insert of a flimsy apartment door shuddering under three heavy knocks, dust shaken from the frame","ECU","eye","static","evening",True,False,
+  "в феврале в вашу дверь стучат кулаком, три тяжёлых удара, и в квартире все замирают."),
+ ("A1_SH11","LEATHER_BASE","flat_98","a medium shot of a heavy-set impassive man in a black leather jacket stepping into the little hallway without removing his shoes","MS","low","static","evening",False,False,
+  "в прихожую входят двое в чёрных кожанках, не снимая обуви, и осматривают комнату, как склад."),
+ ("A1_SH12",None,None,"an extreme close-up insert of a thick male hand with a heavy gold signet ring resting on a doorframe","ECU","eye","push_in","evening",True,False,
+  "у старшего на правой руке тяжёлый золотой перстень, и говорит он тихо, отчего только страшнее."),
+ ("A1_SH13","DAD_BASE","flat_98","a medium shot of the father talking fast with open pleading palms while the television is unplugged behind him","MS","eye","static","evening",False,False,
+  "отец объясняет про март и про навар, но двое уже отключают «Рубин» от розетки."),
+ ("A1_SH14","LEATHER_BASE","flat_98","a wide shot of the leather-jacketed man carrying the bulky wooden television through the hallway, screen forward like furniture","WS","eye","track","evening",False,True,
+  "телевизор выносят вдвоём, экраном вперёд, как мебель, и на полке остаётся квадрат чистой пыли."),
+ ("A1_SH15","HERO_KID","flat_98","a close-up of the ten-year-old boy in the kitchen doorway, his mother's hands gripping his shoulders","CU","eye","push_in","evening",False,False,
+  "ты стоишь в дверях кухни, мать держит тебя за плечи, и ты запоминаешь каждую секунду."),
+ ("A1_SH16","LEATHER_BASE","flat_98","a medium close-up of the impassive man pausing at the front door and turning back, flat unhurried eyes","MCU","eye","static","evening",False,True,
+  "на пороге старший оборачивается и говорит отцу ровным голосом: ничего личного — это просто долг."),
+ ("A1_SH17","OBJ:lighter",None,"an extreme close-up macro insert of the brass lighter set down alone on a bare kitchen table in dim light","ECU","top","static","night",True,False,
+  "в тот вечер отец кладёт зажигалку на стол и долго сидит, так и не прикурив."),
+ ("A1_SH18","MOM_MID","mom_flat","a medium close-up of the mother silently setting a kettle on the stove, darning basket waiting on the table","MCU","eye","static","night",False,False,
+  "мать молча ставит чайник, достаёт штопку и с этого дня берёт вторую смену в столовой."),
+ ("A1_SH19",None,"flat_98","a wide view of the flat's empty television shelf with a pale square of dustless wood, a lace napkin folded beside it","WS","eye","static","day",True,False,
+  "квадрат пыли на полке вы накрываете салфеткой, а новый телевизор появится только через три года."),
+ ("A1_SH20","HERO_KID","flat_98","a close-up of the boy's guarded serious face at the window, winter light flat on it","CU","eye","push_in","day",False,True,
+  "тебе десять, и ты усваиваешь на всю жизнь: сильнее не тот, кто открывает, а тот, кто стучит."),
+ ("A1_SH21","DAD_BASE","street_90s","a medium shot of the balding father hauling crates by the kiosk, quieter and smaller in his movements","MS","eye","static","day",False,False,
+  "к весне отец возвращает долг с процентами, продав ларёк, и разговаривает теперь всегда вполголоса."),
+ ("A1_SH22",None,"street_90s","a wide view of a boarded-up metal kiosk on a street corner, a schoolboy's path worn in the snow past it","WS","eye","pull_out","day",True,False,
+  "заколоченный ларёк отца стоит на углу ещё лет пять, и мимо него ты ходишь в школу."),
+]
+
+if __name__=="__main__":
+    seed_act("cold_open",P_COLD,COLD)
+    seed_act("origin",P_ORIGIN,ORIGIN)

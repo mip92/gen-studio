@@ -25,9 +25,12 @@ export interface StartVideoInput {
    *  - 'cfg' — full Wan2.2 dual-expert, no speed LoRA, 20 steps, cfg=4.0. ~5×
    *    slower, but the negative prompt actually fires — pick per shot when
    *    suppressing unwanted motion matters. = «качество».
+   *  - 'distill' — lightx2v full-distill fp8 checkpoints (Oct-2025 gen, distill
+   *    baked into the weights instead of a rank-64 LoRA). Same 4 steps / cfg=1
+   *    / speed as 'fast', slightly higher quality ceiling. Negative still dead.
    * (Engine family Wan/Flux/SDXL is a per-PROJECT decision via project.visualStyle.)
    */
-  mode?:         'fast' | 'cfg';
+  mode?:         'fast' | 'cfg' | 'distill';
 }
 
 export interface VideoRenderParams {
