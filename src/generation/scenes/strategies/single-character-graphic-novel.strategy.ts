@@ -1,4 +1,4 @@
-import { SceneStrategy } from '../scene-strategy';
+import { SceneStrategy, hasBakedStyleBlock } from '../scene-strategy';
 import { SceneJobParams } from '../scene-job.types';
 import { WorkflowTemplate } from '../../workflows/workflow.types';
 
@@ -45,7 +45,7 @@ export class SingleCharacterGraphicNovelSceneStrategy implements SceneStrategy {
     // (Identity is text-only — face-lock comes from IP-Adapter reference image; see APP_ROOT/data/<slug>/reference/<character>_anchor.png attached as input to the IP-Adapter node in the workflow JSON.)
     const participantPrompts = (params.participants ?? []).map((p) => p.characterPrompt).join(', ');
     const positive = [
-      STYLE_PREFIX,
+      hasBakedStyleBlock(params.scenePrompt) ? '' : STYLE_PREFIX,
       participantPrompts,
       params.scenePrompt && params.scenePrompt.trim().length > 0 ? params.scenePrompt : '',
     ].filter((s) => s && s.trim().length > 0).join(', ');

@@ -1,4 +1,4 @@
-import { SceneStrategy } from '../scene-strategy';
+import { SceneStrategy, hasBakedStyleBlock } from '../scene-strategy';
 import { SceneJobParams } from '../scene-job.types';
 import { WorkflowTemplate } from '../../workflows/workflow.types';
 
@@ -42,7 +42,7 @@ export class DualCharacterFluxComicSceneStrategy implements SceneStrategy {
       .filter((s) => s && s.trim().length > 0)
       .join('; ');
     const positive = [
-      STYLE_PREFIX,
+      hasBakedStyleBlock(params.scenePrompt) ? '' : STYLE_PREFIX,
       participantPrompts,
       params.scenePrompt && params.scenePrompt.trim().length > 0 ? params.scenePrompt : '',
     ].filter((s) => s && s.trim().length > 0).join(', ');

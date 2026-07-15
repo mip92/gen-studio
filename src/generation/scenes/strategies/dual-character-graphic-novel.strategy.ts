@@ -1,4 +1,4 @@
-import { SceneStrategy } from '../scene-strategy';
+import { SceneStrategy, hasBakedStyleBlock } from '../scene-strategy';
 import { SceneJobParams } from '../scene-job.types';
 import { WorkflowTemplate } from '../../workflows/workflow.types';
 
@@ -56,7 +56,7 @@ export class DualCharacterGraphicNovelSceneStrategy implements SceneStrategy {
 
     // Global (whole canvas): style + scene/setting/two-shot framing. No identity.
     const globalPositive = [
-      STYLE_PREFIX,
+      hasBakedStyleBlock(params.scenePrompt) ? '' : STYLE_PREFIX,
       params.scenePrompt && params.scenePrompt.trim().length > 0 ? params.scenePrompt.trim() : 'two women in one frame, medium two-shot, one on the left and one on the right',
     ].filter((s) => s && s.length > 0).join(', ');
     this.set(wf, '3', 'text', globalPositive);

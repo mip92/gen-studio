@@ -1,6 +1,19 @@
 import { SceneJobParams } from './scene-job.types';
 import { WorkflowTemplate } from '../workflows/workflow.types';
 
+/**
+ * True when the shot's positive prompt already opens with its own baked-in
+ * style block (every seed engine since gaz writes the full project style as
+ * the head of `promptFields.positive`). In that case the strategy must NOT
+ * prepend its generic STYLE_PREFIX: the duplication pushed ~60 extra tokens
+ * of boilerplate in front of the subject, shoving the subject out of the
+ * first CLIP chunk — environment shots rendered generic style filler
+ * (night-lamp still lifes, stray people) and ignored the actual subject.
+ */
+export function hasBakedStyleBlock(scenePrompt: string | undefined): boolean {
+  return /\bgraphic[- ]novel illustration\b|\bcomic book panel\b/i.test((scenePrompt ?? '').slice(0, 200));
+}
+
 export interface SceneStrategy {
   /** Unique id used by the factory to pick a strategy by participant count. */
   readonly id: string;

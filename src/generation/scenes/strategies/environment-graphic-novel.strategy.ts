@@ -1,4 +1,4 @@
-import { SceneStrategy } from '../scene-strategy';
+import { SceneStrategy, hasBakedStyleBlock } from '../scene-strategy';
 import { SceneJobParams } from '../scene-job.types';
 import { WorkflowTemplate } from '../../workflows/workflow.types';
 
@@ -37,7 +37,7 @@ export class EnvironmentGraphicNovelSceneStrategy implements SceneStrategy {
     const wf = structuredClone(template);
 
     const positive = [
-      STYLE_PREFIX,
+      hasBakedStyleBlock(params.scenePrompt) ? '' : STYLE_PREFIX,
       params.scenePrompt && params.scenePrompt.trim().length > 0 ? params.scenePrompt : 'cinematic graphic novel establishing shot',
     ].filter((s) => s && s.trim().length > 0).join(', ');
 
