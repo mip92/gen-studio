@@ -270,10 +270,10 @@ def build(slug, max_spreads, panel_frac, out, pack=False):
         "output_root": out_root, "capcut_drafts_root": capcut_root,
         "pages_dir": f"{out_root}/{draft_name}/pages",
         "width": 1920, "height": 1080, "fps": 30,
-        # supersample 4: the sheet+frames are ONE raster the camera zooms into
-        # (~4x at a panel), so render 4x canvas so borders/edges stay crisp, not
-        # soapy, when magnified.
-        "page_style": "old_comic", "texture_path": None, "supersample": 4,
+        # supersample 6: the sheet+frames are ONE raster the camera zooms into
+        # (~4x at a panel), so render 6x canvas (headroom over 1:1) so paper +
+        # borders stay crisp, not soapy, when magnified.
+        "page_style": "old_comic", "texture_path": None, "supersample": 6,
         # pseudo-3D page turn between spreads (CapCut built-in 立体翻页). Only
         # RENDERS if that effect is in CapCut's local cache (apply it once in
         # CapCut to download it) — else it shows in the editor but does nothing.

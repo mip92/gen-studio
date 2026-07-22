@@ -235,6 +235,17 @@ class OldComicPageStyle(PageStyle):
                     vals.append(int(255 - 120 * bell))               # ~135 at the fold
                 row = Image.new("L", (gwidth, 1)); row.putdata(vals)
                 _mul_region(bg, row.resize((gwidth, ybot - ytop)), x_lo, ytop)
+
+            # DRAWN convergence (not a warp, user 2026-07-22): the outer top+bottom
+            # page edges are traced toward a single vanishing point at the spine
+            # centre, so the spread reads as pages folding into the binding. Panels
+            # sit on top in the live export, so these show only in the gutters.
+            ytop = min(b[1] for b in boxes); ybot = max(b[3] for b in boxes)
+            vx, vy = mid, (ytop + ybot) // 2
+            lo, ro = boxes[0], boxes[-1]
+            lwv = max(2, int(min(w, h) * 0.0022))
+            for (cxp, cyp) in ((lo[0], ytop), (lo[0], ybot), (ro[2], ytop), (ro[2], ybot)):
+                d.line([(cxp, cyp), (vx, vy)], fill=(92, 78, 58), width=lwv)
         return bg
 
     def draw_frame(self, draw, rect_px, seed):
