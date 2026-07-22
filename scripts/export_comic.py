@@ -123,16 +123,14 @@ def _build_camera(states: List[dict]):
         same = (abs(a["cx"] - b["cx"]) < 1e-6 and abs(a["cy"] - b["cy"]) < 1e-6
                 and abs(a["zoom"] - b["zoom"]) < 1e-6)
         segs.append((t0, t1, a, b, same))
-        # HOLDS get ONLY their endpoints (the camera is dead still there — this is
-        # what keeps a SLOWED video clip glued: CapCut time-warps a clip's keyframes
-        # by its speed, so any motion during a hold would drift the clip off the
-        # page. All life happens on TRAVELS, where only (unslowed) posters show.
-        if same:
-            grid.add(t0); grid.add(t1)
-        else:
-            steps = max(MIN_BAKE_STEPS, int((t1 - t0) / 1_000_000 * BAKE_KF_PER_SEC))
-            for i in range(steps + 1):
-                grid.add(t0 + int((t1 - t0) * i / steps))
+        # Sample BOTH holds and travels so the camera is alive everywhere. A slowed
+        # clip that also moves is kept glued by compensating its keyframe TIMES for
+        # its speed (see `_bake_layer` time_scale) — CapCut reads a slowed clip's
+        # keyframe time in the SOURCE (pre-speed) domain, so we pre-scale it.
+        rate = HOLD_KF_PER_SEC if same else BAKE_KF_PER_SEC
+        steps = max(1 if same else MIN_BAKE_STEPS, int((t1 - t0) / 1_000_000 * rate))
+        for i in range(steps + 1):
+            grid.add(t0 + int((t1 - t0) * i / steps))
     if states:
         grid.add(int(states[0]["t_us"])); grid.add(int(states[-1]["t_us"]))
 
@@ -145,7 +143,12 @@ def _build_camera(states: List[dict]):
         for (t0, t1, a, b, same) in segs:
             if t0 <= t <= t1:
                 if same:
-                    return (a["cx"], a["cy"], a["zoom"])          # HOLD: dead still
+                    # HOLD: gentle sway, windowed so it is 0 at both ends (meets the
+                    # still travel-endpoints seamlessly) and peaks mid-hold.
+                    win = math.sin(math.pi * (t - t0) / (t1 - t0)) if t1 > t0 else 0.0
+                    sx, sy, sz = _sway(t)
+                    return (a["cx"] + sx * win, a["cy"] + sy * win,
+                            a["zoom"] * (1.0 + (sz - 1.0) * win))
                 p = _ease((t - t0) / (t1 - t0)); bow = math.sin(math.pi * p)
                 dx, dy = b["cx"] - a["cx"], b["cy"] - a["cy"]
                 dist = math.hypot(dx, dy)
@@ -163,11 +166,17 @@ def _build_camera(states: List[dict]):
     return cam, sorted(grid)
 
 
-def _bake_layer(seg, cam, grid, placer, lo: int, hi: int, t0: int) -> int:
+def _bake_layer(seg, cam, grid, placer, lo: int, hi: int, t0: int,
+                time_scale: float = 1.0) -> int:
     """Bake one layer over its lifetime [lo, hi] (page-relative µs) by sampling the
     shared `cam` at the shared `grid` times inside the window (plus the exact
     endpoints) and mapping through `placer`. Offsets are relative to segment start
-    `t0`. All layers share `cam`+`grid`, so the page stays rigid."""
+    `t0`. All layers share `cam`+`grid`, so the page stays rigid.
+
+    `time_scale` pre-warps the written keyframe offset: a SLOWED video clip
+    (speed = src/target < 1) has its keyframe times read by CapCut in the SOURCE
+    domain, so pass time_scale=speed to make them land on the right timeline
+    moments and track the (image) layers. Image layers use time_scale=1.0."""
     times = [t for t in grid if lo <= t <= hi]
     if not times or times[0] > lo:
         times = [lo] + times
@@ -180,7 +189,7 @@ def _bake_layer(seg, cam, grid, placer, lo: int, hi: int, t0: int) -> int:
         prev = t
         cx, cy, z = cam(int(t))
         s, tx, ty = placer(cx, cy, z)
-        off = int(t - t0)
+        off = int((t - t0) * time_scale)
         seg.add_keyframe(KP.uniform_scale, off, s)
         seg.add_keyframe(KP.position_x,    off, tx)
         seg.add_keyframe(KP.position_y,    off, ty)
@@ -294,8 +303,12 @@ def build_comic_draft(manifest: dict) -> Path:
         #     track, carrying the SAME camera path as the sheet → the borders ride
         #     on top of every panel and lap slightly onto the footage.
         fpng = pages_dir / f'frames_{pidx:03d}.png'
+        # render the frames overlay at HIGHER resolution than the paper sheet: it's
+        # thin geometry the camera zooms into, so extra pixels keep the borders
+        # crisp (not soapy) when magnified; the sheet paper can stay at `ss`.
+        frame_ss = min(8, ss + 2)
         render_page(width=width, height=height, panels=panels, style_name=style,
-                    texture_path=texture, supersample=ss, seed=pidx + 1,
+                    texture_path=texture, supersample=frame_ss, seed=pidx + 1,
                     frames_only=True).save(fpng)
         fr_seg = draft.VideoSegment(
             draft.VideoMaterial(str(fpng).replace("\\", "/"), material_name=f'frames_{page.get("pageKey")}'),
@@ -359,7 +372,11 @@ def build_comic_draft(manifest: dict) -> Path:
                     mat,
                     target_timerange=draft.Timerange(start=p_start + video_start, duration=video_screen),
                     source_timerange=draft.Timerange(start=0, duration=src_win) if native > 0 else None)
-                total_kf += _bake_layer(clip, cam, grid, placer_still, video_start, video_end, video_start)
+                # slowed clip → compensate keyframe timing for CapCut's source-time
+                # warp so the moving video tracks the rest of the page.
+                speed_ratio = (src_win / video_screen) if (native > 0 and video_screen > 0) else 1.0
+                total_kf += _bake_layer(clip, cam, grid, placer_still, video_start, video_end,
+                                        video_start, speed_ratio)
                 script.add_segment(clip, track_name=lane)
                 total_clips += 1
                 # (c) last-frame poster: tail freeze + travel-out  [video_end … page_end]

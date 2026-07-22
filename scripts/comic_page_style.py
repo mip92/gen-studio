@@ -73,7 +73,10 @@ def _page_boxes(panels_px: Optional[List[RectPx]], W: int, H: int
     by which halves the panels occupy. Returns ([box,...], spine_x)."""
     mid = int(W / 2)
     dm = int(min(W, H) * 0.018)     # min desk margin around the open book
-    pm = int(min(W, H) * 0.030)     # comic margin between the panels and the page edge
+    # margin from panels to the page EDGE ≈ the gutter between panels (user
+    # 2026-07-22), so the edge sits right next to the panels and, when the camera
+    # zooms into an edge panel, the page edge + the neighbour beyond it stay in view.
+    pm = int(min(W, H) * 0.013)
     groups: dict = {}
     for (x, y, w, h) in (panels_px or []):
         groups.setdefault(0 if (x + w / 2.0) < mid else 1, []).append((x, y, x + w, y + h))
@@ -128,6 +131,27 @@ class OldComicPageStyle(PageStyle):
     EDGE  = (206, 190, 156)     # cut page-block edge (a touch darker than PAPER)
     EDGE_LINE = (120, 104, 78)  # crisp page-boundary line against the desk
 
+    def _wood(self, size, seed):
+        """Dark wooden desk the open book lies on: long horizontal grain fibres +
+        a few plank seams, kept dark so the pages pop off it."""
+        w, h = size
+        base = Image.new("RGB", (w, h), self.DESK)
+        # grain fibres: thin vertical noise stretched wide → long horizontal streaks
+        small = Image.effect_noise((max(1, w // 8), h), 30).convert("L")
+        fib = small.resize((w, h)).filter(ImageFilter.GaussianBlur(1))
+        wood = Image.merge("RGB", [
+            fib.point(lambda v, i=i: max(0, min(255, int(self.DESK[i] + (v - 128) * 0.5))))
+            for i in range(3)])
+        base = Image.blend(base, wood, 0.6)
+        # plank seams: horizontal darker lines at jittered intervals
+        d = ImageDraw.Draw(base); rng = _Rng(seed or 7)
+        seam = (max(0, self.DESK[0] - 16), max(0, self.DESK[1] - 13), max(0, self.DESK[2] - 10))
+        y = int(h * rng.rf(0.05, 0.15))
+        while y < h:
+            d.line([(0, y), (w, y)], fill=seam, width=max(2, h // 500))
+            y += int(h * rng.rf(0.16, 0.26))
+        return base
+
     def _paper_fill(self, size, texture_path, seed):
         """A full-sheet slab of aged paper (base tone + optional texture + grain)."""
         w, h = size
@@ -151,8 +175,7 @@ class OldComicPageStyle(PageStyle):
         boxes, mid = _page_boxes(panels_px, w, h)
         paper = self._paper_fill((w, h), texture_path, seed)
 
-        bg = Image.new("RGB", (w, h), self.DESK)
-        bg = Image.blend(bg, _grain((w, h), 8.0).convert("RGB"), 0.04)
+        bg = self._wood((w, h), seed)                 # wooden desk under the book
         thick = max(5, int(min(w, h) * 0.009))       # page-block thickness
         go = max(4, int(min(w, h) * 0.012))          # drop-shadow spread
 
