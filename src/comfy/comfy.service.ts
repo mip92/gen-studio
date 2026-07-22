@@ -62,4 +62,61 @@ export class ComfyService {
     const res = await fetch(url);
     return res.ok ? res.json() : null;
   }
+
+  /** Interrupt whatever prompt ComfyUI is CURRENTLY executing (no id targeting —
+   *  ComfyUI only ever runs one at a time). Best-effort. */
+  async interrupt(comfyBaseUrl?: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl(comfyBaseUrl)}/interrupt`, { method: 'POST' });
+      return res.ok;
+    } catch (e) {
+      this.logger.warn(`ComfyUI /interrupt failed: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  /** Remove a still-PENDING prompt from ComfyUI's queue by id. Best-effort. */
+  async deleteQueued(promptId: string, comfyBaseUrl?: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl(comfyBaseUrl)}/queue`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ delete: [promptId] }),
+      });
+      return res.ok;
+    } catch (e) {
+      this.logger.warn(`ComfyUI /queue delete ${promptId} failed: ${(e as Error).message}`);
+      return false;
+    }
+  }
+
+  /** Where a prompt currently sits in ComfyUI: running now, still pending, or
+   *  neither (already finished, or LOST — e.g. ComfyUI was restarted). Reads the
+   *  live queue; the promptId is item[1] of each running/pending tuple. */
+  async promptPlacement(
+    promptId: string,
+    comfyBaseUrl?: string,
+  ): Promise<'running' | 'pending' | 'absent' | 'unknown'> {
+    const q = (await this.getQueue(comfyBaseUrl)) as
+      | { queue_running?: unknown[][]; queue_pending?: unknown[][] }
+      | null;
+    if (!q) return 'unknown';
+    const idOf = (row: unknown[]) => (Array.isArray(row) ? row[1] : undefined);
+    if ((q.queue_running ?? []).some((r) => idOf(r) === promptId)) return 'running';
+    if ((q.queue_pending ?? []).some((r) => idOf(r) === promptId)) return 'pending';
+    return 'absent';
+  }
+
+  /** Cancel a specific prompt in ComfyUI: interrupt it if it's the one running,
+   *  or drop it from the queue if still pending. No-op if it's already gone.
+   *  Returns what was done so callers can log it. */
+  async cancelPrompt(
+    promptId: string,
+    comfyBaseUrl?: string,
+  ): Promise<'interrupted' | 'dequeued' | 'absent' | 'unknown'> {
+    const where = await this.promptPlacement(promptId, comfyBaseUrl);
+    if (where === 'running') { await this.interrupt(comfyBaseUrl);            return 'interrupted'; }
+    if (where === 'pending') { await this.deleteQueued(promptId, comfyBaseUrl); return 'dequeued'; }
+    return where; // 'absent' | 'unknown'
+  }
 }

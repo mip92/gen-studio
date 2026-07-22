@@ -6,6 +6,10 @@ export interface YoutubeMain {
   title:       string;
   description: string;
   tags:        string[];
+  /** Set by the uploader after a successful videos.insert. `url` points at the
+   *  video on YouTube even while it's (forced-)private before the audit passes. */
+  videoId?:    string;
+  url?:        string;
 }
 /** Packaging for one short. Two descriptions: `descBefore` for while the main
  *  video isn't published yet (teaser, "полная версия скоро"), `descAfter` for

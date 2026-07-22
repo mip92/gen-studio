@@ -37,11 +37,17 @@ const DISTILL_WORKFLOW_FILENAME = 'video_wan22_i2v_distill_api.json';
 // Allowlist of i2v workflow files the service is permitted to load — guards
 // loadTemplate against a row carrying an unexpected workflowFilename value.
 const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME, DISTILL_WORKFLOW_FILENAME]);
-const UPSCALE_WORKFLOW_FILENAME = 'video_upscale_4x_api.json';
-// FPS interpolation (RIFE/FILM → 2× framerate). Mandatory final step, runs on
-// the FHD-upscaled clip. The model file (e.g. rife47.pth) must live in
-// ComfyUI's models/frame_interpolation/ — override the JSON default via env.
+// FPS interpolation (RIFE/FILM → 2× framerate). Standalone re-smooth path
+// (POST /videos/:id/interpolate) that operates on an already-upscaled FHD clip.
+// The model file (e.g. rife47.pth) must live in ComfyUI's
+// models/frame_interpolation/ — override the JSON default via env.
 const INTERP_WORKFLOW_FILENAME = 'video_fps_interp_api.json';
+// One-pass upscale→RIFE graph: a single ComfyUI prompt saves BOTH the FHD clip
+// and the FPS-interpolated (smooth) clip — one queue job, models load once,
+// nothing to reorder between the two steps, no intermediate mp4 decode. This is
+// the ONLY upscale path (the legacy two-step dispatch was removed 2026-07-21);
+// every project must carry this file.
+const COMBINED_WORKFLOW_FILENAME = 'video_upscale_interp_api.json';
 // MUST be a model in ComfyUI's NATIVE format (comfy_extras frame interpolation),
 // i.e. from the Comfy-Org/frame_interpolation HF repo (rife_v4.x.safetensors /
 // film_net_fp16.safetensors). Fannovel16 custom-node .pth files are NOT
@@ -277,6 +283,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     });
     if (!v) throw new NotFoundException(`Video ${videoId} not found`);
 
+    // Cancel any in-flight pipeline work for this render BEFORE dropping the row,
+    // so we don't (a) leave ComfyUI burning GPU on a now-deleted render or
+    // (b) orphan the single queue slot on a running row that never harvests.
+    // Each stage's queue "job" lives on this row (base/upscale/interp status +
+    // promptId), so removing the row removes the job — we just stop ComfyUI too.
+    await this.cancelInflightComfy(v, `video ${v.id} deleted`);
+
     const shotDir = path.join(APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode);
     const toRemove = [
       v.outputFilename   ? path.join(shotDir, 'videos',        v.outputFilename)   : null,
@@ -308,7 +321,40 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return { deleted: true, id: v.id };
   }
 
-  /** Absolute path to the upscaled FHD mp4 once `upscaleStatus=completed`. */
+  /**
+   * Stop any in-flight ComfyUI work for a render's three stages (base i2v,
+   * upscale, interp). For each stage that is `running`/`pending` with a live
+   * promptId, ask ComfyUI to interrupt (if running) or dequeue (if pending).
+   * Best-effort and idempotent — safe to call on an already-finished render.
+   * Used by delete() and the queue cancel endpoint so a cancel/delete actually
+   * frees the GPU instead of only flipping a DB status.
+   */
+  async cancelInflightComfy(
+    v: {
+      comfyPromptId?:  string | null; status?:        string | null;
+      upscalePromptId?: string | null; upscaleStatus?: string | null;
+      interpPromptId?:  string | null; interpStatus?:  string | null;
+    },
+    reason = 'cancelled',
+  ): Promise<void> {
+    const inflight = (s?: string | null) => s === 'running' || s === 'pending';
+    const stages: Array<[string, string | null | undefined, string | null | undefined]> = [
+      ['base',    v.status,        v.comfyPromptId],
+      ['upscale', v.upscaleStatus, v.upscalePromptId],
+      ['interp',  v.interpStatus,  v.interpPromptId],
+    ];
+    for (const [stage, status, promptId] of stages) {
+      if (!inflight(status) || !promptId) continue;
+      try {
+        const did = await this.comfy.cancelPrompt(promptId);
+        this.logger.log(`${reason}: ${stage} prompt ${promptId} → ComfyUI ${did}`);
+      } catch (e) {
+        this.logger.warn(`${reason}: failed to cancel ${stage} prompt ${promptId}: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  /** Absolute path to the upscaled clip once `upscaleStatus=completed`. */
   async upscaledFilePath(videoId: string): Promise<string> {
     const v = await this.get(videoId);
     if (!v.upscaledFilename) throw new BadRequestException(`Video ${videoId} has no upscaled version yet`);
@@ -317,7 +363,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       include: { project: true },
     });
     if (!shot) throw new NotFoundException(`Shot for video ${videoId} not found`);
-    return path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, 'videos_fhd', v.upscaledFilename);
+    const base = path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode);
+    const fhd  = path.join(base, 'videos_fhd', v.upscaledFilename);
+    if (existsSync(fhd)) return fhd;
+    // One-pass renders no longer persist a separate FHD intermediate — the FHD
+    // SaveVideo branch was removed 2026-07-22. `upscaledFilename` mirrors the
+    // smooth file, so fall back to videos_smooth/ for those rows.
+    return path.join(base, 'videos_smooth', v.upscaledFilename);
   }
 
   // ── Workflow loading + patching ────────────────────────────────────────────
@@ -530,10 +582,31 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     }
 
     try {
-      const template = this.loadUpscaleTemplate(v.shot.project.slug);
-      const workflow = this.patchUpscale(template, {
-        sourceVideo:    inputBasename,
-        filenamePrefix: `video_fhd/${v.shot.shotCode}/${v.id}`,
+      // ONE-PASS upscale→RIFE: a single prompt renders both the FHD and the
+      // smooth clip. The RIFE stage eats the upscaled frames directly — no
+      // re-encode + decode of the intermediate FHD mp4 between the steps. This
+      // is the only upscale path; a missing combined workflow is a config error.
+      const combined = this.loadCombinedTemplate(v.shot.project.slug);
+      if (!combined) {
+        await this.prisma.videoRender.update({
+          where: { id: v.id },
+          data:  {
+            upscaleStatus:       'failed',
+            upscaleErrorMessage: `Combined upscale→RIFE workflow missing: data/${v.shot.project.slug}/comfy/${COMBINED_WORKFLOW_FILENAME}`,
+            upscaleCompletedAt:  new Date(),
+          },
+        });
+        try { unlinkSync(inputDest); } catch { /* best-effort */ }
+        return;
+      }
+      const mult   = v.interpMultiplier ?? DEFAULT_INTERP_MULTIPLIER;
+      const params = (v.params ?? {}) as { fps?: number };
+      const workflow = this.patchCombined(combined, {
+        sourceVideo:  inputBasename,
+        fhdPrefix:    `video_fhd/${v.shot.shotCode}/${v.id}`,
+        smoothPrefix: `video_smooth/${v.shot.shotCode}/${v.id}`,
+        multiplier:   mult,
+        fps:          (params.fps ?? DEFAULT_FPS) * mult,
       });
       const { promptId } = await this.comfy.queuePrompt(workflow);
       await this.prisma.videoRender.update({
@@ -555,21 +628,27 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private loadUpscaleTemplate(projectSlug: string): Record<string, any> {
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', UPSCALE_WORKFLOW_FILENAME);
-    if (!existsSync(filePath)) {
-      throw new NotFoundException(`Upscale workflow not found: ${filePath}`);
-    }
+  /** Combined one-pass upscale→RIFE template, or null when the project doesn't have it (legacy fallback). */
+  private loadCombinedTemplate(projectSlug: string): Record<string, any> | null {
+    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', COMBINED_WORKFLOW_FILENAME);
+    if (!existsSync(filePath)) return null;
     return JSON.parse(readFileSync(filePath, 'utf-8'));
   }
 
-  private patchUpscale(template: Record<string, any>, p: {
-    sourceVideo:    string;
-    filenamePrefix: string;
+  private patchCombined(template: Record<string, any>, p: {
+    sourceVideo:  string;
+    fhdPrefix:    string;
+    smoothPrefix: string;
+    multiplier:   number;
+    fps:          number;
   }): Record<string, any> {
     const wf = structuredClone(template);
-    if (wf['1']) wf['1'].inputs.file            = p.sourceVideo;
-    if (wf['7']) wf['7'].inputs.filename_prefix = p.filenamePrefix;
+    if (wf['1'])  wf['1'].inputs.file             = p.sourceVideo;      // LoadVideo
+    if (wf['7'])  wf['7'].inputs.filename_prefix  = p.fhdPrefix;        // SaveVideo (FHD)
+    if (wf['8'])  wf['8'].inputs.model_name       = INTERP_MODEL_NAME;  // FrameInterpolationModelLoader
+    if (wf['9'])  wf['9'].inputs.multiplier       = p.multiplier;       // FrameInterpolate
+    if (wf['10']) wf['10'].inputs.fps             = p.fps;              // CreateVideo (smooth)
+    if (wf['11']) wf['11'].inputs.filename_prefix = p.smoothPrefix;     // SaveVideo (smooth)
     return wf;
   }
 
@@ -738,12 +817,39 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     await this.pollInterps();
   }
 
+  /**
+   * Watchdog: is a `running` stage's prompt truly LOST — i.e. ComfyUI has no
+   * history for it AND it's not in the live queue (running or pending) — past a
+   * grace window? This is the orphan case (ComfyUI restarted / dropped the job)
+   * that otherwise pins a row at `running` forever and stalls the single queue
+   * slot. The caller has already confirmed there's no completed history.
+   *
+   * Only returns true on a DEFINITIVE 'absent' verdict; a transient ComfyUI
+   * outage yields 'unknown' → we wait rather than fail a job that's still alive.
+   */
+  private async isOrphaned(promptId: string, startedAt: Date | null): Promise<boolean> {
+    const GRACE_MS = 120_000; // don't judge a freshly-dispatched prompt (queue/history lag)
+    if (startedAt && Date.now() - startedAt.getTime() < GRACE_MS) return false;
+    const where = await this.comfy.promptPlacement(promptId).catch(() => 'unknown' as const);
+    return where === 'absent';
+  }
+
   private async pollMainRenders(): Promise<void> {
     const running = await this.prisma.videoRender.findMany({ where: { status: 'running' } });
     for (const v of running) {
       if (!v.comfyPromptId) continue;
       const h = await this.comfy.getHistory(v.comfyPromptId).catch(() => null);
-      if (!h?.status?.completed) continue;
+      if (!h?.status?.completed) {
+        if (await this.isOrphaned(v.comfyPromptId, v.startedAt)) {
+          this.logger.warn(`video ${v.id}: ComfyUI lost prompt ${v.comfyPromptId} (orphaned) — failing to free the slot`);
+          this.cleanupInputCopy(v.id, v.sourceImageFilename);
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data:  { status: 'failed', completedAt: new Date(), errorMessage: 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog' },
+          });
+        }
+        continue;
+      }
 
       const success = h.status.status_str === 'success';
       if (success) {
@@ -791,30 +897,84 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     for (const v of running) {
       if (!v.upscalePromptId) continue;
       const h = await this.comfy.getHistory(v.upscalePromptId).catch(() => null);
-      if (!h?.status?.completed) continue;
+      if (!h?.status?.completed) {
+        if (await this.isOrphaned(v.upscalePromptId, v.upscaleStartedAt)) {
+          this.logger.warn(`upscale ${v.id}: ComfyUI lost prompt ${v.upscalePromptId} (orphaned) — failing to free the slot`);
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data:  { upscaleStatus: 'failed', upscaleCompletedAt: new Date(), upscaleErrorMessage: 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog' },
+          });
+        }
+        continue;
+      }
 
       const success = h.status.status_str === 'success';
       if (success) {
-        const outputFile = this.firstVideoOutput(h.outputs);
-        if (outputFile) {
-          let moved: string | null = null;
+        // The prompt is the combined one-pass graph (smooth output only — the
+        // FHD intermediate SaveVideo was removed 2026-07-22; we no longer write
+        // or keep it), OR a legacy single-step upscale (FHD only, still in
+        // flight). Route by save subfolder; prefer smooth.
+        const outs      = this.allVideoOutputs(h.outputs);
+        const smoothOut = outs.find((o) => (o.subfolder ?? '').includes('video_smooth')) ?? null;
+        const fhdOut    = outs.find((o) => (o.subfolder ?? '').includes('video_fhd'))
+          ?? (smoothOut ? null : outs[0]) ?? null;   // legacy: the sole output is the FHD clip
+        const primaryOut = smoothOut ?? fhdOut;
+        if (primaryOut) {
+          let movedSmooth: string | null = null;
+          let movedFhd:    string | null = null;
           try {
-            moved = await this.moveOutputToShotDir(v.shotId, outputFile, 'videos_fhd');
+            if (smoothOut) {
+              movedSmooth = await this.moveOutputToShotDir(v.shotId, smoothOut, 'videos_smooth');
+            } else if (fhdOut) {
+              movedFhd = await this.moveOutputToShotDir(v.shotId, fhdOut, 'videos_fhd');
+            }
           } catch (e: any) {
             this.logger.warn(`move upscaled video ${v.id}: ${e?.message}`);
           }
-          if (!moved) {
+          if (smoothOut ? !movedSmooth : !movedFhd) {
+            // moveOutputToShotDir is retry-idempotent (already-moved files are
+            // recognised at dest), so a partial move just finishes next tick.
             this.logger.warn(`upscale ${v.id}: completion seen but file not yet at COMFY_OUTPUT — will retry next tick`);
             continue;
           }
-          await this.prisma.videoRender.update({
-            where: { id: v.id },
-            data: {
-              upscaleStatus:      'completed',
-              upscaledFilename:   moved,
-              upscaleCompletedAt: new Date(),
-            },
-          });
+          if (movedSmooth) {
+            // One-pass graph: only the smooth clip is persisted. Point BOTH the
+            // upscale and interp lifecycle at that single file (the "best from
+            // the previous step"), so downstream gates/paths keyed on
+            // upscaledFilename still resolve — with no redundant videos_fhd copy.
+            await this.prisma.videoRender.update({
+              where: { id: v.id },
+              data: {
+                upscaleStatus:      'completed',
+                upscaledFilename:   movedSmooth,
+                upscaleCompletedAt: new Date(),
+                interpStatus:       'completed',
+                interpFilename:     movedSmooth,
+                interpPromptId:     v.upscalePromptId,
+                interpMultiplier:   v.interpMultiplier ?? DEFAULT_INTERP_MULTIPLIER,
+                interpQueuedAt:     v.upscaleStartedAt ?? new Date(),
+                interpStartedAt:    v.upscaleStartedAt ?? new Date(),
+                interpCompletedAt:  new Date(),
+                interpErrorMessage: null,
+              },
+            });
+          } else {
+            // Legacy single-step upscale (FHD only, still in flight): record it
+            // and auto-chain the mandatory interpolation so it stays ONE action.
+            await this.prisma.videoRender.update({
+              where: { id: v.id },
+              data: {
+                upscaleStatus:      'completed',
+                upscaledFilename:   movedFhd,
+                upscaleCompletedAt: new Date(),
+              },
+            });
+            try {
+              await this.interpolate(v.id);
+            } catch (e: any) {
+              this.logger.warn(`auto-queue interp after legacy upscale ${v.id}: ${e?.message}`);
+            }
+          }
         } else {
           // Upscale failed — but the underlying video is fine. Clear all upscale
           // fields so the row looks "never upscaled" and the UI re-offers the
@@ -842,7 +1002,16 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     for (const v of running) {
       if (!v.interpPromptId) continue;
       const h = await this.comfy.getHistory(v.interpPromptId).catch(() => null);
-      if (!h?.status?.completed) continue;
+      if (!h?.status?.completed) {
+        if (await this.isOrphaned(v.interpPromptId, v.interpStartedAt)) {
+          this.logger.warn(`interp ${v.id}: ComfyUI lost prompt ${v.interpPromptId} (orphaned) — failing to free the slot`);
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data:  { interpStatus: 'failed', interpCompletedAt: new Date(), interpErrorMessage: 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog' },
+          });
+        }
+        continue;
+      }
 
       const success = h.status.status_str === 'success';
       if (success) {
@@ -965,6 +1134,21 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return null;
   }
 
+  /** Every video-ish file in a prompt's history outputs — multi-output graphs (combined upscale→RIFE) save more than one. */
+  private allVideoOutputs(outputs: Record<string, unknown> | undefined): { filename: string; subfolder?: string }[] {
+    if (!outputs) return [];
+    const found: { filename: string; subfolder?: string }[] = [];
+    for (const o of Object.values(outputs)) {
+      const oo = o as any;
+      for (const c of [...(oo?.videos ?? []), ...(oo?.gifs ?? []), ...(oo?.images ?? [])]) {
+        if (c?.filename && /\.(mp4|webm|mov|gif)$/i.test(c.filename as string)) {
+          found.push({ filename: c.filename, subfolder: c.subfolder });
+        }
+      }
+    }
+    return found;
+  }
+
   private async moveOutputToShotDir(
     shotId: string,
     out: { filename: string; subfolder?: string },
@@ -978,9 +1162,12 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     const destDir = path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, destSubdir);
     mkdirSync(destDir, { recursive: true });
 
-    const src = path.join(COMFY_OUTPUT, out.subfolder ?? '', path.basename(out.filename));
-    if (!existsSync(src)) return null;
+    const src  = path.join(COMFY_OUTPUT, out.subfolder ?? '', path.basename(out.filename));
     const dest = path.join(destDir, path.basename(out.filename));
+    // Retry-idempotent: a multi-output harvest can move file A, then bail on a
+    // not-yet-flushed file B and retry the whole set next tick — recognise the
+    // already-moved A at its destination instead of reporting it lost.
+    if (!existsSync(src)) return existsSync(dest) ? path.basename(dest) : null;
     try {
       renameSync(src, dest);
     } catch (e: any) {

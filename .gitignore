@@ -55,3 +55,10 @@ data/_voices/
 .next/
 backend_stdout.log
 backend_stderr.log
+
+# Qwen3-TTS local venv (py3.12/cu128, multi-GB — never commit)
+.venv-qwen3/
+# CapCut draft backups (transient, large)
+_capcut_draft_backups_*/
+# YouTube OAuth tokens/credentials — SECRETS, never commit
+data/youtube-auth.json

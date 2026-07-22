@@ -11,6 +11,7 @@ import { BgmRenderService } from '../bgm/bgm-render.service';
 import { AnchorRenderService } from '../characters/anchor-render.service';
 import { ImageValidationService } from '../validation/image-validation.service';
 import { AnchorValidationService } from '../validation/anchor-validation.service';
+import { YoutubeCaptionsService } from '../youtube/youtube-captions.service';
 import { EngineService } from './engine.service';
 
 const POLL_MS = 5_000;
@@ -37,6 +38,8 @@ export class PipelineQueueService {
   private readonly logger = new Logger(PipelineQueueService.name);
   private worker?: NodeJS.Timeout;
   private ticking = false;
+  /** Last dispatched member of the upscale/interp pair — used for same-workflow batching (see tick). */
+  private lastVideoPostType: 'video_upscale' | 'video_interp' | null = null;
 
   constructor(
     private readonly prisma:   PrismaService,
@@ -49,6 +52,7 @@ export class PipelineQueueService {
     private readonly anchors:  AnchorRenderService,
     private readonly validation: ImageValidationService,
     private readonly anchorValidation: AnchorValidationService,
+    private readonly captions: YoutubeCaptionsService,
     private readonly engine:   EngineService,
   ) {}
 
@@ -117,10 +121,15 @@ export class PipelineQueueService {
     const anchorValidationActive = await (this.prisma as any).anchorValidationJob.count({
       where: { status: 'running' },
     });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0 || validationActive > 0 || anchorValidationActive > 0) return;
+    // Caption jobs (faster-whisper transcription) hold the single slot too — CPU
+    // work, but the queue serialises everything, so a transcription pauses renders.
+    const captionActive = await (this.prisma as any).captionJob.count({
+      where: { status: 'running' },
+    });
+    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0 || validationActive > 0 || anchorValidationActive > 0 || captionActive > 0) return;
 
     // ── 3. Pick oldest pending across all queues ───────────────────────────
-    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextInterp, nextTTS, nextBgm, nextAnchor, nextValidation, nextAnchorValidation] = await Promise.all([
+    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextInterp, nextTTS, nextBgm, nextAnchor, nextValidation, nextAnchorValidation, nextCaption] = await Promise.all([
       this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
       this.datasets.findNextPending(),
       this.scenes.findNextPending(),
@@ -132,9 +141,10 @@ export class PipelineQueueService {
       this.anchors.findNextPending(),
       this.validation.findNextPending(),
       this.anchorValidation.findNextPending(),
+      this.captions.findNextPending(),
     ]);
 
-    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation' | 'anchor_validation'; id: string; ts: number };
+    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation' | 'anchor_validation' | 'caption'; id: string; ts: number };
     const candidates: Pick[] = [];
     if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
     if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
@@ -159,10 +169,30 @@ export class PipelineQueueService {
     if (nextAnchor)   candidates.push({ type: 'anchor',   id: nextAnchor.id,   ts: nextAnchor.queuedAt.getTime() });
     if (nextValidation) candidates.push({ type: 'validation', id: nextValidation.id, ts: nextValidation.queuedAt.getTime() });
     if (nextAnchorValidation) candidates.push({ type: 'anchor_validation', id: nextAnchorValidation.id, ts: nextAnchorValidation.queuedAt.getTime() });
+    if (nextCaption) candidates.push({ type: 'caption', id: nextCaption.id, ts: nextCaption.queuedAt.getTime() });
     if (candidates.length === 0) return;
 
     candidates.sort((a, b) => a.ts - b.ts);
-    const winner = candidates[0];
+    let winner = candidates[0];
+
+    // Same-workflow batching for the upscale/interp pair (user 2026-07-16):
+    // alternating the two graphs makes ComfyUI unload/reload models on EVERY
+    // job (~2.5 min each instead of ~30 s). When the FIFO winner is one of the
+    // pair but the previous dispatch was the other one and that pool still has
+    // work, stay on the previous type until its pool drains — one model swap
+    // per pool instead of one per job. Other job types are unaffected (they
+    // only ever win by being oldest, and we never steal their win).
+    if (
+      (winner.type === 'video_upscale' || winner.type === 'video_interp') &&
+      this.lastVideoPostType &&
+      this.lastVideoPostType !== winner.type
+    ) {
+      const sticky = candidates.find((c) => c.type === this.lastVideoPostType);
+      if (sticky) winner = sticky;
+    }
+    if (winner.type === 'video_upscale' || winner.type === 'video_interp') {
+      this.lastVideoPostType = winner.type;
+    }
 
     if (winner.type === 'training')           await this.dispatchTraining(winner.id);
     else if (winner.type === 'dataset')       await this.dispatchDataset(winner.id);
@@ -174,7 +204,32 @@ export class PipelineQueueService {
     else if (winner.type === 'bgm')           await this.dispatchBgm(winner.id);
     else if (winner.type === 'anchor')        await this.dispatchAnchor(winner.id);
     else if (winner.type === 'validation')    await this.dispatchValidation(winner.id);
-    else                                       await this.dispatchAnchorValidation(winner.id);
+    else if (winner.type === 'anchor_validation') await this.dispatchAnchorValidation(winner.id);
+    else                                       await this.dispatchCaption(winner.id);
+  }
+
+  /**
+   * Dispatch a caption job. Whisper runs on CPU, so ComfyUI can stay alive (idle)
+   * — the single-slot guard already prevents any other job from running. Mark
+   * running synchronously so the next tick sees the held slot, then fire the async
+   * transcription+upload (which self-updates the row to completed/failed).
+   */
+  private async dispatchCaption(jobId: string): Promise<void> {
+    // Whisper runs on the GPU (float16) — stop ComfyUI first to free VRAM, same
+    // arbitration as validation. The next render auto-restarts ComfyUI.
+    this.logger.log(`Dispatching caption job ${jobId} — stopping ComfyUI to free the GPU for whisper`);
+    try {
+      await this.engine.stopComfy();
+    } catch (e: any) {
+      this.logger.warn(`stopComfy failed (proceeding anyway): ${e.message}`);
+    }
+    await (this.prisma as any).captionJob.update({
+      where: { id: jobId },
+      data:  { status: 'running', startedAt: new Date() },
+    });
+    void this.captions.run(jobId).catch((e) => {
+      this.logger.error(`caption run ${jobId} threw: ${e?.message ?? e}`);
+    });
   }
 
   /**

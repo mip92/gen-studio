@@ -1133,64 +1133,57 @@ def build_draft(manifest: dict) -> Path:
     total_transitions = successful_transitions
 
     # ── BGM (ACE-Step) ──────────────────────────────────────────────────
-    # One audio lane PER ACT (`bgm_act_<act>`): every cue of an act shares a
-    # lane, the next act starts a fresh lane. Within an act-lane, consecutive
-    # cues are laid in start order and each is capped at the next cue's start
-    # (same lane → would collide). The act's LAST cue plays its full overgen
-    # tail — the next act is on a different lane, so the tail can ring out
-    # without colliding. (Per user spec: «все треки в каждом акте в одной
-    # дорожке, следующий акт — новая дорожка».) Falls back to blockSlug for
-    # cues with no resolved act.
-    #
-    # Two duration fields per entry:
-    #   - duration_us         planned slot length on the timeline
-    #   - render_duration_us  actual flac length on disk (renderSec from ACE-Step,
-    #                         which is duration_us + overgen tail)
-    BGM_FADE_IN_US  = 1_000_000   # 1 s in-fade for clean entry
-    BGM_FADE_OUT_US = 1_500_000   # 1.5 s out-fade hides the source_timerange cut
+    # Per ACT (NarrativeBlock): tiles are laid CHECKERBOARD across two lanes
+    # ('a'/'b') on their own tracks `bgm_<block>_<lane>`. We walk the block's
+    # tiles in `order` from `block_start_us` and advance the cursor by each
+    # tile's REAL flac length minus the crossfade — so neighbours overlap
+    # exactly for a crossfade whatever the tile size (legacy short takes AND new
+    # 150s tiles lay tight; no baked/mocked step). Each block keeps its own fresh
+    # lane pair, so its tails can ring into the next act without colliding. Whole
+    # flac plays — no crop. (Per user: «ставь по реальной длине трека».)
+    BGM_CROSSFADE_US = 3_000_000   # 3 s
     tracks = list(manifest.get("music_tracks") or [])
-    # Sort by start_us so "next track" lookup is correct even if blocks were
-    # emitted out of timeline order.
-    tracks.sort(key=lambda t: int(t.get("start_us") or 0))
 
-    # Group by ACT, preserving sort order within each group. Each act becomes
-    # its own audio lane. Cues are already globally sorted by start_us above,
-    # so each act-group is in timeline order.
-    act_groups: Dict[str, List[Dict[str, Any]]] = {}
-    act_order: List[str] = []
+    # Group by BLOCK, preserving first-seen order; tiles ordered by `order`.
+    by_block: Dict[str, List[Dict[str, Any]]] = {}
+    block_order: List[str] = []
     for mt in tracks:
-        act = (mt.get("act") or mt.get("blockSlug") or "default") or "default"
-        if act not in act_groups:
-            act_groups[act] = []
-            act_order.append(act)
-        act_groups[act].append(mt)
+        block = str(mt.get("blockSlug") or mt.get("act") or "default") or "default"
+        if block not in by_block:
+            by_block[block] = []
+            block_order.append(block)
+        by_block[block].append(mt)
 
-    for act in act_order:
-        track_name = f"bgm_act_{act}"
-        script.add_track(draft.TrackType.audio, track_name)
-        group = act_groups[act]
-        for j, mt in enumerate(group):
-            wav_path = mt["path"].replace("\\", "/")
-            actual_us = _audio_duration_us(wav_path)
-            playback_us = int(mt.get("duration_us") or 0)
-            render_us   = int(mt.get("render_duration_us") or 0)
-            if actual_us <= 0 and playback_us <= 0 and render_us <= 0:
+    for block in block_order:
+        tiles = sorted(by_block[block], key=lambda t: int(t.get("order") or 0))
+        if not tiles:
+            continue
+        # Create each lane track once (first-seen lane order = a then b).
+        seen_lanes: List[str] = []
+        for mt in tiles:
+            lane = str(mt.get("lane") or "a")
+            if lane not in seen_lanes:
+                script.add_track(draft.TrackType.audio, f"bgm_{block}_{lane}")
+                seen_lanes.append(lane)
+        # Accumulate each tile's position from the act anchor using the REAL
+        # on-disk flac length.
+        cursor = int(tiles[0].get("block_start_us") or 0)
+        for mt in tiles:
+            lane       = str(mt.get("lane") or "a")
+            track_name = f"bgm_{block}_{lane}"
+            wav_path   = mt["path"].replace("\\", "/")
+            actual_us  = _audio_duration_us(wav_path)
+            if actual_us <= 0:
+                actual_us = int(mt.get("render_duration_us") or 0)  # probe failed → fallback
+            if actual_us <= 0:
                 _log(f'skipping bgm segment {mt.get("segmentId")}: cannot determine duration')
                 continue
-            flac_us = actual_us if actual_us > 0 else render_us
-            start_us = int(mt["start_us"])
-            # Within a block: cap by the next cue in the same block (same
-            # lane → would collide). For the last cue of a block: play out
-            # the full flac (no neighbour on this lane, the next block's
-            # first cue is on a different lane).
-            if j + 1 < len(group):
-                next_start_us = int(group[j + 1].get("start_us") or 0)
-                bgm_dur = max(0, next_start_us - start_us)
-                if flac_us > 0:
-                    bgm_dur = min(bgm_dur, flac_us)
-            else:
-                bgm_dur = flac_us if flac_us > 0 else playback_us
-            # Shorts: never let a cue run past the (short) timeline end.
+            start_us = cursor
+            bgm_dur  = actual_us
+            # Advance the cursor for the NEXT tile (overlap by the crossfade) —
+            # do it now so a shorts-clipped/skipped tile still keeps the rhythm.
+            cursor += max(1_000_000, actual_us - BGM_CROSSFADE_US)
+            # Shorts: never let a tile run past the (short) timeline end.
             if max_timeline_us > 0:
                 if start_us >= max_timeline_us:
                     continue
@@ -1199,23 +1192,19 @@ def build_draft(manifest: dict) -> Path:
                 continue
             material = draft.AudioMaterial(
                 wav_path,
-                material_name=f'bgm_{act}_{mt.get("blockSlug","")}_{mt.get("segmentId","")[:8]}',
+                material_name=f'bgm_{block}_{lane}_{mt.get("segmentId","")[:8]}',
             )
-            # BGM sits under voiceover at 20% gain. ACE-Step output is
-            # normalised to roughly -6 dBFS RMS so a straight pass would
-            # drown narration; 0.2 ≈ -14 dB attenuation puts it where movie
-            # cues typically sit behind dialog. Editable per-segment in
-            # CapCut afterward.
+            # BGM sits under voiceover at 20% gain (≈ -14 dB) — editable per
+            # segment in CapCut afterward.
             segment = draft.AudioSegment(
                 material=material,
                 target_timerange=draft.Timerange(start=start_us, duration=bgm_dur),
-                # source_timerange crops the flac to the playback slot.
                 source_timerange=draft.Timerange(start=0, duration=bgm_dur),
                 volume=0.2,
             )
-            fade_in  = min(BGM_FADE_IN_US,  bgm_dur // 2)
-            fade_out = min(BGM_FADE_OUT_US, bgm_dur // 2)
-            segment.add_fade(in_duration=fade_in, out_duration=fade_out)
+            # Crossfade with the neighbour on the other lane (spares included).
+            fade = min(BGM_CROSSFADE_US, bgm_dur // 2)
+            segment.add_fade(in_duration=fade, out_duration=fade)
             script.add_segment(segment, track_name=track_name)
             total_bgm += 1
 

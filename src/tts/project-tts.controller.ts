@@ -56,7 +56,7 @@ export class ProjectTTSController {
   // ── Engine switch ──────────────────────────────────────────────────────
 
   @Patch('engine')
-  @ApiOperation({ summary: 'Switch the project TTS engine (silero | xtts2 | f5)' })
+  @ApiOperation({ summary: 'Switch the project TTS engine (silero | xtts2 | f5 | qwen3)' })
   async setEngine(
     @Param('projectId') projectId: string,
     @Body() body: { engine: TTSEngine },

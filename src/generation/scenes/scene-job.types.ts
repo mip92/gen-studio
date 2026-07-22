@@ -44,4 +44,17 @@ export interface SceneJobParams {
   reduxClipVision?:    string;
   /** StyleModelApply strength (0..1, identity influence). Default ~0.8. */
   reduxStrength?:      number;
+
+  // ── Qwen-Image-Edit-2511 multi-anchor identity ─────────────────────────────
+  /** ComfyUI-input-relative filenames of the staged participant anchor PNGs,
+   *  parallel to `participants` (Picture 1 = participants[0]), max 3. Set by
+   *  scene-render.service ONLY when every required anchor + the Qwen model
+   *  files are present on disk, so strategies can trust it — the realcomic_qwen
+   *  strategies and the dual-character Qwen overlay read it. */
+  anchorImagePaths?:   string[];
+  /** Style LoRA for the Qwen graph (RealComic by default; overridable via
+   *  project.settings.styleLora — the same convention node "2" uses on the
+   *  legacy cartoon graphs). Absent on the dual-character overlay, where the
+   *  style is carried by the anchor reference images. */
+  qwenStyleLora?:      { name: string; strengthModel?: number };
 }

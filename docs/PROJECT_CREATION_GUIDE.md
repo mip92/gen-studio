@@ -267,7 +267,8 @@ data/<slug>/
 │   ├── scene_single_character_hires_api.json
 │   ├── scene_single_character_ipadapter_api.json  (создать на основе)
 │   ├── video_wan22_i2v_api.json
-│   ├── video_upscale_4x_api.json
+│   ├── video_upscale_interp_api.json   (one-pass upscale→RIFE, обязателен)
+│   ├── video_fps_interp_api.json       (standalone re-smooth)
 │   └── bgm_acestep_api.json
 ├── datasets/               ← LoRA training images
 │   ├── CONDUCTOR_BASE/
@@ -624,7 +625,7 @@ SELECT * FROM scoped WHERE "shotType" = prev_type;
 12. **Утвердить рендеры** — выбрать `chosenRender` для каждого шота
 13. **i2v видео** (Wan2.2) — `POST /shots/:shotId/videos` для каждого
 14. **Утвердить видео** — выбрать `chosenVideoId`
-15. **Upscale 4x** (optional) — `video_upscale_4x_api.json`
+15. **Upscale→FPS** (one-pass) — `video_upscale_interp_api.json` (один ComfyUI-джоб выдаёт FHD + сглаженный клип; модели грузятся один раз)
 16. **TTS narration** — `POST /tts/shots/:shotId` для всех 200 шотов (Silero V5 RU)
 17. **BGM** — `NarrativeBlock` + `MusicSegment` через ACE-Step
 18. **Сшивка финального mp4** — CapCut export через `scripts/export_capcut.py`

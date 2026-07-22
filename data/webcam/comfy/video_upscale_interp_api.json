@@ -1,0 +1,69 @@
+{
+  "1": {
+    "class_type": "LoadVideo",
+    "inputs": { "file": "PLACEHOLDER.mp4" }
+  },
+  "2": {
+    "class_type": "GetVideoComponents",
+    "inputs": { "video": ["1", 0] }
+  },
+
+  "3": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": { "model_name": "4x-UltraSharp.pth" }
+  },
+  "4": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": { "upscale_model": ["3", 0], "image": ["2", 0] }
+  },
+  "5": {
+    "class_type": "ImageScale",
+    "inputs": {
+      "image": ["4", 0],
+      "upscale_method": "lanczos",
+      "width": 1920,
+      "height": 1080,
+      "crop": "disabled"
+    }
+  },
+
+  "6": {
+    "class_type": "CreateVideo",
+    "inputs": { "images": ["5", 0], "fps": ["2", 2] }
+  },
+  "7": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["6", 0],
+      "filename_prefix": "video_fhd/scene",
+      "format": "auto",
+      "codec": "auto"
+    }
+  },
+
+  "8": {
+    "class_type": "FrameInterpolationModelLoader",
+    "inputs": { "model_name": "rife_v4.26.safetensors" }
+  },
+  "9": {
+    "class_type": "FrameInterpolate",
+    "inputs": {
+      "interp_model": ["8", 0],
+      "images": ["5", 0],
+      "multiplier": 2
+    }
+  },
+  "10": {
+    "class_type": "CreateVideo",
+    "inputs": { "images": ["9", 0], "fps": 32 }
+  },
+  "11": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "video": ["10", 0],
+      "filename_prefix": "video_smooth/scene",
+      "format": "auto",
+      "codec": "auto"
+    }
+  }
+}

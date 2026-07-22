@@ -919,6 +919,10 @@ model MusicSegment {
   /// Target seconds for this segment. Final flac length is decided by ACE-Step
   /// (driven by node `EmptyAceStep1.5LatentAudio.seconds`); this is the request.
   durationSec Int      @default(60)
+  /// Spare tile: generated on the act mood prompt but laid raw (no fade / no
+  /// crop) on its own export lane, as manual-editing material. false = a main
+  /// tile that the exporter places checkerboard with a crossfade.
+  spare       Boolean  @default(false)
   /// AudioRenderJob.id chosen as the canonical take for this segment. Plain id,
   /// no FK — mirrors approvedTTSJobId convention, so deleting a job row doesn't
   /// cascade-null the segment.
@@ -982,6 +986,35 @@ model AnchorRenderJob {
   @@index([profileId])
   @@index([status, queuedAt])
   @@map("anchor_render_jobs")
+}
+
+/// Subtitle/caption jobs — transcribe a project's FINAL exported mp4 with
+/// faster-whisper (in the qwen3 venv) into an .srt, then upload it to the video
+/// on YouTube via captions.insert. Runs through PipelineQueueService in the same
+/// single GPU slot as every other job (whisper is CPU, but the queue is
+/// single-slot by invariant, so a transcription pauses renders until it's done).
+/// See YoutubeCaptionsService.
+model CaptionJob {
+  id           String    @id @default(uuid())
+  projectId    String
+  /// The YouTube video id to attach the caption track to (from the upload).
+  videoId      String
+  /// Absolute path to the mp4 to transcribe (the final CapCut export).
+  videoPath    String
+  /// BCP-47 language of the caption track.
+  language     String    @default("ru")
+  status       String    @default("pending")   // pending | running | completed | failed
+  /// Path to the generated .srt once transcription completes.
+  srtPath      String?
+  /// True once captions.insert accepted the track.
+  uploaded     Boolean   @default(false)
+  errorMessage String?
+  queuedAt     DateTime  @default(now())
+  startedAt    DateTime?
+  completedAt  DateTime?
+
+  @@index([status, queuedAt])
+  @@map("caption_jobs")
 }
 
 /// Visual-style registry. Each row defines a complete style: style-block tokens

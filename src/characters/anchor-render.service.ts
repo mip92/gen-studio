@@ -5,6 +5,8 @@ import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { ComfyService } from '../comfy/comfy.service';
 import { normalizeStyleLora } from '../generation/scenes/scene-render.service';
+import { QwenSceneGraphBuilder } from '../generation/scenes/qwen/qwen-scene-graph.builder';
+import { composeQwenInstruction, REALCOMIC_T2I_STYLE } from '../generation/scenes/qwen/qwen-prompt';
 import { AnchorValidationService, anchorCandidateDir } from '../validation/anchor-validation.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? 'E:\\ComfyUI\\gen-studio';
@@ -58,6 +60,17 @@ const FLUX_COMIC_STYLE =
 const PORTRAIT_COMPOSITION =
   'three-quarter portrait facing camera, head-and-shoulders framing, ' +
   'neutral pale grey backdrop, soft north-window light, anchor reference portrait';
+
+// realcomic_qwen: Qwen's VL encoder reads natural language, and the anchor
+// must show enough of the body for scene renders to copy the outfit/build —
+// not just head-and-shoulders.
+const QWEN_PORTRAIT_COMPOSITION =
+  'a three-quarter portrait of a single person facing the camera, waist-up framing, ' +
+  'neutral pale grey backdrop, soft window light, clean character reference sheet look';
+
+const QWEN_ANCHOR_NEGATIVE =
+  'photograph, photorealistic, 3D render, plastic skin, anime, manga, chibi, ' +
+  'deformed hands, extra fingers, two heads, multiple people, watermark, text overlay, blurry, low quality';
 
 const ANCHOR_NEGATIVE =
   'photograph, photorealistic, 3D render, CGI, plastic skin, smooth gradient shading, ' +
@@ -181,9 +194,11 @@ export class AnchorRenderService {
     // Anchor workflow per visual style. Both share the node layout the patches
     // below target (2=LoraLoader, 3/4=text, 6=KSampler, 8=SaveImage), so the
     // same code drives the SDXL and Flux comic anchor graphs.
-    const workflowFilename = visualStyle === 'graphic_novel_flux'
-      ? 'gen_anchor_portrait_flux_comic_api.json'
-      : 'gen_anchor_portrait_graphic_novel_api.json';
+    const workflowFilename = visualStyle === 'realcomic_qwen'
+      ? 'gen_anchor_portrait_realcomic_qwen_api.json'
+      : visualStyle === 'graphic_novel_flux'
+        ? 'gen_anchor_portrait_flux_comic_api.json'
+        : 'gen_anchor_portrait_graphic_novel_api.json';
     // Per-project workflow wins; fall back to the shared master template so a
     // new project renders anchors without pre-copying its comfy/ dir.
     const perProject   = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
@@ -197,7 +212,39 @@ export class AnchorRenderService {
       return;
     }
 
-    const wf = JSON.parse(readFileSync(workflowPath, 'utf-8')) as Record<string, any>;
+    let wf = JSON.parse(readFileSync(workflowPath, 'utf-8')) as Record<string, any>;
+
+    if (visualStyle === 'realcomic_qwen') {
+      // Qwen graph: different node layout AND the text input on
+      // TextEncodeQwenImageEditPlus is named `prompt`, not `text` — the generic
+      // patch block below would silently write a stray `.text` key and leave
+      // the real prompt as "PLACEHOLDER" (garbage anchor, no error). Delegate
+      // to the shared Qwen builder instead.
+      const styleLora = normalizeStyleLora((project as any).settings);
+      const instruction = composeQwenInstruction({
+        participants:   [],
+        scenePrompt:    [QWEN_PORTRAIT_COMPOSITION, profile.promptBase].join(', '),
+        styleDirective: REALCOMIC_T2I_STYLE,
+        withReferences: false,
+      });
+      wf = new QwenSceneGraphBuilder().build(wf as any, {
+        instruction,
+        negative:       (profile.negative && profile.negative.trim().length > 0) ? profile.negative : QWEN_ANCHOR_NEGATIVE,
+        width:          832,
+        height:         1216,
+        batchSize:      ANCHOR_CANDIDATES,
+        seed:           Math.floor(Math.random() * 2 ** 31),
+        scheduler:      'sgm_uniform',
+        filenamePrefix: `anchor_${profile.profileCode}`,
+        anchors:        [],
+        styleLora: {
+          name:           styleLora?.name ?? 'style\\RealComic_2509_base.safetensors',
+          strengthModel:  styleLora?.strengthModel ?? 1.0,
+        },
+      }) as Record<string, any>;
+      await this.submitAndMarkRunning(jobId, profile.profileCode, wf);
+      return;
+    }
 
     // One style LoRA per PROJECT, across the whole pipeline. The anchor workflow
     // bakes Graphic_Novel in its LoraLoader (node 2); if the project picked a
@@ -232,6 +279,12 @@ export class AnchorRenderService {
     // vision validator can pick the best clean, on-model, non-anime portrait.
     if (wf['5']?.inputs) wf['5'].inputs.batch_size = ANCHOR_CANDIDATES;
 
+    await this.submitAndMarkRunning(jobId, profile.profileCode, wf);
+  }
+
+  /** Submit the assembled anchor workflow to ComfyUI and mark the job running.
+   *  Fails the job (does not throw) when ComfyUI is unreachable. */
+  private async submitAndMarkRunning(jobId: string, profileCode: string, wf: Record<string, any>): Promise<void> {
     let promptId: string;
     try {
       ({ promptId } = await this.comfy.queuePrompt(wf));
@@ -248,7 +301,7 @@ export class AnchorRenderService {
       where: { id: jobId },
       data:  { status: 'running', comfyPromptId: promptId, startedAt: new Date() },
     });
-    this.logger.log(`Anchor dispatch: jobId=${jobId} profile=${profile.profileCode} → promptId=${promptId}`);
+    this.logger.log(`Anchor dispatch: jobId=${jobId} profile=${profileCode} → promptId=${promptId}`);
   }
 
   /** Poll ComfyUI for any running anchor jobs; mark done/failed and copy file. */

@@ -80,6 +80,24 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     });
     if (!segment) throw new NotFoundException(`Segment ${input.segmentId} not found`);
 
+    // Gate: music can only be generated once ALL project voiceover is done —
+    // the act length (and thus the tiling) is derived from VO, so rendering
+    // before TTS is approved would tile against a moving target. A shot "needs
+    // VO" iff it has narrationText; "ready" iff it also has an approved take.
+    const pendingTts = await this.prisma.shot.count({
+      where: {
+        projectId:        segment.block.projectId,
+        narrationText:    { not: null },
+        approvedTTSJobId: null,
+      },
+    });
+    if (pendingTts > 0) {
+      throw new BadRequestException(
+        `Cannot render music yet: ${pendingTts} shot(s) still need approved voiceover. `
+        + `Music length is computed from the finished narration — finish TTS first.`,
+      );
+    }
+
     const promptOverride = input.prompt?.trim();
     const promptResolved = promptOverride
       || segment.prompt?.trim()

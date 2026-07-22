@@ -16,6 +16,8 @@ import { EnvironmentGraphicNovelSceneStrategy } from './strategies/environment-g
 import { EnvironmentFluxComicSceneStrategy } from './strategies/environment-flux-comic.strategy';
 import { SingleCharacterFluxComicSceneStrategy } from './strategies/single-character-flux-comic.strategy';
 import { DualCharacterFluxComicSceneStrategy } from './strategies/dual-character-flux-comic.strategy';
+import { QwenRealcomicSceneStrategy } from './strategies/qwen-realcomic-scene.strategy';
+import { QwenDualCharacterOverlayStrategy } from './strategies/qwen-dual-character-overlay.strategy';
 
 const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..', '..');
 
@@ -59,6 +61,23 @@ export class SceneFactory {
     this.register(new EnvironmentFluxComicSceneStrategy());
     this.register(new SingleCharacterFluxComicSceneStrategy());
     this.register(new DualCharacterFluxComicSceneStrategy());
+
+    // ── REALCOMIC QWEN strategies (Qwen-Image-Edit-2511 + RealComic LoRA) ────
+    // For projects with Project.visualStyle = 'realcomic_qwen'. One class, four
+    // participant counts — identity is 0-3 anchor portraits attached as VL
+    // image references (image1..image3), style is the RealComic LoRA + trigger.
+    for (const n of [0, 1, 2, 3] as const) {
+      this.register(new QwenRealcomicSceneStrategy(n));
+    }
+
+    // ── QWEN DUAL-CHARACTER OVERLAY for the legacy cartoon styles ────────────
+    // Synthetic visualStyle ids ('<host>::qwen_dual_override') are never
+    // matched by pickByStyleAndParticipantCount — scene-render.service fetches
+    // these via get(id) only when the Qwen models AND both participants'
+    // anchors are on disk; otherwise the legacy text-only dual strategies
+    // above keep handling the shot unchanged.
+    this.register(new QwenDualCharacterOverlayStrategy('graphic_novel_flux'));
+    this.register(new QwenDualCharacterOverlayStrategy('graphic_novel_cell_shaded'));
 
     // PHOTOREAL DualCharacterRegional was a 2-LoRA regional-prompting attempt
     // that produced face-bleed and identity mixing. Replaced by SingleWithBack

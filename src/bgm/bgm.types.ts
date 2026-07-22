@@ -53,14 +53,13 @@ export interface StartRenderInput {
 
 export interface AudioRenderParams {
   prompt:      string;
-  /** Playback target in seconds — what the CapCut timeline allots to this
-   *  segment. The flac on disk is longer (see `renderSec`); CapCut trims to
-   *  this length with a fade-out at the cut. */
+  /** Nominal tile length in seconds (TILE_SECONDS). The whole flac plays on
+   *  the CapCut timeline now — tiles are laid checkerboard on two lanes per
+   *  act and overlap by CROSSFADE_SECONDS, so there is no crop-to-slot. */
   durationSec: number;
   /** Actual seconds the ACE-Step pipeline was asked to render. Equals
-   *  `durationSec + OVERGEN_SECONDS` (capped at 240). Stored separately so
-   *  the export knows how long the flac on disk really is and can place a
-   *  source_timerange that crops to durationSec without hitting "超出了素材时长". */
+   *  `durationSec + OVERGEN_SECONDS` (capped at 240). Kept so the export knows
+   *  the real flac length when laying the tile at full length. */
   renderSec:   number;
   seed:        number;
   steps:       number;
@@ -81,6 +80,23 @@ export const OVERGEN_SECONDS = 0;
 export const RENDER_MAX_SECONDS = 240;
 
 /**
+ * Music layout per act (= NarrativeBlock). The act is auto-tiled into
+ * fixed-length tracks:
+ *   - TILE_SECONDS      one track = 150 s (well under RENDER_MAX_SECONDS).
+ *   - main tile count   = ceil(actLengthSeconds / TILE_SECONDS), laid
+ *                         checkerboard on two lanes (a/b) that overlap by
+ *                         CROSSFADE_SECONDS so one track fades out while the
+ *                         next fades in.
+ *   - SPARE_TRACK_COUNT extra tracks generated on the same act mood prompt and
+ *                         dropped raw (no fade, no trim) on their own lanes —
+ *                         the editor uses them to trim silence / reshuffle by
+ *                         hand. Per user spec: «плюс два запасных трека на акт».
+ */
+export const TILE_SECONDS       = 150;
+export const CROSSFADE_SECONDS   = 3;
+export const SPARE_TRACK_COUNT   = 2;
+
+/**
  * Default ACE-Step v1.5 *Turbo* generation params. Critical values:
  *   - steps=8 — turbo checkpoint is distilled for 8-step inference; 50 steps
  *              drives the sampler off-trajectory and produces noise/squeal.
@@ -96,5 +112,5 @@ export const DEFAULT_RENDER_PARAMS = {
   cfg:         1.0,
   samplerName: 'euler',
   scheduler:   'simple',
-  durationSec: 60,
+  durationSec: TILE_SECONDS,
 } as const;

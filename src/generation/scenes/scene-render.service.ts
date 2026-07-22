@@ -6,6 +6,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService, QueuePromptResult } from '../../comfy/comfy.service';
 import { ImageValidationService } from '../../validation/image-validation.service';
 import { SceneFactory } from './scene.factory';
+import { SceneStrategy } from './scene-strategy';
 import { SceneJobParams, SceneParticipant } from './scene-job.types';
 
 const APP_ROOT        = process.env.APP_ROOT        ?? path.resolve(__dirname, '..', '..', '..', '..');
@@ -24,6 +25,25 @@ const UPSCALE_SCRIPT  = path.join(APP_ROOT, 'scripts', 'upscale_to_fhd.py');
 const FLUX_VISUAL_STYLE      = 'graphic_novel_flux';
 const REDUX_STYLE_MODEL_NAME = process.env.FLUX_REDUX_MODEL        ?? 'flux1-redux-dev.safetensors';
 const REDUX_CLIP_VISION_NAME = process.env.FLUX_REDUX_CLIP_VISION  ?? 'sigclip_vision_patch14_384.safetensors';
+
+// Qwen-Image-Edit-2511: the native 'realcomic_qwen' style + the dual-character
+// overlay for the two legacy cartoon styles (both participants' anchors as
+// image references instead of text-only identity).
+const QWEN_VISUAL_STYLE         = 'realcomic_qwen';
+const CELL_SHADED_VISUAL_STYLE  = 'graphic_novel_cell_shaded';
+const QWEN_DUAL_OVERRIDE_STYLES = new Set([FLUX_VISUAL_STYLE, CELL_SHADED_VISUAL_STYLE]);
+// The LIVE ComfyUI models root. COMFY_MODELS_ROOT above derives from
+// COMFY_LORA_ROOT whose default points at the retired E:\ComfyUI install —
+// kept as-is for the (currently dormant) Redux probes; the Qwen files only
+// exist in the live install, so probe via COMFY_DIR when it's configured.
+const LIVE_MODELS_ROOT = process.env.COMFY_DIR
+  ? path.join(process.env.COMFY_DIR, 'models')
+  : COMFY_MODELS_ROOT;
+const QWEN_UNET_NAME           = process.env.QWEN_UNET           ?? 'qwen_image_edit_2511_fp8mixed.safetensors';
+const QWEN_LIGHTNING_LORA_NAME = process.env.QWEN_LIGHTNING_LORA ?? 'qwen\\Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors';
+const QWEN_CLIP_NAME           = process.env.QWEN_CLIP           ?? 'qwen_2.5_vl_7b_fp8_scaled.safetensors';
+const QWEN_VAE_NAME            = process.env.QWEN_VAE            ?? 'qwen_image_vae.safetensors';
+const REALCOMIC_LORA_NAME      = process.env.REALCOMIC_LORA      ?? 'style\\RealComic_2509_base.safetensors';
 
 export interface RenderShotInput {
   shotId:          string;
@@ -462,6 +482,54 @@ export class SceneRenderService {
     return staged;
   }
 
+  // ── Qwen-Image-Edit-2511 helpers ────────────────────────────────────────────
+
+  /** All four Qwen model files present in the live ComfyUI install. */
+  private isQwenBaseReady(): boolean {
+    return existsSync(path.join(LIVE_MODELS_ROOT, 'diffusion_models', QWEN_UNET_NAME))
+        && existsSync(path.join(LIVE_MODELS_ROOT, 'loras', QWEN_LIGHTNING_LORA_NAME))
+        && existsSync(path.join(LIVE_MODELS_ROOT, 'text_encoders', QWEN_CLIP_NAME))
+        && existsSync(path.join(LIVE_MODELS_ROOT, 'vae', QWEN_VAE_NAME));
+  }
+
+  /** Anchor PNG on disk for one participant, scanned across every project slug
+   *  the character is attached to (cameo anchors live under their HOME
+   *  project). Same resolution logic stageFluxReduxReference uses. */
+  private resolveAnchorPngPath(anchor: { profileCode: string; slugs: string[] }): string | undefined {
+    if (!anchor.profileCode) return undefined;
+    const seen = new Set<string>();
+    for (const slug of anchor.slugs) {
+      if (!slug || seen.has(slug)) continue;
+      seen.add(slug);
+      const p = path.join(APP_ROOT, 'data', slug, 'reference', `${anchor.profileCode}_anchor.png`);
+      if (existsSync(p)) return p;
+    }
+    return undefined;
+  }
+
+  /** Stage 0-3 participant anchors into ComfyUI's input dir for the Qwen
+   *  image references. Returns staged filenames parallel to `anchors`;
+   *  undefined slots = anchor not found / copy failed (caller decides whether
+   *  that's a hard error or a fallback). */
+  private stageParticipantAnchors(
+    shotCode: string,
+    anchors: Array<{ profileCode: string; slugs: string[] }>,
+  ): Array<string | undefined> {
+    return anchors.map((a, i) => {
+      const anchorPath = this.resolveAnchorPngPath(a);
+      if (!anchorPath) return undefined;
+      const staged = `scene_ref_${shotCode}_${i + 1}.png`;
+      try {
+        mkdirSync(COMFY_INPUT, { recursive: true });
+        copyFileSync(anchorPath, path.join(COMFY_INPUT, staged));
+      } catch (e: any) {
+        this.logger.warn(`[${shotCode}] Qwen anchor staging failed for ${a.profileCode}: ${e?.message ?? e}`);
+        return undefined;
+      }
+      return staged;
+    });
+  }
+
   // ── Direct render (called by queue worker after engine arbitration) ─────────
 
   async renderShot(input: RenderShotInput): Promise<RenderResult> {
@@ -579,7 +647,66 @@ export class SceneRenderService {
     // 0 participants is fine — uses environment strategy (no LoRA).
 
     // ── 3. Pick strategy by visual style + participant count ─────────────────
-    const strategy = this.scenes.pickByStyleAndParticipantCount(visualStyle, participants.length);
+    // realcomic_qwen renders natively on Qwen-Image-Edit-2511 (hard-fails when
+    // the model files or a participant's anchor are missing — mirroring the
+    // photoreal "no trained LoRA" rule, so a half-ready cast never silently
+    // renders with inconsistent faces). The two legacy cartoon styles get a
+    // Qwen dual-character OVERLAY (both anchors as image references) when
+    // every asset is present, else fall back to their original text-only dual
+    // strategies. Overlay strategies are reachable only via get(id) — the
+    // factory's (style, count) auto-picker never resolves them.
+    let strategy: SceneStrategy;
+    let anchorImagePaths: string[] | undefined;
+    let qwenStyleLora: { name: string; strengthModel?: number } | undefined;
+
+    if (visualStyle === QWEN_VISUAL_STYLE) {
+      if (!this.isQwenBaseReady()) {
+        throw new BadRequestException(
+          `Visual style "${QWEN_VISUAL_STYLE}" requires the Qwen-Image-Edit-2511 files under ${LIVE_MODELS_ROOT} ` +
+          `(diffusion_models/${QWEN_UNET_NAME}, loras/${QWEN_LIGHTNING_LORA_NAME}, text_encoders/${QWEN_CLIP_NAME}, vae/${QWEN_VAE_NAME}).`,
+        );
+      }
+      const settingsLora = normalizeStyleLora((shot.project as any).settings);
+      const loraName = settingsLora?.name ?? REALCOMIC_LORA_NAME;
+      if (!existsSync(path.join(LIVE_MODELS_ROOT, 'loras', loraName))) {
+        throw new BadRequestException(`Style LoRA "${loraName}" not found under ${LIVE_MODELS_ROOT}\\loras.`);
+      }
+      qwenStyleLora = {
+        name:          loraName,
+        strengthModel: input.loraStrength ?? settingsLora?.strengthModel ?? 1.0,
+      };
+      if (participants.length > 0) {
+        const staged  = this.stageParticipantAnchors(shot.shotCode, cartoonAnchors);
+        const missing = staged.flatMap((s, i) => (s ? [] : [participants[i]?.displayName ?? cartoonAnchors[i]?.profileCode]));
+        if (missing.length > 0) {
+          throw new BadRequestException(
+            `Shot ${shot.shotCode}: no anchor portrait for ${missing.join(', ')} — ` +
+            `realcomic_qwen identity is anchor-based; generate anchors first (POST /profiles/:id/generate-anchor).`,
+          );
+        }
+        anchorImagePaths = staged as string[];
+      }
+      strategy = this.scenes.pickByStyleAndParticipantCount(visualStyle, participants.length);
+    } else if (
+      QWEN_DUAL_OVERRIDE_STYLES.has(visualStyle) &&
+      participants.length === 2 &&
+      this.isQwenBaseReady()
+    ) {
+      const staged = this.stageParticipantAnchors(shot.shotCode, cartoonAnchors);
+      if (staged[0] && staged[1]) {
+        strategy = this.scenes.get(`scene_dual_character_qwen_overlay__${visualStyle}`);
+        anchorImagePaths = [staged[0], staged[1]];
+        this.logger.log(`[${shot.shotCode}] Qwen dual-character overlay engaged (both anchors found)`);
+      } else {
+        // Missing anchor(s) → legacy text-only dual strategy, unchanged.
+        strategy = this.scenes.pickByStyleAndParticipantCount(visualStyle, participants.length);
+      }
+    } else {
+      strategy = this.scenes.pickByStyleAndParticipantCount(visualStyle, participants.length);
+    }
+    // The Qwen graphs share none of the legacy node ids the post-strategy
+    // overrides in 4b/4c patch — those blocks must not touch them.
+    const usingQwenGraph = visualStyle === QWEN_VISUAL_STYLE || anchorImagePaths !== undefined;
     const template = this.scenes.loadTemplate(strategy, shot.project.slug);
 
     // ── 4. Build params ──────────────────────────────────────────────────────
@@ -661,6 +788,8 @@ export class SceneRenderService {
       referenceImagePath,
       reduxStyleModel: REDUX_STYLE_MODEL_NAME,
       reduxClipVision: REDUX_CLIP_VISION_NAME,
+      anchorImagePaths,
+      qwenStyleLora,
     };
 
     const workflow = strategy.buildPrompt(template, params);
@@ -675,7 +804,10 @@ export class SceneRenderService {
     // Guarded on isCartoon: in the PHOTOREAL workflows node "2" is the CHARACTER
     // LoRA, so we must never touch it there. Absent/null settings → the JSON
     // default LoRA is used unchanged (keeps gaz / bio_plus working as before).
-    if (isCartoon) {
+    // Skipped for Qwen graphs: node "2" doesn't exist there and the style LoRA
+    // (RealComic) is already applied via params.qwenStyleLora — including the
+    // settings.styleLora override and the per-render loraStrength slider.
+    if (isCartoon && !usingQwenGraph) {
       const node2 = (workflow as any)['2']?.inputs;
       const styleLora = normalizeStyleLora((shot.project as any).settings);
       if (styleLora && node2) {
@@ -701,7 +833,9 @@ export class SceneRenderService {
     // comic LoRA must match the base it was trained on (usually flux1-dev), a
     // project can pin a neutral base via `project.settings.fluxBaseModel`
     // without editing the JSON. Absent → the JSON default is kept.
-    if (visualStyle === FLUX_VISUAL_STYLE) {
+    // Skipped for Qwen graphs: node "1" there is the QWEN UNETLoader — writing
+    // the project's Flux base into it would corrupt the graph.
+    if (visualStyle === FLUX_VISUAL_STYLE && !usingQwenGraph) {
       const fluxBase = normalizeFluxBase((shot.project as any).settings);
       const node1 = (workflow as any)['1']?.inputs;
       if (fluxBase && node1) {

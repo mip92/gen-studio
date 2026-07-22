@@ -530,7 +530,7 @@ export class ActionsService {
     },
     out: ActionItem[],
   ): Promise<void> {
-    // Voice-clone engines (xtts2 | f5) can't synthesize anything without a
+    // Voice-clone engines (xtts2 | f5 | qwen3) can't synthesize anything without a
     // project voice reference — the renderer throws BadRequest until one is
     // uploaded (see TtsService.resolveEmotionParams). So a render_tts gate for
     // such a project isn't an action the user can take, it's a blocked
@@ -539,7 +539,7 @@ export class ActionsService {
     // reference, so it's never gated here. Note: approve_tts is unaffected — a
     // completed take can only exist once a reference already did.
     const engine = project.ttsEngine ?? 'silero';
-    const isVoiceClone = engine === 'xtts2' || engine === 'f5';
+    const isVoiceClone = engine === 'xtts2' || engine === 'f5' || engine === 'qwen3';
     const canRenderVoice = !isVoiceClone || !!project.ttsVoiceRefPath;
 
     // render_tts — shot has narration text (>= 1 char) but NO voiceover yet:

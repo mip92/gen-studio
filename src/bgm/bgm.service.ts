@@ -5,7 +5,10 @@ import {
   UpdateBlockInput,
   CreateSegmentInput,
   DEFAULT_RENDER_PARAMS,
+  TILE_SECONDS,
+  SPARE_TRACK_COUNT,
 } from './bgm.types';
+import { shotHoldUs, narrationUsFromTts } from '../exports/shot-timing';
 
 /**
  * Default-fallback duration per shot when its chosen video isn't available yet
@@ -38,7 +41,8 @@ export class BgmService {
     const project = await this.prisma.project.findUnique({ where: { id: input.projectId } });
     if (!project) throw new NotFoundException(`Project ${input.projectId} not found`);
 
-    const targetSeconds = await this.computeTargetSeconds(input.shotIds);
+    const exportTiming  = project.exportTiming === 'narration' ? 'narration' : 'clip';
+    const targetSeconds = await this.computeTargetSeconds(input.shotIds, exportTiming);
     return this.prisma.narrativeBlock.create({
       data: {
         projectId:  input.projectId,
@@ -104,7 +108,8 @@ export class BgmService {
         throw new BadRequestException(`Block must cover at least one shot`);
       }
       data.shotIds       = body.shotIds as any;
-      data.targetSeconds = await this.computeTargetSeconds(body.shotIds);
+      const exportTiming = await this.resolveExportTiming(block.projectId);
+      data.targetSeconds = await this.computeTargetSeconds(body.shotIds, exportTiming);
     }
     return this.prisma.narrativeBlock.update({ where: { id: blockId }, data });
   }
@@ -126,7 +131,8 @@ export class BgmService {
     const block = await this.prisma.narrativeBlock.findUnique({ where: { id: blockId } });
     if (!block) throw new NotFoundException(`Block ${blockId} not found`);
     const shotIds = (block.shotIds as string[]) ?? [];
-    const targetSeconds = await this.computeTargetSeconds(shotIds);
+    const exportTiming  = await this.resolveExportTiming(block.projectId);
+    const targetSeconds = await this.computeTargetSeconds(shotIds, exportTiming);
     return this.prisma.narrativeBlock.update({
       where: { id: blockId },
       data:  { targetSeconds },
@@ -190,22 +196,22 @@ export class BgmService {
   // ── Fill action ───────────────────────────────────────────────────────────
 
   /**
-   * Auto-fill a block with empty MusicSegment rows until their summed
-   * durationSec meets the block's targetSeconds. Does NOT queue any
-   * AudioRenderJob — that happens via BgmRenderService.start() per segment.
-   * Returns the freshly-created segments (sorted by sortOrder).
+   * Auto-fill a block with fixed-length MusicSegment tiles. The act length is
+   * (re)computed from voiceover — the same math the CapCut exporter uses — and
+   * tiled into `ceil(actLength / TILE_SECONDS)` main tiles of TILE_SECONDS each,
+   * plus SPARE_TRACK_COUNT spare tiles on the same act mood prompt. The export
+   * lays the main tiles checkerboard on two lanes (overlapping for a crossfade)
+   * and drops the spares raw on their own lanes for manual editing. Does NOT
+   * queue any AudioRenderJob — that happens via BgmRenderService.start().
    *
-   * The default segment length is the block's chunkSeconds (typical 60s).
-   * The last segment is shrunk to exactly cover the remainder so the chapter
-   * doesn't overflow into the next block.
-   *
-   * Refuses to run on a block with status='manual' — that mode means the user
-   * has taken over segment layout and we don't second-guess them.
+   * Idempotent top-up: it only creates the tiles still missing, so re-running
+   * after some tiles already exist won't duplicate them. Refuses to run on a
+   * block with status='manual' (the user took over segment layout).
    */
   async fillBlock(
     blockId: string,
-    opts: { chunkSeconds?: number } = {},
-  ): Promise<{ created: number; existing: number; targetSeconds: number; coveredSeconds: number }> {
+    _opts: { chunkSeconds?: number } = {},
+  ): Promise<{ created: number; existing: number; targetSeconds: number; mainTiles: number; spareTiles: number }> {
     const block = await this.prisma.narrativeBlock.findUnique({
       where:   { id: blockId },
       include: { segments: true },
@@ -214,69 +220,98 @@ export class BgmService {
     if (block.status === 'manual') {
       throw new BadRequestException(`Block ${blockId} is in manual mode — fill disabled`);
     }
-    const target = block.targetSeconds ?? await this.computeTargetSeconds((block.shotIds as string[]) ?? []);
-    const chunk  = opts.chunkSeconds ?? 60;
-    if (chunk < 10 || chunk > 240) {
-      throw new BadRequestException(`chunkSeconds must be in [10, 240] (got: ${chunk})`);
-    }
+    // Always recompute from VO so the tile count tracks the real act length,
+    // then persist it so the UI shows a fresh target.
+    const exportTiming = await this.resolveExportTiming(block.projectId);
+    const target = await this.computeTargetSeconds((block.shotIds as string[]) ?? [], exportTiming);
+    await this.prisma.narrativeBlock.update({ where: { id: blockId }, data: { targetSeconds: target } });
 
-    let covered = block.segments.reduce((sum, s) => sum + s.durationSec, 0);
+    // ceil(actLength / 150), at least one main tile even for a tiny act.
+    const wantMain  = Math.max(1, Math.ceil(target / TILE_SECONDS));
+    const wantSpare = SPARE_TRACK_COUNT;
+    const haveMain  = block.segments.filter((s) => !(s as { spare?: boolean }).spare).length;
+    const haveSpare = block.segments.filter((s) =>  (s as { spare?: boolean }).spare).length;
+
     let nextOrder = await this.nextSegmentSortOrder(blockId);
     let created = 0;
-
-    while (covered < target) {
-      const remaining = target - covered;
-      const seg = Math.min(chunk, Math.max(10, remaining));
+    const makeTile = async (spare: boolean) => {
       await this.prisma.musicSegment.create({
-        data: { blockId, durationSec: seg, sortOrder: nextOrder, prompt: null },
+        data: { blockId, durationSec: TILE_SECONDS, sortOrder: nextOrder, prompt: null, spare } as any,
       });
-      covered  += seg;
       nextOrder++;
       created++;
-      // Safety stop: never make more than 24 segments in one call. Hitting this
-      // means targetSeconds is wildly larger than chunk — caller should adjust.
-      if (created >= 24) break;
-    }
+    };
+    for (let i = haveMain;  i < wantMain;  i++) await makeTile(false);
+    for (let i = haveSpare; i < wantSpare; i++) await makeTile(true);
 
-    if (covered >= target) {
-      await this.prisma.narrativeBlock.update({
-        where: { id: blockId },
-        data:  { status: 'filled' },
-      });
-    }
-    return { created, existing: block.segments.length, targetSeconds: target, coveredSeconds: covered };
+    await this.prisma.narrativeBlock.update({
+      where: { id: blockId },
+      data:  { status: 'filled' },
+    });
+    return {
+      created,
+      existing:      block.segments.length,
+      targetSeconds: target,
+      mainTiles:     Math.max(haveMain, wantMain),
+      spareTiles:    Math.max(haveSpare, wantSpare),
+    };
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────
 
+  /** Resolve a project's export-timing mode ('narration' | 'clip'). */
+  private async resolveExportTiming(projectId: string): Promise<'narration' | 'clip'> {
+    const project = await this.prisma.project.findUnique({
+      where:  { id: projectId },
+      select: { exportTiming: true },
+    });
+    return project?.exportTiming === 'narration' ? 'narration' : 'clip';
+  }
+
   /**
-   * Sum chosen-video durations for the given shotIds (length / fps), falling
-   * back to {@link DEFAULT_SHOT_SECONDS} for shots without a chosen video. The
-   * result becomes the block's targetSeconds.
+   * Act length in seconds, summed from each shot's timeline hold via the shared
+   * {@link shotHoldUs} — the EXACT math the CapCut exporter uses (VO length +
+   * 0.5 s tail, floored, animated clips stretched to fit a longer VO). So the
+   * music we tile out equals the real act length on the timeline. Shots not
+   * found fall back to {@link DEFAULT_SHOT_SECONDS}.
    */
-  private async computeTargetSeconds(shotIds: string[]): Promise<number> {
+  private async computeTargetSeconds(
+    shotIds: string[],
+    exportTiming: 'narration' | 'clip',
+  ): Promise<number> {
     if (shotIds.length === 0) return 0;
     const shots = await this.prisma.shot.findMany({
       where:   { id: { in: shotIds } },
-      include: { videoRenders: true },
+      include: { videoRenders: true, ttsJobs: true },
     });
-    let total = 0;
+    let totalUs = 0;
     for (const id of shotIds) {
       const shot = shots.find((s) => s.id === id);
-      if (!shot) { total += DEFAULT_SHOT_SECONDS; continue; }
-      const chosen = shot.chosenVideoId
-        ? shot.videoRenders.find((v) => v.id === shot.chosenVideoId)
-        : null;
-      const params = (chosen?.params ?? null) as null | { length?: number; fps?: number };
-      const length = params?.length;
-      const fps    = params?.fps;
-      if (typeof length === 'number' && typeof fps === 'number' && fps > 0) {
-        total += Math.round(length / fps);
+      if (!shot) { totalUs += DEFAULT_SHOT_SECONDS * 1_000_000; continue; }
+
+      const narrationUs = narrationUsFromTts(
+        (shot as { approvedTTSJobId?: string | null }).approvedTTSJobId ?? null,
+        (shot as { ttsJobs?: Array<{ id: string; durationMs: number | null; text: string }> }).ttsJobs ?? [],
+      );
+
+      // Resolve render mode + native animated-clip length, mirroring the export.
+      let kind: 'image' | undefined;
+      let sourceUs: number | undefined;
+      if ((shot as { renderMode?: string }).renderMode === 'static') {
+        kind = 'image';
       } else {
-        total += DEFAULT_SHOT_SECONDS;
+        const chosen = shot.chosenVideoId
+          ? shot.videoRenders.find((v) => v.id === shot.chosenVideoId)
+          : null;
+        const params = (chosen?.params ?? null) as null | { length?: number; fps?: number };
+        if (typeof params?.length === 'number' && typeof params?.fps === 'number' && params.fps > 0) {
+          sourceUs = Math.round((params.length / params.fps) * 1_000_000);
+        }
       }
+
+      totalUs += shotHoldUs({ kind, sourceUs, narrationUs, exportTiming });
     }
-    return total;
+    return Math.round(totalUs / 1_000_000);
   }
 
   private async nextSegmentSortOrder(blockId: string): Promise<number> {

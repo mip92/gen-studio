@@ -1,8 +1,9 @@
-import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Post, Query } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Logger, NotFoundException, Param, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { PrismaService } from '../prisma/prisma.service';
+import { ComfyService } from '../comfy/comfy.service';
 
-type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation' | 'anchor_validation';
+type JobType = 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation' | 'anchor_validation' | 'caption';
 
 interface QueueRow {
   type:          JobType;
@@ -47,7 +48,12 @@ type SortField = (typeof SORTABLE_FIELDS)[number];
 @ApiTags('pipeline')
 @Controller('pipeline')
 export class PipelineController {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(PipelineController.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly comfy:  ComfyService,
+  ) {}
 
   /**
    * Unified, paginated queue list across every job type (training, dataset,
@@ -110,7 +116,7 @@ export class PipelineController {
     // without N+1 queries.
     const bgmInclude     = { segment: { include: { block: { include: { project: true } } } } };
 
-    const [trA, dsA, scA, vrA, ttsA, bgmA, anA, valA, avA] = await Promise.all([
+    const [trA, dsA, scA, vrA, ttsA, bgmA, anA, valA, avA, capA] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.datasetJob.findMany({     where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.sceneRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
@@ -128,9 +134,10 @@ export class PipelineController {
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).imageValidationJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: shotInclude, orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).anchorValidationJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
+      (this.prisma as any).captionJob.findMany({ where: { status: { in: ACTIVE_STATUSES } }, orderBy: { queuedAt: 'asc' } }),
     ]);
 
-    const [trR, dsR, scR, vrR, vrUR, vrIR, ttsR, bgmR, anR, valR, avR] = await Promise.all([
+    const [trR, dsR, scR, vrR, vrUR, vrIR, ttsR, bgmR, anR, valR, avR, capR] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.datasetJob.findMany({     where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       this.prisma.sceneRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude,    orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
@@ -147,18 +154,32 @@ export class PipelineController {
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       (this.prisma as any).imageValidationJob.findMany({ where: { status: { in: TERMINAL } }, include: shotInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
       (this.prisma as any).anchorValidationJob.findMany({ where: { status: { in: TERMINAL } }, include: profileInclude, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
+      (this.prisma as any).captionJob.findMany({ where: { status: { in: TERMINAL } }, orderBy: { completedAt: 'desc' }, take: TERMINAL_TAKE }),
     ]);
 
-    // Each VideoRender row can contribute three queue rows (main + upscale + interp).
+    // Caption jobs store only projectId (no Prisma relation) — resolve slugs in one query.
+    const capProjectIds = [...new Set([...capA, ...capR].map((j: any) => j.projectId).filter(Boolean))];
+    const capProjects = capProjectIds.length
+      ? await this.prisma.project.findMany({ where: { id: { in: capProjectIds as string[] } }, select: { id: true, slug: true } })
+      : [];
+    const slugById = new Map<string, string>(capProjects.map((p) => [p.id, p.slug]));
+
+    // Each VideoRender row can contribute up to three queue rows (main + upscale
+    // + interp). One-pass upscale→RIFE (the default since 2026-07-15) is a SINGLE
+    // ComfyUI prompt that closes both the upscale and interp lifecycles at once —
+    // both stages share one promptId. Collapse those two into a single "↑FHD⏩FPS"
+    // row so the queue shows one job, not two. Separate interp rows survive only
+    // for a standalone re-interpolate (new interpPromptId ≠ upscalePromptId) or a
+    // legacy pre-one-pass two-step render.
     const videoActiveRows: QueueRow[] = [
       ...vrA.filter((j) => ACTIVE_STATUSES.includes(j.status)).map(normalizeVideo),
       ...vrA.filter((j) => j.upscaleStatus !== null && ACTIVE_STATUSES.includes(j.upscaleStatus)).map(normalizeVideoUpscale),
-      ...vrA.filter((j) => j.interpStatus !== null && ACTIVE_STATUSES.includes(j.interpStatus)).map(normalizeVideoInterp),
+      ...vrA.filter((j) => j.interpStatus !== null && ACTIVE_STATUSES.includes(j.interpStatus) && !isOnePassPost(j)).map(normalizeVideoInterp),
     ];
     const videoRecentRows: QueueRow[] = [
       ...vrR.map(normalizeVideo),
-      ...vrUR.map(normalizeVideoUpscale),
-      ...vrIR.map(normalizeVideoInterp),
+      ...vrUR.map((v) => isOnePassPost(v) ? normalizeVideoPost(v) : normalizeVideoUpscale(v)),
+      ...vrIR.filter((v) => !isOnePassPost(v)).map(normalizeVideoInterp),
     ];
 
     const all: QueueRow[] = [
@@ -171,6 +192,7 @@ export class PipelineController {
       ...anA.map(normalizeAnchor),
       ...valA.map(normalizeValidation),
       ...avA.map(normalizeAnchorValidation),
+      ...capA.map((j: any) => normalizeCaption(j, slugById)),
       ...trR.map(normalizeTraining),
       ...dsR.map(normalizeDataset),
       ...scR.map(normalizeScene),
@@ -180,6 +202,7 @@ export class PipelineController {
       ...anR.map(normalizeAnchor),
       ...valR.map(normalizeValidation),
       ...avR.map(normalizeAnchorValidation),
+      ...capR.map((j: any) => normalizeCaption(j, slugById)),
     ];
 
     // ── 1b. Pending FIFO position ──────────────────────────────────────────
@@ -385,28 +408,52 @@ export class PipelineController {
         data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
       });
     }
+    if (type === 'caption') {
+      const j = await (this.prisma as any).captionJob.findUnique({ where: { id } });
+      if (!j) throw new NotFoundException(`caption job ${id} not found`);
+      if (TERMINAL.includes(j.status)) return j;
+      return (this.prisma as any).captionJob.update({
+        where: { id },
+        data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
+      });
+    }
     const job = await this.fetchOne(type, id);
     if (TERMINAL.includes(job.status)) return job;
     const data = { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' };
     if (type === 'training')      return this.prisma.trainingJob.update({ where: { id }, data });
     if (type === 'dataset')       return this.prisma.datasetJob.update({ where: { id }, data });
     if (type === 'scene')         return this.prisma.sceneRenderJob.update({ where: { id }, data });
-    if (type === 'video') {
+    // All three video job types live on one videoRender row. Interrupt/dequeue
+    // the relevant ComfyUI prompt so cancelling actually frees the GPU, then
+    // mark the stage cancelled (which frees the single queue slot).
+    if (type === 'video' || type === 'video_interp' || type === 'video_upscale') {
+      const vr = await this.prisma.videoRender.findUnique({ where: { id } });
+      if (!vr) throw new NotFoundException(`video render ${id} not found`);
+      const promptId = type === 'video'        ? vr.comfyPromptId
+                     : type === 'video_interp' ? vr.interpPromptId
+                     :                           vr.upscalePromptId;
+      if (promptId) {
+        const did = await this.comfy.cancelPrompt(promptId).catch(() => 'unknown' as const);
+        this.logger.log(`cancel ${type} ${id}: ComfyUI prompt ${promptId} → ${did}`);
+      }
+      if (type === 'video') {
+        return this.prisma.videoRender.update({
+          where: { id },
+          data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
+        });
+      }
+      if (type === 'video_interp') {
+        return this.prisma.videoRender.update({
+          where: { id },
+          data:  { interpStatus: 'cancelled', interpCompletedAt: new Date(), interpErrorMessage: 'Manually cancelled' },
+        });
+      }
       return this.prisma.videoRender.update({
         where: { id },
-        data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'Manually cancelled' },
+        data:  { upscaleStatus: 'cancelled', upscaleCompletedAt: new Date(), upscaleErrorMessage: 'Manually cancelled' },
       });
     }
-    if (type === 'video_interp') {
-      return this.prisma.videoRender.update({
-        where: { id },
-        data:  { interpStatus: 'cancelled', interpCompletedAt: new Date(), interpErrorMessage: 'Manually cancelled' },
-      });
-    }
-    return this.prisma.videoRender.update({
-      where: { id },
-      data:  { upscaleStatus: 'cancelled', upscaleCompletedAt: new Date(), upscaleErrorMessage: 'Manually cancelled' },
-    });
+    throw new BadRequestException(`Unhandled cancel type: ${type}`);
   }
 
   // ── helpers ────────────────────────────────────────────────────────────
@@ -523,6 +570,11 @@ export class PipelineController {
       if (!j) throw new NotFoundException(`anchor validation job ${id} not found`);
       return normalizeAnchorValidation(j);
     }
+    if (type === 'caption') {
+      const j = await (this.prisma as any).captionJob.findUnique({ where: { id } });
+      if (!j) throw new NotFoundException(`caption job ${id} not found`);
+      return normalizeCaption(j, new Map());
+    }
     const v = await this.prisma.videoRender.findUnique({
       where: { id },
       include: { shot: { include: { project: true, scene: true } } },
@@ -556,7 +608,7 @@ export class PipelineController {
       shot:  { include: { project: true, scene: true } },
     };
     const bgmInclude = { segment: { include: { block: { include: { project: true } } } } };
-    const [tr, ds, sc, vr, vrU, vrI, tts, bgm, an, val, av] = await Promise.all([
+    const [tr, ds, sc, vr, vrU, vrI, tts, bgm, an, val, av, cap] = await Promise.all([
       this.prisma.trainingJob.findMany({    where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.datasetJob.findMany({     where: { status: 'pending' },        include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       this.prisma.sceneRenderJob.findMany({ where: { status: 'pending' },        include: shotInclude,    orderBy: { queuedAt: 'asc' } }),
@@ -568,6 +620,7 @@ export class PipelineController {
       (this.prisma as any).anchorRenderJob.findMany({ where: { status: 'pending' }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).imageValidationJob.findMany({ where: { status: 'pending' }, include: shotInclude, orderBy: { queuedAt: 'asc' } }),
       (this.prisma as any).anchorValidationJob.findMany({ where: { status: 'pending' }, include: profileInclude, orderBy: { queuedAt: 'asc' } }),
+      (this.prisma as any).captionJob.findMany({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
     ]);
     return [
       ...tr.map(normalizeTraining),
@@ -581,6 +634,7 @@ export class PipelineController {
       ...an.map(normalizeAnchor),
       ...val.map(normalizeValidation),
       ...av.map(normalizeAnchorValidation),
+      ...cap.map((j: any) => normalizeCaption(j, new Map())),
     ].sort((a, b) => a.queuedAt.getTime() - b.queuedAt.getTime());
   }
 
@@ -596,6 +650,7 @@ export class PipelineController {
     if (type === 'anchor')        return (this.prisma as any).anchorRenderJob.update({ where: { id }, data: { queuedAt } });
     if (type === 'validation')    return (this.prisma as any).imageValidationJob.update({ where: { id }, data: { queuedAt } });
     if (type === 'anchor_validation') return (this.prisma as any).anchorValidationJob.update({ where: { id }, data: { queuedAt } });
+    if (type === 'caption')       return (this.prisma as any).captionJob.update({ where: { id }, data: { queuedAt } });
     return this.prisma.tTSJob.update({ where: { id }, data: { queuedAt } });
   }
 }
@@ -603,7 +658,31 @@ export class PipelineController {
 function isJobType(t: string): t is JobType {
   return t === 'training' || t === 'dataset' || t === 'scene'
       || t === 'video'    || t === 'video_upscale' || t === 'video_interp' || t === 'tts'
-      || t === 'bgm'      || t === 'anchor'  || t === 'validation' || t === 'anchor_validation';
+      || t === 'bgm'      || t === 'anchor'  || t === 'validation' || t === 'anchor_validation'
+      || t === 'caption';
+}
+
+function normalizeCaption(j: any, slugById: Map<string, string>): QueueRow {
+  // Subtitle/caption transcription (faster-whisper). Has only projectId + videoPath;
+  // 💬 marks it in the queue UI. Slug is resolved from the batch lookup in queue().
+  const file = (j.videoPath ?? '').split(/[\\/]/).pop() || '—';
+  return {
+    type:          'caption',
+    id:            j.id,
+    status:        j.status,
+    profileCode:   `💬 субтитры`,
+    characterCode: j.videoId ? `→ ${j.videoId}` : file,
+    projectSlug:   slugById.get(j.projectId) ?? '—',
+    projectId:     j.projectId ?? null,
+    shotId:        null,
+    triggerToken:  null,
+    queuedAt:      j.queuedAt,
+    startedAt:     j.startedAt ?? null,
+    completedAt:   j.completedAt ?? null,
+    errorMessage:  j.errorMessage ?? null,
+    isFirstPending: false,
+    isLastPending:  false,
+  };
 }
 
 function cmp(a: QueueRow, b: QueueRow, field: SortField, order: 'asc' | 'desc'): number {
@@ -704,6 +783,25 @@ function normalizeVideo(v: any): QueueRow {
     errorMessage:  v.errorMessage ?? null,
     isFirstPending: false,
     isLastPending:  false,
+  };
+}
+
+/**
+ * True when the upscale and interp lifecycles were produced by the SAME
+ * one-pass ComfyUI prompt (combined upscale→RIFE graph). Both stages then share
+ * one promptId. Used to collapse the two queue rows into a single "↑FHD⏩FPS"
+ * row. A standalone re-interpolate re-queues interp with its own prompt, so the
+ * promptIds diverge and the rows stay separate.
+ */
+function isOnePassPost(v: any): boolean {
+  return !!v.upscalePromptId && v.upscalePromptId === v.interpPromptId;
+}
+
+/** Collapsed one-pass upscale→RIFE row: one job that yields BOTH the FHD and the smooth clip. */
+function normalizeVideoPost(v: any): QueueRow {
+  return {
+    ...normalizeVideoUpscale(v),
+    profileCode: `${v.shot.shotCode} ↑FHD⏩FPS`,
   };
 }
 

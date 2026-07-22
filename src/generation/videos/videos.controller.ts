@@ -53,8 +53,8 @@ export class VideosController {
 
   @Post('videos/:videoId/upscale')
   @ApiOperation({
-    summary: 'Queue a 4x-UltraSharp upscale → 1920×1080 of a completed video',
-    description: 'Idempotent. The original 832×480 preview stays in place; the FHD output lands at /videos/:id/file-fhd once done.',
+    summary: 'Queue a 4x-UltraSharp upscale → 1920×1080 of a completed video (FPS interpolation auto-queues after)',
+    description: 'Idempotent. The original 832×480 preview stays in place; the FHD output lands at /videos/:id/file-fhd once done. When the upscale completes, the mandatory FPS interpolation is queued automatically — one action covers both steps.',
   })
   upscale(@Param('videoId') videoId: string) {
     return this.videos.upscale(videoId);

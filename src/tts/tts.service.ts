@@ -15,6 +15,12 @@ const PYTHON_BIN    = process.env.TTS_PYTHON    ?? process.env.PYTHON_BIN
 const TTS_SCRIPT       = path.join(APP_ROOT, 'scripts', 'tts_silero.py');
 const TTS_XTTS2_SCRIPT = path.join(APP_ROOT, 'scripts', 'tts_xtts2.py');
 const TTS_F5_SCRIPT    = path.join(APP_ROOT, 'scripts', 'tts_f5.py');
+const TTS_QWEN3_SCRIPT = path.join(APP_ROOT, 'scripts', 'tts_qwen3.py');
+// Qwen3-TTS needs python 3.12 + a Blackwell-era torch (cu128) — newer than the
+// kohya venv the other engines share — so it gets its own venv. Override with
+// TTS_QWEN3_PYTHON if a different env is preferred.
+const QWEN3_PYTHON_BIN = process.env.TTS_QWEN3_PYTHON
+                       ?? path.join(APP_ROOT, '.venv-qwen3', 'Scripts', 'python.exe');
 const SILERO_CACHE  = process.env.SILERO_CACHE_DIR
                     ?? path.join(APP_ROOT, '.silero_cache');
 // Leading reference-bleed ("понь") trimmer — detects + cuts the artifact, keeps
@@ -30,7 +36,7 @@ function artifactBackupPath(slug: string, kind: 'shots' | 'scenes', code: string
 /** Engines the service knows how to dispatch. Source of truth is the
  *  Python worker scripts; this constant exists to validate the
  *  Project.ttsEngine column and the per-job engine snapshot. */
-export const TTS_ENGINES = ['silero', 'xtts2', 'f5'] as const;
+export const TTS_ENGINES = ['silero', 'xtts2', 'f5', 'qwen3'] as const;
 export type TTSEngine = (typeof TTS_ENGINES)[number];
 
 /** Emotion labels accepted on the per-job API. IMPORTANT: both voice-clone
@@ -80,13 +86,19 @@ const MAX_SENTENCE_PAUSE = 30;
 const F5_DEFAULT_RATE           = 0.85;
 const F5_DEFAULT_SENTENCE_PAUSE = 1.0;
 
-/** Default playback rate when the caller didn't specify one — engine-aware. */
+/** Default playback rate when the caller didn't specify one — engine-aware.
+ *  qwen3 has no speed knob (the worker ignores rate), so snapshot an honest
+ *  1.0 instead of a misleading 0.85 in the job row / UI history. */
 function defaultRateFor(engine: TTSEngine): number {
+  if (engine === 'qwen3') return 1.0;
   return engine === 'f5' ? F5_DEFAULT_RATE : DEFAULT_RATE;
 }
-/** Default sentence pause (seconds) when not specified — engine-aware. */
+/** Default sentence pause (seconds) when not specified — engine-aware.
+ *  qwen3 shares f5's 1s default: with pause=0 it synthesises the whole shot in
+ *  one pass and runs sentences together (user feedback 2026-07-16 «одним
+ *  забором»); chunked synthesis also resets prosody per sentence. */
 function defaultSentencePauseFor(engine: TTSEngine): number {
-  return engine === 'f5' ? F5_DEFAULT_SENTENCE_PAUSE : 0;
+  return engine === 'f5' || engine === 'qwen3' ? F5_DEFAULT_SENTENCE_PAUSE : 0;
 }
 
 export interface StartTTSInput {
@@ -592,15 +604,17 @@ export class TTSService {
     if (!job)                       throw new Error(`TTS job ${jobId} not found`);
     if (job.status !== 'pending')   return;
 
-    if (!existsSync(PYTHON_BIN)) {
-      await this.fail(job.id, `python bin missing: ${PYTHON_BIN} (set TTS_PYTHON env)`);
-      return;
-    }
-
     // Engine snapshot — null/unknown on legacy rows means 'silero'.
     const engine: TTSEngine = (TTS_ENGINES as readonly string[]).includes(job.engine ?? '')
       ? (job.engine as TTSEngine) : 'silero';
+    // qwen3 lives in its own venv; every other engine shares the kohya venv.
+    const pythonBin = engine === 'qwen3' ? QWEN3_PYTHON_BIN : PYTHON_BIN;
+    if (!existsSync(pythonBin)) {
+      await this.fail(job.id, `python bin missing: ${pythonBin} (set ${engine === 'qwen3' ? 'TTS_QWEN3_PYTHON' : 'TTS_PYTHON'} env)`);
+      return;
+    }
     const script = engine === 'f5'    ? TTS_F5_SCRIPT
+                 : engine === 'qwen3' ? TTS_QWEN3_SCRIPT
                  : engine === 'xtts2' ? TTS_XTTS2_SCRIPT
                  :                      TTS_SCRIPT;
     if (!existsSync(script)) {
@@ -685,13 +699,13 @@ export class TTSService {
         '--emotion-preset',    job.emotionPreset ?? 'neutral',
         '--emotion-intensity', String(job.emotionIntensity ?? 0.5),
       ];
-      // f5 honours the silero-style speed + sentence-pause knobs; the xtts2
-      // worker doesn't define these flags, so pass them to f5 only.
+      // f5 honours the silero-style speed knob; qwen3 has no speed knob but
+      // shares f5's sentence-pause behaviour. xtts2 defines neither flag.
       if (engine === 'f5') {
         argv.push('--speed', String(job.rate ?? 1.0));
-        if ((job.sentencePauseSec ?? 0) > 0) {
-          argv.push('--sentence-pause-sec', String(job.sentencePauseSec));
-        }
+      }
+      if ((engine === 'f5' || engine === 'qwen3') && (job.sentencePauseSec ?? 0) > 0) {
+        argv.push('--sentence-pause-sec', String(job.sentencePauseSec));
       }
       if (job.emotionRefName) {
         const refRow = await this.prisma.projectTTSEmotionRef.findUnique({
@@ -710,7 +724,7 @@ export class TTSService {
         }
         argv.push('--emotion-ref', refPath);
       }
-      this.logger.log(`Launching ${engine} TTS: ${PYTHON_BIN} ${argv.join(' ')}`);
+      this.logger.log(`Launching ${engine} TTS: ${pythonBin} ${argv.join(' ')}`);
     } else {
       argv = [
         '-X', 'utf8',
@@ -725,10 +739,10 @@ export class TTSService {
       if (job.modelFilename) {
         subEnv.SILERO_MODEL_PATH = path.join(SILERO_CACHE, job.modelFilename);
       }
-      this.logger.log(`Launching silero TTS: ${PYTHON_BIN} ${argv.join(' ')}${job.modelFilename ? ` (model=${job.modelFilename})` : ''}`);
+      this.logger.log(`Launching silero TTS: ${pythonBin} ${argv.join(' ')}${job.modelFilename ? ` (model=${job.modelFilename})` : ''}`);
     }
 
-    const proc = spawn(PYTHON_BIN, argv, {
+    const proc = spawn(pythonBin, argv, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env:   subEnv,
     });
