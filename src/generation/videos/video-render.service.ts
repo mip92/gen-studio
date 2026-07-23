@@ -268,7 +268,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       include: { project: true },
     });
     if (!shot) throw new NotFoundException(`Shot for video ${videoId} not found`);
-    return path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, 'videos', v.outputFilename);
+    const base    = path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode);
+    const preview = path.join(base, 'videos', v.outputFilename);
+    if (existsSync(preview)) return preview;
+    // The low-res preview was pruned by the tier consolidation (2026-07-22),
+    // which keeps only the final smooth clip. Fall back to videos_smooth/ so the
+    // base player still plays (shows the finished clip) instead of 404-ing.
+    return path.join(base, 'videos_smooth', v.interpFilename ?? v.outputFilename);
   }
 
   /**
