@@ -22,11 +22,11 @@ ROOT = "W:/Programs/ComfyUI/gen-studio"
 DATA = ROOT + "/data"
 
 # ── spread layout ─────────────────────────────────────────────────────────────
-# Unit = SPREAD (разворот) = 6 panels per PAGE × 2 pages. Reading order is the
-# real-comic order: the WHOLE left page (row-major) first, THEN the whole right
+# Unit = SPREAD (разворот) = 4 panels per PAGE (2×2) × 2 pages. Reading order is
+# the real-comic order: the WHOLE left page (row-major) first, THEN the whole right
 # page — so the camera reads one page down, then pans once across the binding to
 # the next page, instead of hopping the spine on every row.
-SPREAD_SIZES = [12]
+SPREAD_SIZES = [8]
 MARGIN   = 0.028      # outer margin around the whole spread
 MARGIN_Y = 0.040      # top margin
 FOOT     = 0.090      # bottom band reserved for the book's fore-edge (page stack)
@@ -275,10 +275,10 @@ def build(slug, max_spreads, panel_frac, out, pack=False):
         "output_root": out_root, "capcut_drafts_root": capcut_root,
         "pages_dir": f"{out_root}/{draft_name}/pages",
         "width": 1920, "height": 1080, "fps": 30,
-        # supersample 6: the sheet+frames are ONE raster the camera zooms into
-        # (~4x at a panel), so render 6x canvas (headroom over 1:1) so paper +
-        # borders stay crisp, not soapy, when magnified.
-        "page_style": "old_comic", "texture_path": None, "supersample": 6,
+        # supersample 8: the sheet is the raster the camera zooms into (~4x at a
+        # panel). At ss6 its baked page-block lines read softer than the ss8 panel
+        # borders; matching ss8 keeps the page contours as crisp as the borders.
+        "page_style": "old_comic", "texture_path": None, "supersample": 8,
         # pseudo-3D page turn between spreads (CapCut built-in 立体翻页). Only
         # RENDERS if that effect is in CapCut's local cache (apply it once in
         # CapCut to download it) — else it shows in the editor but does nothing.

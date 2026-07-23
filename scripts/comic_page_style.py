@@ -238,8 +238,7 @@ class OldComicPageStyle(PageStyle):
         if foot >= 6 and xR > xL:
             dm = int(min(w, h) * 0.018)
             lwl = max(1, int(min(w, h) * 0.0016))
-            PAGE_LINE = SEP                       # muted tan sheet lines (paper, not wood)
-            PAGE_EDGE = (132, 118, 88)            # crisp outer sheet — still a paper tone
+            PAGE_LINE = SEP                       # single paper-tan contour colour (not wood)
             K = 8
             Nb = 26
             room_R = max(0, (w - dm) - xR)
@@ -287,8 +286,8 @@ class OldComicPageStyle(PageStyle):
                     cx = ox
                 # paper fill: staircase top → down the outer side → back along page edge
                 d.polygon(poly_top + [(cx, yb + foot), (edge_x, yb)], fill=self.EDGE)
-                for i, path in enumerate(sheets):
-                    d.line(path, fill=(PAGE_EDGE if i == K - 1 else PAGE_LINE), width=lwl)
+                for path in sheets:                                # ONE consistent contour colour
+                    d.line(path, fill=PAGE_LINE, width=lwl)
         return bg
 
     def draw_frame(self, draw, rect_px, seed):
