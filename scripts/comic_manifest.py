@@ -28,7 +28,9 @@ DATA = ROOT + "/data"
 # the next page, instead of hopping the spine on every row.
 SPREAD_SIZES = [12]
 MARGIN   = 0.028      # outer margin around the whole spread
-MARGIN_Y = 0.040      # top/bottom margin
+MARGIN_Y = 0.040      # top margin
+FOOT     = 0.090      # bottom band reserved for the book's fore-edge (page stack)
+SIDE     = 0.055      # outer L/R band reserved for the fanned side page-leaves
 SPINE    = 0.055      # reserved centre gutter for the binding (thick manga-style gutter)
 # Tight gutters so that when the camera zooms into a panel the NEIGHBOURS peek in
 # at the edges (user 2026-07-22). Vertical (between columns) stays thinner than
@@ -90,13 +92,16 @@ def spread_rects(n):
     real reading order: the entire LEFT page (row-major), then the entire RIGHT
     page. Panels never enter the spine band, so the binding shadow falls only in
     the empty gutter, never on a video."""
-    y0, y1 = MARGIN_Y, 1 - MARGIN_Y
+    # bottom is pulled up by FOOT so the page-stack fore-edge has room to show
+    # under the spread (panels never reach the very bottom of the sheet).
+    y0, y1 = MARGIN_Y, 1 - MARGIN_Y - FOOT
     if n <= 3:                                    # short tail spread → single page
-        return _place_page(n, MARGIN, 1 - MARGIN, y0, y1)
+        return _place_page(n, MARGIN + SIDE, 1 - MARGIN - SIDE, y0, y1)
     left_n = math.ceil(n / 2)
     right_n = n - left_n
-    left = _place_page(left_n, MARGIN, 0.5 - SPINE / 2, y0, y1)
-    right = _place_page(right_n, 0.5 + SPINE / 2, 1 - MARGIN, y0, y1)
+    # outer x pulled IN by SIDE so the fanned side page-leaves have desk room.
+    left = _place_page(left_n, MARGIN + SIDE, 0.5 - SPINE / 2, y0, y1)
+    right = _place_page(right_n, 0.5 + SPINE / 2, 1 - MARGIN - SIDE, y0, y1)
     return left + right
 
 

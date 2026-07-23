@@ -193,25 +193,13 @@ class OldComicPageStyle(PageStyle):
         HI = (252, 246, 226); LO = (66, 54, 40); SEP = (150, 136, 104)
         for (x0, y0, x1, y1) in boxes:
             outer_right = len(boxes) == 1 or (x0 + x1) // 2 >= mid
-            ox0 = x0 - (0 if outer_right else block)
-            ox1 = x1 + (block if outer_right else 0)
-            # 1) page-block slab (bottom + outer side) = the thickness of the ream
-            d.rectangle([ox0, y1, ox1, y1 + block], fill=self.EDGE)              # bottom
-            if outer_right:
-                d.rectangle([x1, y0, x1 + block, y1 + block], fill=self.EDGE)    # right side
-            else:
-                d.rectangle([x0 - block, y0, x0, y1 + block], fill=self.EDGE)    # left side
-            # 2) distinct SHEET lines across the slab → reads as many pages
-            for k in range(1, 6):
-                yy = y1 + int(block * k / 6)
-                d.line([(ox0, yy), (ox1, yy)], fill=SEP, width=max(1, block // 14))
-                xx = (x1 + int(block * k / 6)) if outer_right else (x0 - int(block * k / 6))
-                d.line([(xx, y0), (xx, y1 + block)], fill=SEP, width=max(1, block // 14))
-            # 3) paper leaf on top
+            # paper leaf (the page surface). The book's THICKNESS is no longer drawn
+            # per-page as a ream; it's ONE unified fore-edge block under the whole
+            # spread (see below) so the stack reads as a single open book.
             bg.paste(paper.crop((x0, y0, x1, y1)), (x0, y0))
-            # 4) bevel so the leaf reads as a RAISED page: light top + spine edge,
-            #    dark bottom + outer edge.
-            d.line([(x0, y0), (x1, y0)], fill=HI, width=lw)                      # top highlight
+            # 4) bevel so the leaf reads as a RAISED page: spine-edge highlight + dark
+            #    bottom/outer edge. NO top highlight — it read as a strange white band
+            #    along the top (user 2026-07-23).
             d.line([(x0, y1), (x1, y1)], fill=LO, width=lw)                      # bottom shade
             if outer_right:
                 d.line([(x1, y0), (x1, y1)], fill=LO, width=lw)                  # outer dark
@@ -236,16 +224,71 @@ class OldComicPageStyle(PageStyle):
                 row = Image.new("L", (gwidth, 1)); row.putdata(vals)
                 _mul_region(bg, row.resize((gwidth, ybot - ytop)), x_lo, ytop)
 
-            # DRAWN convergence (not a warp, user 2026-07-22): the outer top+bottom
-            # page edges are traced toward a single vanishing point at the spine
-            # centre, so the spread reads as pages folding into the binding. Panels
-            # sit on top in the live export, so these show only in the gutters.
-            ytop = min(b[1] for b in boxes); ybot = max(b[3] for b in boxes)
-            vx, vy = mid, (ytop + ybot) // 2
-            lo, ro = boxes[0], boxes[-1]
-            lwv = max(2, int(min(w, h) * 0.0022))
-            for (cxp, cyp) in ((lo[0], ytop), (lo[0], ybot), (ro[2], ytop), (ro[2], ybot)):
-                d.line([(cxp, cyp), (vx, vy)], fill=(92, 78, 58), width=lwv)
+        # Open-book PAGE-BLOCK (user 2026-07-22): the visible ream of sheets around the
+        # spread, in PAPER tone (a light band, NOT bare wood). Each sheet is ONE
+        # continuous edge — a STAIR-STEP at the top-outer corner, straight DOWN the
+        # outer side, then ACROSS the bottom converging to the binding at the spine —
+        # so the side edge and the bottom edge are the same page and read as stacked
+        # sheets. Panels sit on top in the live export; the block lives entirely in the
+        # desk reserve beside/below the pages, so nothing overlaps a panel.
+        xL = min(b[0] for b in boxes); xR = max(b[2] for b in boxes)
+        ytop = min(b[1] for b in boxes); yb = max(b[3] for b in boxes)
+        foot = max(6, min(int(min(w, h) * 0.075),
+                          h - yb - max(2, int(min(w, h) * 0.006))))
+        if foot >= 6 and xR > xL:
+            dm = int(min(w, h) * 0.018)
+            lwl = max(1, int(min(w, h) * 0.0016))
+            PAGE_LINE = SEP                       # muted tan sheet lines (paper, not wood)
+            PAGE_EDGE = (132, 118, 88)            # crisp outer sheet — still a paper tone
+            K = 8
+            Nb = 26
+            room_R = max(0, (w - dm) - xR)
+            room_L = max(0, xL - dm)
+            oR = xR + int(room_R * 0.55)          # outermost sheet x (right / left)
+            oL = xL - int(room_L * 0.55)
+
+            # bottom band drop-shadow + paper fill (thick at outer corners, pinching
+            # to the spine). Drawn first so the side bands sit on top of it.
+            bottom = [(oL + (oR - oL) * (i / 48),
+                       yb + foot * (2.0 * (i / 48) - 1.0) ** 2) for i in range(49)]
+            shp2 = Image.new("L", (w, h), 0)
+            ImageDraw.Draw(shp2).polygon(
+                bottom + [(oR, min(h - 1, yb + foot + go)),
+                          (oL, min(h - 1, yb + foot + go))], fill=150)
+            shp2 = shp2.filter(ImageFilter.GaussianBlur(go))
+            bg = Image.composite(Image.new("RGB", (w, h), (0, 0, 0)), bg, shp2)
+            d = ImageDraw.Draw(bg)
+            d.polygon(bottom + [(oR, yb), (oL, yb)], fill=self.EDGE)               # bottom band
+
+            # PER-SHEET STAIRCASE on each side (user 2026-07-23 red-marker drawing):
+            # the page's top-outer CORNER is the HIGHEST point (the top sheet); from it
+            # clean right-angle steps go DOWN-and-OUT (riser down, tread out) — each step
+            # is one sheet peeking out below the one above. From its step the sheet drops
+            # to the fore-edge, then runs ACROSS the bottom converging at the binding
+            # (spine). Paper, not wood.
+            rise = int(foot * 1.15)                       # total staircase drop below the corner
+            for (edge_x, sign, room) in ((xR, +1, room_R), (xL, -1, room_L)):
+                if room <= 8:
+                    continue
+                poly_top = [(edge_x, ytop)]
+                sheets = []
+                cx = edge_x
+                for i in range(1, K + 1):
+                    f = i / K
+                    ox = edge_x + sign * int(room * 0.55 * f)      # this step's outer x
+                    ty = min(yb, ytop + int(rise * f))             # this step's top (LOWER outward)
+                    depth = yb + int(foot * f)                     # this sheet's fore-edge depth
+                    poly_top += [(cx, ty), (ox, ty)]               # riser down, then tread out
+                    path = [(cx, ty), (ox, ty), (ox, depth)]       # tread + straight side down
+                    for j in range(1, Nb + 1):                     # bottom edge → converge to spine
+                        t = j / Nb
+                        path.append((ox + (mid - ox) * t, yb + (depth - yb) * (1 - t) ** 2))
+                    sheets.append(path)
+                    cx = ox
+                # paper fill: staircase top → down the outer side → back along page edge
+                d.polygon(poly_top + [(cx, yb + foot), (edge_x, yb)], fill=self.EDGE)
+                for i, path in enumerate(sheets):
+                    d.line(path, fill=(PAGE_EDGE if i == K - 1 else PAGE_LINE), width=lwl)
         return bg
 
     def draw_frame(self, draw, rect_px, seed):
