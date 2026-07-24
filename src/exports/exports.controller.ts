@@ -43,6 +43,20 @@ export class ExportsController {
     return this.exports.exportCapcut(idOrSlug);
   }
 
+  @Post('comic')
+  @ApiOperation({
+    summary: 'Build the cinematic-COMIC CapCut draft for the project',
+    description:
+      'Lays the whole film out as comic spreads (2×2 panels/page) with a camera '
+      + 'flying between panels and a pseudo-3D page turn between spreads. Same '
+      + 'readiness as the linear export. Writes the draft straight into CapCut\'s '
+      + 'drafts folder — build with CapCut CLOSED (an open CapCut drops the draft '
+      + 'on exit). Slow (renders hi-res sheets), so the request may run for minutes.',
+  })
+  exportComic(@Param('idOrSlug') idOrSlug: string) {
+    return this.exports.exportComic(idOrSlug);
+  }
+
   @Get('shorts/plan')
   @ApiOperation({
     summary: 'Read the project\'s curated YouTube-Shorts plan',

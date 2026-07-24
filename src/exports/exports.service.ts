@@ -20,6 +20,15 @@ const EXPORT_SCRIPT = path.join(APP_ROOT, 'scripts', 'export_capcut.py');
 // export_capcut.py with EXPORT_PYTHON. Override with SHORTS_PYTHON if needed.
 const SHORTS_SCRIPT = path.join(APP_ROOT, 'scripts', 'export_shorts.py');
 const SHORTS_PYTHON = process.env.SHORTS_PYTHON ?? 'python';
+
+// ── Comic export (cinematic page-flythrough) ─────────────────────────────────
+// Two-python pipeline like shorts: comic_manifest.py reads the DB (psycopg2) →
+// system python; export_comic.py needs pyJianYingDraft → the kohya venv python
+// (PYTHON_BIN). The draft is written straight into CapCut's drafts folder
+// (manifest.capcut_drafts_root), so it appears in CapCut with no copy step.
+const COMIC_MANIFEST_SCRIPT = path.join(APP_ROOT, 'scripts', 'comic_manifest.py');
+const COMIC_EXPORT_SCRIPT   = path.join(APP_ROOT, 'scripts', 'export_comic.py');
+const COMIC_MANIFEST_PYTHON = process.env.COMIC_PYTHON ?? SHORTS_PYTHON;
 /** Curated per-project shorts plan lives here (versioned in git). The endpoint
  *  reads it when no plan is POSTed in the request body. */
 const shortsPlanPath = (slug: string) =>
@@ -867,6 +876,66 @@ export class ExportsService {
     };
     this.logger.log(`shorts export for ${project.slug}: ${result.shorts?.length ?? 0} draft(s)`);
     return { shorts: result.shorts ?? [] };
+  }
+
+  /**
+   * Build the CINEMATIC-COMIC CapCut draft: the whole film laid out as comic
+   * spreads (2×2 panels/page) with the camera flying between panels and a
+   * pseudo-3D page turn between spreads. Same readiness as the linear export
+   * (chosen+upscaled video, approved TTS). Runs the two-python pipeline and
+   * writes the draft straight into CapCut's drafts folder.
+   *
+   * NOTE: build the draft with CapCut CLOSED — an open CapCut rewrites its
+   * root_meta on exit and drops a freshly-written draft. The UI warns about this.
+   */
+  async exportComic(idOrSlug: string): Promise<{
+    draft_name: string; draft_path: string; spreads: number;
+  }> {
+    const project = await this.findProject(idOrSlug);
+    if (!existsSync(COMIC_MANIFEST_SCRIPT)) {
+      throw new BadRequestException(`comic_manifest.py missing: ${COMIC_MANIFEST_SCRIPT}`);
+    }
+    if (!existsSync(COMIC_EXPORT_SCRIPT)) {
+      throw new BadRequestException(`export_comic.py missing: ${COMIC_EXPORT_SCRIPT}`);
+    }
+    if (!existsSync(PYTHON_BIN)) {
+      throw new BadRequestException(`python bin missing: ${PYTHON_BIN} (set EXPORT_PYTHON env)`);
+    }
+
+    const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
+    mkdirSync(outDir, { recursive: true });
+    const manifestPath = path.join(outDir, 'comic_manifest.json');
+
+    // 1) manifest — system python (reads the DB via psycopg2)
+    this.logger.log(`Comic export: building manifest for ${project.slug}`);
+    const m = await runPython(COMIC_MANIFEST_PYTHON, [
+      '-X', 'utf8', COMIC_MANIFEST_SCRIPT, '--slug', project.slug, '--pack', '--out', manifestPath,
+    ]);
+    if (m.code !== 0) {
+      throw new BadRequestException(`comic_manifest.py exited ${m.code}: ${m.stderr.trim().slice(-800)}`);
+    }
+    if (!existsSync(manifestPath)) {
+      throw new BadRequestException(`comic_manifest wrote no manifest at ${manifestPath}`);
+    }
+
+    // 2) draft — kohya python (pyJianYingDraft). Slow: renders the ss8 sheets +
+    //    frame overlays + extracts panel stills, so this can take minutes.
+    this.logger.log(`Comic export: building draft for ${project.slug}`);
+    const b = await runPython(PYTHON_BIN, [
+      '-X', 'utf8', COMIC_EXPORT_SCRIPT, '--manifest', manifestPath,
+    ]);
+    if (b.code !== 0) {
+      throw new BadRequestException(`export_comic.py exited ${b.code}: ${b.stderr.trim().slice(-800)}`);
+    }
+
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
+      draft_name?: string; capcut_drafts_root?: string; pages?: unknown[];
+    };
+    const draftName = manifest.draft_name ?? '';
+    const draftPath = manifest.capcut_drafts_root
+      ? path.join(manifest.capcut_drafts_root, draftName) : draftName;
+    this.logger.log(`comic export for ${project.slug}: ${draftName} (${(manifest.pages ?? []).length} spreads)`);
+    return { draft_name: draftName, draft_path: draftPath, spreads: (manifest.pages ?? []).length };
   }
 }
 
