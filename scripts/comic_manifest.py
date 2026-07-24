@@ -22,11 +22,11 @@ ROOT = "W:/Programs/ComfyUI/gen-studio"
 DATA = ROOT + "/data"
 
 # ── spread layout ─────────────────────────────────────────────────────────────
-# Unit = SPREAD (разворот) = 4 panels per PAGE (2×2) × 2 pages. Reading order is
-# the real-comic order: the WHOLE left page (row-major) first, THEN the whole right
-# page — so the camera reads one page down, then pans once across the binding to
-# the next page, instead of hopping the spine on every row.
-SPREAD_SIZES = [8]
+# Unit = SPREAD (разворот) = 6 panels per PAGE (2×3) × 2 pages = 12. Reading order
+# is the real-comic order: the WHOLE left page (row-major) first, THEN the whole
+# right page — so the camera reads one page down, then pans once across the binding
+# to the next page, instead of hopping the spine on every row.
+SPREAD_SIZES = [12]
 MARGIN   = 0.015      # outer margin around the whole spread (trimmed — bigger panels)
 MARGIN_Y = 0.040      # top margin
 FOOT     = 0.090      # bottom band reserved for the book's fore-edge (page stack)
