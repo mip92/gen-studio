@@ -197,16 +197,9 @@ class OldComicPageStyle(PageStyle):
             # per-page as a ream; it's ONE unified fore-edge block under the whole
             # spread (see below) so the stack reads as a single open book.
             bg.paste(paper.crop((x0, y0, x1, y1)), (x0, y0))
-            # 4) bevel so the leaf reads as a RAISED page: spine-edge highlight + dark
-            #    bottom/outer edge. NO top highlight — it read as a strange white band
-            #    along the top (user 2026-07-23).
-            d.line([(x0, y1), (x1, y1)], fill=LO, width=lw)                      # bottom shade
-            if outer_right:
-                d.line([(x1, y0), (x1, y1)], fill=LO, width=lw)                  # outer dark
-                d.line([(x0, y0), (x0, y1)], fill=HI, width=lw)                  # spine light
-            else:
-                d.line([(x0, y0), (x0, y1)], fill=LO, width=lw)
-                d.line([(x1, y0), (x1, y1)], fill=HI, width=lw)
+            # NO edge bevel: the page-block contours + fore-edge + binding shadow +
+            # panel borders already define every edge; the old bevel lines only added
+            # redundant lines around the page (user 2026-07-23).
 
         # soft binding shadow: a smooth bell centred on the fold, darkest at the
         # centre, fading over the gutter — NO hard line/bar.
@@ -237,8 +230,8 @@ class OldComicPageStyle(PageStyle):
                           h - yb - max(2, int(min(w, h) * 0.006))))
         if foot >= 6 and xR > xL:
             dm = int(min(w, h) * 0.018)
-            lwl = max(1, int(min(w, h) * 0.0016))
             PAGE_LINE = SEP                       # single paper-tan contour colour (not wood)
+            lwl = max(1, int(min(w, h) * 0.0009))  # thin, crisp contour (user 2026-07-23)
             K = 8
             Nb = 26
             room_R = max(0, (w - dm) - xR)

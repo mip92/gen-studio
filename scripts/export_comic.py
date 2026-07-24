@@ -52,6 +52,7 @@ PANEL_INSET     = 0.0      # gap between the inked frame and the content (0 = ti
 # and pad the remainder with freeze-frame PAUSES split across the two edges
 # (first frame at the head, last frame at the tail).
 SPEED_FLOOR     = 0.5
+TURN_US         = 700_000  # pseudo-3D page-turn duration at each spread boundary
 
 # ── organic camera (user 2026-07-22: «не линейно, покачивания, не по прямой») ──
 HOLD_KF_PER_SEC = 2        # sample holds so the parked camera gently breathes/sways
@@ -230,6 +231,107 @@ def _slice(states: List[dict], lo: int, hi: int) -> List[dict]:
     return [s for s in states if lo - 1 <= s["t_us"] <= hi + 1]
 
 
+# ── pseudo-3D page turn ───────────────────────────────────────────────────────
+def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
+                    width, height, ss, style, texture) -> int:
+    """At each spread boundary, overlay a wide book (opaque) + a leaf that flips
+    across the spine. The leaf carries baked panel content (stills). The spine is
+    the canvas centre, and scale_x scales about the centre, so animating scale_x
+    from 1→0 (front, current right page) then 0→1 (back, next left page) reads as a
+    page turning. Full-canvas images placed at scale 1 / transform 0 (= the wide
+    book), so no half-page scale math is needed."""
+    from PIL import Image
+    from comic_page_style import _page_boxes
+    from comic_pagebuild import _rect_to_px
+
+    # Turn images are rendered at a REDUCED supersample: the leaf flips in ~0.7s, so
+    # any softness is hidden by the motion — no need for the full ss8 sheet quality.
+    # 21 boundaries × 3 full-canvas images at ss8 was the export's slowest stage;
+    # ss4 quarters the pixels per image (user 2026-07-23).
+    tss = max(2, min(ss, 4))
+    Wp, Hp = width * tss, height * tss
+
+    def _cx(p):
+        r = p["rect"]; return r["x"] + r["w"] / 2.0
+
+    def _side(pg, right):  # panels on the right (True) or left (False) page
+        return [p for p in (pg.get("panels") or []) if (_cx(p) >= 0.5) == right]
+
+    def _pagebox(all_panels, right):
+        """Pixel rect of the requested page's paper leaf (so the flipping leaf is
+        JUST that page — no fake page-block leaves / fore-edge, which stay static)."""
+        ppx = [_rect_to_px(p["rect"], Wp, Hp) for p in all_panels]
+        boxes, mid = _page_boxes(ppx, Wp, Hp)
+        for b in boxes:
+            if (((b[0] + b[2]) / 2) >= mid) == right:
+                return b
+        return boxes[-1]
+
+    def _bake_bg(panels_subset, seed, out: Path) -> str:  # opaque full book (static)
+        render_page(width=width, height=height, panels=panels_subset, style_name=style,
+                    texture_path=texture, supersample=tss, seed=seed,
+                    bake_content=True, draw_frames=True).save(out)
+        return str(out).replace("\\", "/")
+
+    def _bake_leaf(all_panels, seed, out: Path, right: bool) -> str:  # ONE page only
+        img = render_page(width=width, height=height, panels=all_panels, style_name=style,
+                          texture_path=texture, supersample=tss, seed=seed,
+                          bake_content=True, draw_frames=True).convert("RGBA")
+        x0, y0, x1, y1 = _pagebox(all_panels, right)
+        mask = Image.new("L", img.size, 0)
+        mask.paste(255, (x0, y0, x1, y1))          # keep only the page rectangle
+        img.putalpha(mask)
+        img.save(out)
+        return str(out).replace("\\", "/")
+
+    def _kf(seg, off, sx):                          # one full transform keyframe
+        seg.add_keyframe(KP.scale_x, off, max(0.02, sx))
+        seg.add_keyframe(KP.scale_y, off, 1.0)
+        seg.add_keyframe(KP.position_x, off, 0.0)
+        seg.add_keyframe(KP.position_y, off, 0.0)
+
+    STEPS = 10
+    half = TURN_US // 2
+    n = 0
+    for i in range(len(pages) - 1):
+        A, B = pages[i], pages[i + 1]
+        sA = int(A.get("pageIndex", i)) + 1
+        sB = int(B.get("pageIndex", i + 1)) + 1
+        bg    = _bake_bg(_side(A, False) + _side(B, True), sA, pages_dir / f"turn_bg_{i:03d}.png")
+        front = _bake_leaf(A.get("panels") or [], sA, pages_dir / f"turn_front_{i:03d}.png", right=True)
+        back  = _bake_leaf(B.get("panels") or [], sB, pages_dir / f"turn_back_{i:03d}.png",  right=False)
+
+        tb = int(spread_bounds[i]); t0 = max(0, tb - half)
+
+        bg_seg = draft.VideoSegment(
+            draft.VideoMaterial(bg, material_name=f"turn_bg_{i}"),
+            target_timerange=draft.Timerange(start=t0, duration=TURN_US))
+        for off in (0, TURN_US):
+            bg_seg.add_keyframe(KP.uniform_scale, off, 1.0)
+            bg_seg.add_keyframe(KP.position_x, off, 0.0)
+            bg_seg.add_keyframe(KP.position_y, off, 0.0)
+        script.add_segment(bg_seg, track_name="comic_turn_bg"); n += 2
+
+        fseg = draft.VideoSegment(
+            draft.VideoMaterial(front, material_name=f"turn_front_{i}"),
+            target_timerange=draft.Timerange(start=t0, duration=half))
+        for k in range(STEPS + 1):
+            p = k / STEPS
+            _kf(fseg, int(half * p), math.cos(p * math.pi / 2))   # 1 → 0
+        script.add_segment(fseg, track_name="comic_turn_leaf"); n += STEPS + 1
+
+        bseg = draft.VideoSegment(
+            draft.VideoMaterial(back, material_name=f"turn_back_{i}"),
+            target_timerange=draft.Timerange(start=t0 + half, duration=TURN_US - half))
+        for k in range(STEPS + 1):
+            p = k / STEPS
+            _kf(bseg, int((TURN_US - half) * p), math.sin(p * math.pi / 2))  # 0 → 1
+        script.add_segment(bseg, track_name="comic_turn_leaf"); n += STEPS + 1
+
+    _log(f'page-turns: {len(pages) - 1} boundary flip(s)')
+    return n
+
+
 # ── draft assembly ────────────────────────────────────────────────────────────
 def build_comic_draft(manifest: dict) -> Path:
     width  = int(manifest.get("width", 1920))
@@ -255,6 +357,9 @@ def build_comic_draft(manifest: dict) -> Path:
         script.add_track(draft.TrackType.video, f"slot_{i}", relative_index=i + 1)
     # TOP track: the marker frames ride ABOVE every panel (borders visible / lap on)
     script.add_track(draft.TrackType.video, "comic_frames", relative_index=max_slots + 1)
+    # ABOVE everything: the page-turn overlay (opaque wide book + the flipping leaf)
+    script.add_track(draft.TrackType.video, "comic_turn_bg",   relative_index=max_slots + 2)
+    script.add_track(draft.TrackType.video, "comic_turn_leaf", relative_index=max_slots + 3)
     script.add_track(draft.TrackType.audio, "narration")
 
     subtitle_cues: List[tuple] = []
@@ -416,23 +521,16 @@ def build_comic_draft(manifest: dict) -> Path:
         spread_bounds.append(p_start + p_dur)
         timeline_end_us = max(timeline_end_us, p_start + p_dur)
 
-    # 3) between-spread PAGE-TURN transition. CapCut ships pseudo-3D page flips
-    #    (e.g. 立体翻页 / 翻书转场 / 翻页) — apply to BOTH the sheet and the frames
-    #    overlay so the whole page turns together. "none" → hard cut.
-    preset = str(manifest.get("page_transition") or "none")
-    if preset and preset.lower() not in ("none", "slide") and len(page_segments) > 1:
-        tt = getattr(draft.TransitionType, preset, None)
-        if tt is None:
-            _log(f'unknown page_transition {preset!r} — skipping (hard cut)')
-        else:
-            dur = int(manifest.get("page_transition_us") or 800_000)
-            for seg in page_segments[:-1] + frame_segments[:-1]:
-                try:
-                    seg.add_transition(tt, duration=dur)
-                    if seg.transition is not None and seg.transition not in script.materials:
-                        script.materials.transitions.append(seg.transition)
-                except Exception as e:  # noqa: BLE001
-                    _log(f'page transition attach failed: {e!r}')
+    # 3) between-spread PAGE-TURN. The native CapCut flips (立体翻页 …) don't render
+    #    unless the effect is cached, so we build our OWN pseudo-3D turn: a full-frame
+    #    wide book (left = ending spread's left page, right = next spread's right page)
+    #    is overlaid at the boundary, and a leaf carrying baked content flips across
+    #    the spine (scale_x, which scales about the canvas centre = the spine).
+    preset = str(manifest.get("page_transition") or "none").lower()
+    if preset in ("turn3d", "turn", "flip") and len(pages) > 1:
+        total_kf += _add_page_turns(
+            script, pages, spread_bounds, pages_dir,
+            width=width, height=height, ss=ss, style=style, texture=texture)
 
     # 4) BGM
     total_bgm = _place_bgm(script, manifest)

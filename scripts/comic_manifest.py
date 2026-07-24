@@ -279,11 +279,11 @@ def build(slug, max_spreads, panel_frac, out, pack=False):
         # panel). At ss6 its baked page-block lines read softer than the ss8 panel
         # borders; matching ss8 keeps the page contours as crisp as the borders.
         "page_style": "old_comic", "texture_path": None, "supersample": 8,
-        # pseudo-3D page turn between spreads (CapCut built-in 立体翻页). Only
-        # RENDERS if that effect is in CapCut's local cache (apply it once in
-        # CapCut to download it) — else it shows in the editor but does nothing.
-        # "none" = hard cut (current default until the effect is cached).
-        "page_transition": "none", "page_transition_us": 800_000,
+        # "turn3d" = our OWN pseudo-3D page turn (export_comic._add_page_turns):
+        # a leaf with baked content flips across the spine on scale_x keyframes,
+        # revealing the next spread. Renders without any CapCut effect cache.
+        # "none" = hard cut.
+        "page_transition": "turn3d", "page_transition_us": 800_000,
         "max_panel_slots": max((len(p["panels"]) for p in pages), default=1),
         "pages": pages, "music_tracks": music,
     }
