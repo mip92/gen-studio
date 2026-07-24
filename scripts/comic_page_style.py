@@ -232,7 +232,7 @@ class OldComicPageStyle(PageStyle):
             dm = int(min(w, h) * 0.018)
             PAGE_LINE = SEP                       # single paper-tan contour colour (not wood)
             lwl = max(1, int(min(w, h) * 0.0009))  # thin, crisp contour (user 2026-07-23)
-            K = 8
+            K = 7                                  # one fewer stacked leaf (user 2026-07-24)
             Nb = 26
             room_R = max(0, (w - dm) - xR)
             room_L = max(0, xL - dm)

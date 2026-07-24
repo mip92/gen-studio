@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { ExportsService } from './exports.service';
 
@@ -45,16 +45,28 @@ export class ExportsController {
 
   @Post('comic')
   @ApiOperation({
-    summary: 'Build the cinematic-COMIC CapCut draft for the project',
+    summary: 'Start the cinematic-COMIC CapCut build (async)',
     description:
       'Lays the whole film out as comic spreads (2×2 panels/page) with a camera '
-      + 'flying between panels and a pseudo-3D page turn between spreads. Same '
-      + 'readiness as the linear export. Writes the draft straight into CapCut\'s '
-      + 'drafts folder — build with CapCut CLOSED (an open CapCut drops the draft '
-      + 'on exit). Slow (renders hi-res sheets), so the request may run for minutes.',
+      + 'flying between panels and a pseudo-3D page turn between spreads. Builds the '
+      + 'manifest synchronously then spawns the SLOW render DETACHED and returns '
+      + 'immediately with { draft_name, spreads, status:"building" }. Poll '
+      + 'GET export/comic/status?name=<draft_name> until done. Build with CapCut '
+      + 'CLOSED (an open CapCut drops the draft on exit).',
   })
   exportComic(@Param('idOrSlug') idOrSlug: string) {
     return this.exports.exportComic(idOrSlug);
+  }
+
+  @Get('comic/status')
+  @ApiOperation({
+    summary: 'Poll a comic build',
+    description:
+      'Returns { done, building, rendered, total } for the given draft name — '
+      + 'done flips true once the draft is written into CapCut\'s folder.',
+  })
+  comicStatus(@Param('idOrSlug') idOrSlug: string, @Query('name') name: string) {
+    return this.exports.comicStatus(idOrSlug, name ?? '');
   }
 
   @Get('shorts/plan')

@@ -27,10 +27,10 @@ DATA = ROOT + "/data"
 # page — so the camera reads one page down, then pans once across the binding to
 # the next page, instead of hopping the spine on every row.
 SPREAD_SIZES = [8]
-MARGIN   = 0.028      # outer margin around the whole spread
+MARGIN   = 0.015      # outer margin around the whole spread (trimmed — bigger panels)
 MARGIN_Y = 0.040      # top margin
 FOOT     = 0.090      # bottom band reserved for the book's fore-edge (page stack)
-SIDE     = 0.055      # outer L/R band reserved for the fanned side page-leaves
+SIDE     = 0.040      # outer L/R band reserved for the fanned side page-leaves
 SPINE    = 0.055      # reserved centre gutter for the binding (thick manga-style gutter)
 # Tight gutters so that when the camera zooms into a panel the NEIGHBOURS peek in
 # at the edges (user 2026-07-22). Vertical (between columns) stays thinner than
@@ -43,7 +43,8 @@ TAIL_US, MIN_SHOT_US, NO_VO_US = 500_000, 2_500_000, 4_000_000
 # ── camera tuning ─────────────────────────────────────────────────────────────
 OPEN_HOLD, TRAVEL_US, END_HOLD = 900_000, 650_000, 500_000
 ZOOM_MIN, ZOOM_MAX = 1.2, 7.0
-DEFAULT_PANEL_FRAC = 0.85
+DEFAULT_PANEL_FRAC = 0.72   # camera fills 72% of frame with a panel (was 0.85) —
+                            # less zoom-in → less magnification of the baked sheet
 
 
 def shot_hold_us(kind, source_us, narration_us, export_timing):

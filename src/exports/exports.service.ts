@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { spawn } from 'child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { shotHoldUs } from './shot-timing';
@@ -178,6 +178,8 @@ interface Manifest {
 @Injectable()
 export class ExportsService {
   private readonly logger = new Logger(ExportsService.name);
+  /** Slugs with a comic draft render currently in flight (async build guard). */
+  private readonly buildingComic = new Set<string>();
 
   constructor(private readonly prisma: PrismaService) {}
 
@@ -879,17 +881,18 @@ export class ExportsService {
   }
 
   /**
-   * Build the CINEMATIC-COMIC CapCut draft: the whole film laid out as comic
-   * spreads (2×2 panels/page) with the camera flying between panels and a
-   * pseudo-3D page turn between spreads. Same readiness as the linear export
-   * (chosen+upscaled video, approved TTS). Runs the two-python pipeline and
-   * writes the draft straight into CapCut's drafts folder.
+   * Kick off the CINEMATIC-COMIC CapCut build ASYNCHRONOUSLY: the whole film laid
+   * out as comic spreads (2×2 panels/page) with a camera fly-through and a
+   * pseudo-3D page turn between spreads. Builds the manifest synchronously (fast),
+   * then spawns the SLOW draft render DETACHED and returns immediately with the
+   * draft name + total spreads. The UI polls comicStatus() until the draft is
+   * written. Returns fast so no HTTP timeout can drop the request.
    *
-   * NOTE: build the draft with CapCut CLOSED — an open CapCut rewrites its
-   * root_meta on exit and drops a freshly-written draft. The UI warns about this.
+   * NOTE: build with CapCut CLOSED — an open CapCut rewrites its root_meta on exit
+   * and drops a freshly-written draft. The UI warns about this.
    */
   async exportComic(idOrSlug: string): Promise<{
-    draft_name: string; draft_path: string; spreads: number;
+    draft_name: string; spreads: number; status: 'building';
   }> {
     const project = await this.findProject(idOrSlug);
     if (!existsSync(COMIC_MANIFEST_SCRIPT)) {
@@ -901,12 +904,16 @@ export class ExportsService {
     if (!existsSync(PYTHON_BIN)) {
       throw new BadRequestException(`python bin missing: ${PYTHON_BIN} (set EXPORT_PYTHON env)`);
     }
+    if (this.buildingComic.has(project.slug)) {
+      throw new BadRequestException(
+        `Комикс для «${project.slug}» уже собирается — дождитесь завершения (не запускайте повторно).`);
+    }
 
     const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
     mkdirSync(outDir, { recursive: true });
     const manifestPath = path.join(outDir, 'comic_manifest.json');
 
-    // 1) manifest — system python (reads the DB via psycopg2)
+    // 1) manifest — system python (reads the DB via psycopg2). Fast.
     this.logger.log(`Comic export: building manifest for ${project.slug}`);
     const m = await runPython(COMIC_MANIFEST_PYTHON, [
       '-X', 'utf8', COMIC_MANIFEST_SCRIPT, '--slug', project.slug, '--pack', '--out', manifestPath,
@@ -917,26 +924,65 @@ export class ExportsService {
     if (!existsSync(manifestPath)) {
       throw new BadRequestException(`comic_manifest wrote no manifest at ${manifestPath}`);
     }
-
-    // 2) draft — kohya python (pyJianYingDraft). Slow: renders the ss8 sheets +
-    //    frame overlays + extracts panel stills, so this can take minutes.
-    this.logger.log(`Comic export: building draft for ${project.slug}`);
-    const b = await runPython(PYTHON_BIN, [
-      '-X', 'utf8', COMIC_EXPORT_SCRIPT, '--manifest', manifestPath,
-    ]);
-    if (b.code !== 0) {
-      throw new BadRequestException(`export_comic.py exited ${b.code}: ${b.stderr.trim().slice(-800)}`);
-    }
-
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
       draft_name?: string; capcut_drafts_root?: string; pages?: unknown[];
     };
     const draftName = manifest.draft_name ?? '';
-    const draftPath = manifest.capcut_drafts_root
-      ? path.join(manifest.capcut_drafts_root, draftName) : draftName;
-    this.logger.log(`comic export for ${project.slug}: ${draftName} (${(manifest.pages ?? []).length} spreads)`);
-    return { draft_name: draftName, draft_path: draftPath, spreads: (manifest.pages ?? []).length };
+    const spreads = (manifest.pages ?? []).length;
+
+    // 2) draft — kohya python (pyJianYingDraft). SLOW (renders hi-res sheets + turn
+    //    images + extracts stills), so run DETACHED and let the UI poll. Its output
+    //    goes to a log file; the running flag clears on exit.
+    this.buildingComic.add(project.slug);
+    const logPath = path.join(outDir, 'comic_build.log');
+    const log = createWriteStream(logPath, { flags: 'w' });
+    this.logger.log(`Comic export: spawning detached draft build for ${project.slug} (${draftName})`);
+    const proc = spawn(PYTHON_BIN, ['-X', 'utf8', COMIC_EXPORT_SCRIPT, '--manifest', manifestPath], {
+      stdio: ['ignore', log, log],
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+    });
+    const clear = (code: number | null) => {
+      this.buildingComic.delete(project.slug);
+      this.logger.log(`Comic build for ${project.slug} finished (exit ${code ?? 'err'})`);
+      try { log.end(); } catch { /* already closed */ }
+    };
+    proc.on('exit', clear);
+    proc.on('error', () => clear(1));
+    proc.unref();
+
+    return { draft_name: draftName, spreads, status: 'building' };
   }
+
+  /**
+   * Poll a comic build: is the draft written yet, and how many spreads are done.
+   * `done` flips true once export_comic has written draft_content.json into
+   * CapCut's folder. `rendered` counts the spread PNGs already produced.
+   */
+  async comicStatus(idOrSlug: string, draftName: string): Promise<{
+    done: boolean; building: boolean; rendered: number; total: number;
+  }> {
+    const project = await this.findProject(idOrSlug);
+    const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
+    const manifestPath = path.join(outDir, 'comic_manifest.json');
+    let root = ''; let total = 0; let outRoot = '';
+    if (existsSync(manifestPath)) {
+      const mf = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
+        capcut_drafts_root?: string; output_root?: string; pages?: unknown[];
+      };
+      root = mf.capcut_drafts_root ?? '';
+      outRoot = mf.output_root ?? '';
+      total = (mf.pages ?? []).length;
+    }
+    const done = !!draftName && !!root
+      && existsSync(path.join(root, draftName, 'draft_content.json'));
+    let rendered = 0;
+    const pagesDir = outRoot && draftName ? path.join(outRoot, draftName, 'pages') : '';
+    if (pagesDir && existsSync(pagesDir)) {
+      rendered = readdirSync(pagesDir).filter((f) => /^spread_\d+\.png$/.test(f)).length;
+    }
+    return { done, building: this.buildingComic.has(project.slug), rendered, total };
+  }
+
 }
 
 function runPython(bin: string, argv: string[]): Promise<{ code: number; stderr: string }> {
