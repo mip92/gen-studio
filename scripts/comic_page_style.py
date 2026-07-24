@@ -274,10 +274,9 @@ class OldComicPageStyle(PageStyle):
                     path = [(cx, ty), (ox, ty), (ox, depth)]       # tread + straight side down
                     for j in range(1, Nb + 1):                     # bottom edge → converge to spine
                         t = j / Nb
-                        # straight line from the outer-bottom corner to the spine base
-                        # → the sheets fan cleanly to the centre-bottom, no curl
-                        # (user 2026-07-24).
-                        path.append((ox + (mid - ox) * t, yb + (depth - yb) * (1 - t)))
+                        # non-linear (eased) fall to the spine base — curved sheets,
+                        # not a rigid straight line (user 2026-07-24, restore).
+                        path.append((ox + (mid - ox) * t, yb + (depth - yb) * (1 - t) ** 2))
                     sheets.append(path)
                     cx = ox
                 # paper fill: staircase top → down the outer side → back along page edge

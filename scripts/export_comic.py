@@ -44,7 +44,10 @@ from comic_pagebuild import render_page
 
 KP = draft.KeyframeProperty
 
-BAKE_KF_PER_SEC = 12       # linear keyframes per second of camera travel (holds emit none)
+BAKE_KF_PER_SEC = 60       # dense travel keyframes: CapCut lerps position linearly
+                           # between them, so during the fast roll the layers only
+                           # stay glued if keyframes are close (else tiny arc-chord
+                           # drift shows as residual parallax, user 2026-07-24)
 MIN_BAKE_STEPS  = 5
 PANEL_INSET     = 0.0      # gap between the inked frame and the content (0 = tight)
 # Long-VO rule: never slow a clip below this speed. When the voiceover forces a
@@ -61,6 +64,13 @@ ZOOM_DIP        = 0.28     # camera pulls BACK this much at mid-travel (lift & m
 SWAY_AMP_X      = 0.0032   # low-freq handheld drift (page-normalized units)
 SWAY_AMP_Y      = 0.0026
 SWAY_AMP_Z      = 0.010    # ±1% zoom breathing
+# Camera ROLL (user 2026-07-24): tilt during travels, alternating side, level at
+# holds. pyJianYingDraft: rotation is CLOCKWISE degrees; transform_x unit = half
+# canvas WIDTH, transform_y = half HEIGHT (anisotropic) → the layer positions must
+# be orbited by the SAME clockwise angle in true pixels (aspect-corrected) so the
+# scene rolls rigidly (else off-centre panels drift → parallax).
+ROT_TRAVEL_DEG  = 3.5      # peak tilt mid-travel — pronounced, one per travel; holds level
+ASPECT          = 16.0 / 9.0
 
 
 def _sway(t_us: int) -> Tuple[float, float, float]:
@@ -117,13 +127,17 @@ def _build_camera(states: List[dict]):
     `_bake_layer` (a pure function of t, so also identical across layers)."""
     segs = []
     grid = set()
+    tcount = 0                          # travel index → alternates the roll direction
     for a, b in zip(states, states[1:]):
         t0, t1 = int(a["t_us"]), int(b["t_us"])
         if t1 <= t0:
             continue
         same = (abs(a["cx"] - b["cx"]) < 1e-6 and abs(a["cy"] - b["cy"]) < 1e-6
                 and abs(a["zoom"] - b["zoom"]) < 1e-6)
-        segs.append((t0, t1, a, b, same))
+        ti = -1 if same else tcount
+        if not same:
+            tcount += 1
+        segs.append((t0, t1, a, b, same, ti))
         # Sample BOTH holds and travels so the camera is alive everywhere. A slowed
         # clip that also moves is kept glued by compensating its keyframe TIMES for
         # its speed (see `_bake_layer` time_scale) — CapCut reads a slowed clip's
@@ -135,21 +149,25 @@ def _build_camera(states: List[dict]):
     if states:
         grid.add(int(states[0]["t_us"])); grid.add(int(states[-1]["t_us"]))
 
-    def cam(t: int) -> Tuple[float, float, float]:
+    def cam(t: int) -> Tuple[float, float, float, float]:
         if not segs:
             s = states[0] if states else {"cx": 0.5, "cy": 0.5, "zoom": 1.0}
-            return (s["cx"], s["cy"], s["zoom"])
+            return (s["cx"], s["cy"], s["zoom"], 0.0)
         if t <= segs[0][0]:
-            a = segs[0][2]; return (a["cx"], a["cy"], a["zoom"])
-        for (t0, t1, a, b, same) in segs:
+            a = segs[0][2]; return (a["cx"], a["cy"], a["zoom"], 0.0)
+        for (t0, t1, a, b, same, ti) in segs:
             if t0 <= t <= t1:
                 if same:
-                    # HOLD: gentle sway, windowed so it is 0 at both ends (meets the
-                    # still travel-endpoints seamlessly) and peaks mid-hold.
+                    # HOLD: gentle X/Y/zoom breathing over the whole hold, but ZERO
+                    # roll — the (possibly SLOWED) video plays here and must stay
+                    # perfectly level; rolling it meant its source-time-warped rotation
+                    # keyframes desynced from the sheet → parallax (user 2026-07-24).
+                    # The roll lives only on travels, where all visible layers are
+                    # normal-speed posters/sheet/frames and stay rigid.
                     win = math.sin(math.pi * (t - t0) / (t1 - t0)) if t1 > t0 else 0.0
                     sx, sy, sz = _sway(t)
                     return (a["cx"] + sx * win, a["cy"] + sy * win,
-                            a["zoom"] * (1.0 + (sz - 1.0) * win))
+                            a["zoom"] * (1.0 + (sz - 1.0) * win), 0.0)
                 p = _ease((t - t0) / (t1 - t0)); bow = math.sin(math.pi * p)
                 dx, dy = b["cx"] - a["cx"], b["cy"] - a["cy"]
                 dist = math.hypot(dx, dy)
@@ -158,11 +176,15 @@ def _build_camera(states: List[dict]):
                 # sway is windowed by `bow` → it vanishes at both ends, so the
                 # travel joins the (still) holds seamlessly with no jump.
                 sx, sy, sz = _sway(t)
+                # ROLL: tilt during the travel, alternating side per travel, 0 at
+                # both ends → approach each panel at a slight angle, level to view it.
+                sign = 1.0 if (ti % 2 == 0) else -1.0
+                rot = ROT_TRAVEL_DEG * sign * bow
                 return (a["cx"] + dx * p + (px * arc + sx) * bow,
                         a["cy"] + dy * p + (py * arc + sy) * bow,
                         (a["zoom"] + (b["zoom"] - a["zoom"]) * p)
-                        * (1.0 - ZOOM_DIP * bow) * (1.0 + (sz - 1.0) * bow))
-        b = segs[-1][3]; return (b["cx"], b["cy"], b["zoom"])
+                        * (1.0 - ZOOM_DIP * bow) * (1.0 + (sz - 1.0) * bow), rot)
+        b = segs[-1][3]; return (b["cx"], b["cy"], b["zoom"], 0.0)
 
     return cam, sorted(grid)
 
@@ -188,12 +210,21 @@ def _bake_layer(seg, cam, grid, placer, lo: int, hi: int, t0: int,
         if prev is not None and t <= prev:
             continue
         prev = t
-        cx, cy, z = cam(int(t))
+        cx, cy, z, rot = cam(int(t))
         s, tx, ty = placer(cx, cy, z)
+        # ROLL: CapCut rotates a clip CLOCKWISE about its own centre. To roll the
+        # whole scene rigidly about the frame centre, orbit each layer's position by
+        # the SAME clockwise angle — in true pixels (transform_x is half-WIDTH units,
+        # transform_y half-HEIGHT, so divide/multiply by ASPECT). Sign matches the
+        # clockwise clip rotation (mismatched sign = double-drift = parallax).
+        if rot:
+            rad = math.radians(rot); c = math.cos(rad); sn = math.sin(rad)
+            tx, ty = tx * c + ty * sn / ASPECT, -tx * sn * ASPECT + ty * c
         off = int((t - t0) * time_scale)
         seg.add_keyframe(KP.uniform_scale, off, s)
         seg.add_keyframe(KP.position_x,    off, tx)
         seg.add_keyframe(KP.position_y,    off, ty)
+        seg.add_keyframe(KP.rotation,      off, rot)
         n += 1
     return n
 
@@ -356,13 +387,20 @@ def build_comic_draft(manifest: dict) -> Path:
     script.add_track(draft.TrackType.video, "comic_page", relative_index=0)
     max_slots = int(manifest.get("max_panel_slots")
                     or max((len(p.get("panels") or []) for p in pages), default=1))
+    # BASE lanes (below): the panel's WHOLE-SPREAD poster — a static shot's still, or
+    # a video shot's LAST frame. Rendered exactly like a static panel (full span,
+    # t0=0) → no drift (user 2026-07-24). SLOT lanes (above): the intro first-frame +
+    # the slowed video clip, covering only [0, video_end]; after the video ends the
+    # slot is empty and the base poster shows through.
     for i in range(max_slots):
-        script.add_track(draft.TrackType.video, f"slot_{i}", relative_index=i + 1)
+        script.add_track(draft.TrackType.video, f"base_{i}", relative_index=i + 1)
+    for i in range(max_slots):
+        script.add_track(draft.TrackType.video, f"slot_{i}", relative_index=max_slots + 1 + i)
     # TOP track: the marker frames ride ABOVE every panel (borders visible / lap on)
-    script.add_track(draft.TrackType.video, "comic_frames", relative_index=max_slots + 1)
+    script.add_track(draft.TrackType.video, "comic_frames", relative_index=2 * max_slots + 1)
     # ABOVE everything: the page-turn overlay (opaque wide book + the flipping leaf)
-    script.add_track(draft.TrackType.video, "comic_turn_bg",   relative_index=max_slots + 2)
-    script.add_track(draft.TrackType.video, "comic_turn_leaf", relative_index=max_slots + 3)
+    script.add_track(draft.TrackType.video, "comic_turn_bg",   relative_index=2 * max_slots + 2)
+    script.add_track(draft.TrackType.video, "comic_turn_leaf", relative_index=2 * max_slots + 3)
     script.add_track(draft.TrackType.audio, "narration")
 
     subtitle_cues: List[tuple] = []
@@ -465,44 +503,48 @@ def build_comic_draft(manifest: dict) -> Path:
                         pause_in = pause // 2; pause_out = pause - pause_in
                 video_start = arrival + pause_in
                 video_end   = video_start + video_screen
-                # (a) first-frame poster: travel-in + head freeze  [0 … video_start]
+                # BASE (below): the WHOLE-SPREAD poster = the LAST frame, baked EXACTLY
+                # like a static-shot panel (full span [0,p_dur], t0=0). Static panels
+                # never drift, and neither does this — the earlier per-tail short
+                # segment (t0=video_end) was the thing that drifted on travels
+                # (user 2026-07-24). fp + clip overlay it during [0,video_end]; after
+                # the video the base shows through. Falls back to the still.
+                lastf = _last_frame_png(vpath, frames_dir, panel["shotCode"])
+                base_mat = lastf or still
+                if base_mat:
+                    bp = draft.VideoSegment(
+                        draft.VideoMaterial(base_mat, material_name=f'{panel["shotCode"]}_tail'),
+                        target_timerange=draft.Timerange(start=p_start, duration=p_dur),
+                        source_timerange=draft.Timerange(start=0, duration=p_dur))
+                    total_kf += _bake_layer(bp, cam, grid, placer_still, 0, p_dur, 0)
+                    script.add_segment(bp, track_name=f"base_{slot}")
+                # (a) intro first-frame poster [0 … video_start] on the SLOT lane (above base)
                 if still and video_start > 0:
                     fp = draft.VideoSegment(
                         draft.VideoMaterial(still, material_name=f'{panel["shotCode"]}_first'),
-                        target_timerange=draft.Timerange(start=p_start, duration=video_start))
+                        target_timerange=draft.Timerange(start=p_start, duration=video_start),
+                        source_timerange=draft.Timerange(start=0, duration=video_start))
                     total_kf += _bake_layer(fp, cam, grid, placer_still, 0, video_start, 0)
                     script.add_segment(fp, track_name=lane)
-                # (b) the clip (floor-capped slow-mo). Bake the panel's focus state
-                #     as keyframes (NOT a static transform) so the video breathes /
-                #     sways in lockstep with the page instead of sliding under its
-                #     frame during the hold.
+                # (b) the clip (floor-capped slow-mo — DO NOT change its speed). Bake the
+                #     panel's focus state as keyframes so the video sways in lockstep.
                 clip = draft.VideoSegment(
                     mat,
                     target_timerange=draft.Timerange(start=p_start + video_start, duration=video_screen),
                     source_timerange=draft.Timerange(start=0, duration=src_win) if native > 0 else None)
-                # slowed clip → compensate keyframe timing for CapCut's source-time
-                # warp so the moving video tracks the rest of the page.
                 speed_ratio = (src_win / video_screen) if (native > 0 and video_screen > 0) else 1.0
                 total_kf += _bake_layer(clip, cam, grid, placer_still, video_start, video_end,
                                         video_start, speed_ratio)
                 script.add_segment(clip, track_name=lane)
                 total_clips += 1
-                # (c) last-frame poster: tail freeze + travel-out  [video_end … page_end]
-                lastf = _last_frame_png(vpath, frames_dir, panel["shotCode"])
-                if lastf and video_end < p_dur:
-                    placer_last = _make_panel_placer(rect)
-                    lp = draft.VideoSegment(
-                        draft.VideoMaterial(lastf, material_name=f'{panel["shotCode"]}_last'),
-                        target_timerange=draft.Timerange(start=p_start + video_end, duration=p_dur - video_end))
-                    total_kf += _bake_layer(lp, cam, grid, placer_last, video_end, p_dur, video_end)
-                    script.add_segment(lp, track_name=lane)
             elif still:
-                # static shot: one still poster for the whole spread
+                # static shot: one still poster for the whole spread (on the base lane)
                 sp = draft.VideoSegment(
                     draft.VideoMaterial(still, material_name=panel["shotCode"]),
-                    target_timerange=draft.Timerange(start=p_start, duration=p_dur))
+                    target_timerange=draft.Timerange(start=p_start, duration=p_dur),
+                    source_timerange=draft.Timerange(start=0, duration=p_dur))
                 total_kf += _bake_layer(sp, cam, grid, placer_still, 0, p_dur, 0)
-                script.add_segment(sp, track_name=lane)
+                script.add_segment(sp, track_name=f"base_{slot}")
 
             # narration wav anchored to camera arrival
             narr = panel.get("narration")

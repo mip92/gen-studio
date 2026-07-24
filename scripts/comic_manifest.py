@@ -31,7 +31,8 @@ MARGIN   = 0.015      # outer margin around the whole spread (trimmed — bigger
 MARGIN_Y = 0.040      # top margin
 FOOT     = 0.090      # bottom band reserved for the book's fore-edge (page stack)
 SIDE     = 0.040      # outer L/R band reserved for the fanned side page-leaves
-SPINE    = 0.055      # reserved centre gutter for the binding (thick manga-style gutter)
+SPINE    = 0.025      # narrow centre gutter — panels reach closer to the spine, a
+                      # touch wider → a touch less zoom (user 2026-07-24)
 # Tight gutters so that when the camera zooms into a panel the NEIGHBOURS peek in
 # at the edges (user 2026-07-22). Vertical (between columns) stays thinner than
 # horizontal (between rows) — best practice, groups each row for the eye.
