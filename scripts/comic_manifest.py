@@ -41,7 +41,7 @@ GUT_H    = 0.012      # gutter BETWEEN ROWS
 # ── timing (mirror src/exports/shot-timing.ts) ───────────────────────────────
 TAIL_US, MIN_SHOT_US, NO_VO_US = 500_000, 2_500_000, 4_000_000
 # ── camera tuning ─────────────────────────────────────────────────────────────
-OPEN_HOLD, TRAVEL_US, END_HOLD = 900_000, 650_000, 500_000
+OPEN_HOLD, TRAVEL_US, END_HOLD = 900_000, 650_000, 700_000  # END_HOLD = quick pull-back to wide
 ZOOM_MIN, ZOOM_MAX = 1.2, 7.0
 DEFAULT_PANEL_FRAC = 0.72   # camera fills 72% of frame with a panel (was 0.85) —
                             # less zoom-in → less magnification of the baked sheet
@@ -216,9 +216,11 @@ def build(slug, max_spreads, panel_frac, out, pack=False):
                            "still_path": sh["still"], "media": sh["media"],
                            "narration": sh["narration"], "zoom": zoom,
                            "arrival_us": arrival, "hold_us": hold, "depart_us": depart})
-        # No whole-spread beat at the END — after the last panel, go STRAIGHT to the
-        # next spread; a short tail holds the last panel's last frame.
+        # After the last panel, QUICKLY PULL BACK to the wide spread (general view)
+        # over END_HOLD, so the page turn begins from the wide book instead of a hard
+        # cut off a zoomed-in panel (user 2026-07-24). The final camera state = wide.
         page_end = cursor + END_HOLD
+        states.append({"t_us": page_end, "cx": 0.5, "cy": 0.5, "zoom": 1.0})
         pages.append({"pageIndex": sidx, "pageKey": f"{skey}_{sidx}",
                       "page_start_us": page_start, "page_duration_us": page_end,
                       "panels": panels, "camera_states": states})

@@ -301,7 +301,10 @@ def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
         front = _bake_leaf(A.get("panels") or [], sA, pages_dir / f"turn_front_{i:03d}.png", right=True)
         back  = _bake_leaf(B.get("panels") or [], sB, pages_dir / f"turn_back_{i:03d}.png",  right=False)
 
-        tb = int(spread_bounds[i]); t0 = max(0, tb - half)
+        # Start the turn AT the boundary (not straddling it): the spread's END_HOLD
+        # already pulled the camera back to the wide book, so the flip begins from
+        # that wide view and plays into the next spread's opening (user 2026-07-24).
+        tb = int(spread_bounds[i]); t0 = tb
 
         bg_seg = draft.VideoSegment(
             draft.VideoMaterial(bg, material_name=f"turn_bg_{i}"),
