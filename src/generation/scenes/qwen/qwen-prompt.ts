@@ -8,6 +8,36 @@
  * scenePrompt) into that instruction shape, shared by the realcomic_qwen
  * strategies, the dual-character overlay strategies AND the anchor-portrait
  * generator.
+ *
+ * ─── THE FOUR 2511 RULES THIS FILE ENCODES ─────────────────────────────────
+ * Sourced from the official Qwen-Image-Edit-2511 model card, the ComfyUI node
+ * implementation (comfy_extras/nodes_qwen.py) and community prompt guides.
+ * Full write-up + citations: .claude/skills/gen-studio-qwen2511/.
+ *
+ * 1. DESCRIBE THE RESULT, NOT THE EDIT. The official multi-image example is one
+ *    sentence of finished image: "The magician bear is on the left, the
+ *    alchemist bear is on the right, facing each other in the central park
+ *    square." Not "take the bear from picture 1 and place it…".
+ * 2. NEGATIONS DO NOT WORK. The VL encoder has no negation channel — "do not
+ *    copy their pose / their background" reinforces pose and background. State
+ *    what you WANT ("medium shot, eye level, standing at the open cab door").
+ *    This file used to carry a 2-sentence "ANTI-PASTE" block of exactly such
+ *    negations; it was the cause of the pasted-collage look on `trucker`, not
+ *    the cure. Do not reintroduce it.
+ * 3. SHORT WINS. 1-3 sentences. Structure: subject → environment → detail →
+ *    light. Long instruction stacks measurably degrade composition.
+ * 4. NATURALNESS COMES FROM ACTION + LIGHT. A named action ("leans on the door
+ *    frame and looks down at her") yields a natural pose where positional
+ *    description ("is on the left") yields a stiff cut-out. A named light
+ *    ("sodium lamps behind them, warm rim light") makes 2511 relight the
+ *    subjects into the plate by itself — the relight LoRA is baked into 2511.
+ *
+ * The OTHER half of the pasted-look fix is not textual: TextEncodeQwenImage-
+ * EditPlus feeds each reference through TWO channels — the VL encoder at
+ * 384x384 (semantics: who this is, what they wear) and, only when its `vae`
+ * input is connected, the VAE at 1024x1024 appended as `reference_latents`
+ * (appearance: the actual pixels). `reference_latents` is the paste channel.
+ * See QwenGraphSpec.referenceLatents in qwen-scene-graph.builder.ts.
  */
 
 /** RealComic LoRA trigger phrase (Civitai model 1757495, 2509_Base). Phrased
@@ -85,15 +115,32 @@ export function composeQwenInstruction(o: QwenInstructionOpts): string {
     return [o.styleDirective, scene].filter((s) => s && s.length > 0).join(', ');
   }
 
-  const refs = o.participants
-    .map((p, i) => {
-      const desc = (p.characterPrompt ?? '').trim();
-      return `Picture ${i + 1} is ${p.displayName}${desc ? ` — ${desc}` : ''}.`;
-    })
+  // Rule 1 + 3: bind each attached picture to a name, state each identity once,
+  // then ONE sentence of finished image. No meta-instructions, no negations
+  // (rule 2) — the paste is fought in the graph, not with "do not copy".
+  const bindings = o.participants
+    .map((p, i) => `Picture ${i + 1} is ${p.displayName}.`)
+    .join(' ');
+  const described = o.participants.filter((p) => (p.characterPrompt ?? '').trim().length > 0);
+  const identities = described
+    .map((p) => `${p.displayName} is ${sentence(p.characterPrompt)}`)
     .join(' ');
   const names = o.participants.map((p) => p.displayName).join(' and ');
-  const placement = scene ? `Draw a new scene with ${names}: ${scene}.` : `Draw a new scene with ${names}.`;
-  const identity =
-    "Keep each person's face, hairstyle and build exactly as in their reference picture.";
-  return [refs, placement, identity, `${o.styleDirective}.`].join(' ');
+  // The shot's own text IS the target-image description (rule 1). When a shot
+  // has no positive at all, fall back to naming the cast — never to "draw a
+  // new scene showing…", which is an instruction about the edit, not a result.
+  const target = scene ? sentence(scene) : `${names} together in one scene.`;
+  // Rule 2 restated positively: what to PRESERVE, in one clause.
+  const preserve = `Keep each person's face, hair and clothing exactly as in their reference picture.`;
+  return [bindings, identities, target, preserve, sentence(o.styleDirective)]
+    .filter((s) => s.length > 0)
+    .join(' ');
+}
+
+/** Trim and terminate a clause so the composed instruction reads as prose to
+ *  the VL encoder rather than as a run-on tag list. */
+function sentence(s: string): string {
+  const t = (s ?? '').trim();
+  if (t.length === 0) return '';
+  return /[.!?]$/.test(t) ? t : `${t}.`;
 }

@@ -52,6 +52,16 @@ export interface SceneJobParams {
    *  files are present on disk, so strategies can trust it — the realcomic_qwen
    *  strategies and the dual-character Qwen overlay read it. */
   anchorImagePaths?:   string[];
+  /**
+   * Per-project override of the Qwen appearance channel
+   * (`project.settings.qwenReferenceLatents`). Absent → each strategy's own
+   * default: OFF for realcomic_qwen scenes (style is carried by the RealComic
+   * LoRA, so the anchors are needed for identity only and the pixel channel
+   * only pastes the character sheet into the frame), ON for the dual-character
+   * overlay (there the anchors ARE the style carrier). See
+   * QwenGraphSpec.referenceLatents for the mechanism.
+   */
+  qwenReferenceLatents?: boolean;
   /** Style LoRA for the Qwen graph (RealComic by default; overridable via
    *  project.settings.styleLora — the same convention node "2" uses on the
    *  legacy cartoon graphs). Absent on the dual-character overlay, where the

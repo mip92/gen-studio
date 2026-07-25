@@ -71,6 +71,11 @@ export class QwenRealcomicSceneStrategy implements SceneStrategy {
       filenamePrefix: params.filenamePrefix,
       anchors,
       styleLora:      params.qwenStyleLora ?? { name: DEFAULT_REALCOMIC_LORA },
+      // Identity via the VL channel only. RealComic already carries the style,
+      // so the anchors are wanted for "who is this" — not for their pixels,
+      // which is what dropped the studio character sheet into every frame on
+      // `trucker`. Overridable per project via settings.qwenReferenceLatents.
+      referenceLatents: params.qwenReferenceLatents ?? false,
     });
   }
 }

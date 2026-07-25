@@ -64,7 +64,11 @@ export class QwenDualCharacterOverlayStrategy implements SceneStrategy {
       filenamePrefix: params.filenamePrefix,
       anchors,
       // No style LoRA and template-default scheduler: the style comes from
-      // the reference images, not from RealComic.
+      // the reference images, not from RealComic. For the same reason the
+      // appearance channel STAYS on here — unlike the realcomic_qwen strategy,
+      // these anchors are the only carrier of the project's art style, and the
+      // VL channel alone (384x384 semantics) would not transfer it.
+      referenceLatents: params.qwenReferenceLatents ?? true,
     });
   }
 }

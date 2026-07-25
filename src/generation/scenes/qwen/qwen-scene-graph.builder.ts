@@ -42,6 +42,33 @@ export interface QwenGraphSpec {
   filenamePrefix: string;
   /** ComfyUI-input-relative staged anchor filenames, 0-3, Picture-N order. */
   anchors: string[];
+  /**
+   * Whether the encode nodes keep their `vae` input — i.e. whether each
+   * reference is ALSO appended to the conditioning as a `reference_latents`
+   * entry. This is the single biggest lever on how "pasted" the output looks.
+   *
+   * TextEncodeQwenImageEditPlus runs every attached image through two channels
+   * (comfy_extras/nodes_qwen.py): the VL encoder at 384x384 — semantics, "who
+   * is this person, what are they wearing" — and, only if `vae` is wired, the
+   * VAE at 1024x1024 appended via conditioning_set_values('reference_latents').
+   * The latter is APPEARANCE, near-pixel: it is what makes the model reproduce
+   * the anchor's waist-up framing, frontal pose and grey backdrop inside what
+   * was meant to be a night exterior. Our anchors are deliberately studio
+   * character sheets ("clean character reference sheet look", anchor-render.
+   * service.ts) — the worst possible donor for a pixel channel, and community
+   * guidance is explicit that donors should match the target's viewpoint and
+   * light.
+   *
+   * false → identity travels through the VL channel only: the face is held by
+   * semantics + promptBase text, the composition is free. Use it when the
+   * STYLE has another carrier (the RealComic LoRA on realcomic_qwen).
+   * true  → keep the pixel channel. Required when the references are the only
+   * thing carrying the project's art style (the dual-character overlay on the
+   * legacy cartoon styles has no Qwen style LoRA at all).
+   *
+   * Default true = the graph exactly as the JSON ships it.
+   */
+  referenceLatents?: boolean;
   /** Style LoRA to splice into the model chain; omit for the dual-character
    *  overlay (style is carried by the reference images there). */
   styleLora?: { name: string; strengthModel?: number };
@@ -61,7 +88,20 @@ export class QwenSceneGraphBuilder {
     this.set(wf, '8', 'filename_prefix', spec.filenamePrefix);
     this.injectAnchors(wf, spec.anchors);
     this.injectStyleLora(wf, spec.styleLora);
+    this.applyReferenceLatents(wf, spec.referenceLatents ?? true);
     return wf;
+  }
+
+  /** Drop the `vae` input from both encode nodes when the appearance channel is
+   *  not wanted (see QwenGraphSpec.referenceLatents). The node's `vae` is
+   *  OPTIONAL, so omitting the key is a valid graph — with no vae it simply
+   *  never builds `ref_latents` and the references act as semantics only.
+   *  Node 7 (VAEDecode) keeps its own vae wire; only nodes 3/4 are touched. */
+  private applyReferenceLatents(wf: WorkflowTemplate, enabled: boolean): void {
+    if (enabled) return;
+    for (const enc of ['3', '4']) {
+      if (wf[enc]?.inputs) delete wf[enc].inputs.vae;
+    }
   }
 
   /** Attach up to 3 anchor references. Each gets a LoadImage node wired into
