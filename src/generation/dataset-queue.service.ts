@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException, Logger } from '@nes
 import { existsSync, copyFileSync, readdirSync, statSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { ComfyService } from '../comfy/comfy.service';
 import { WorkflowFactory } from './workflows/workflow.factory';
 import { DatasetService } from '../training/dataset.service';
@@ -33,6 +34,7 @@ export class DatasetQueueService {
     private readonly comfy:     ComfyService,
     private readonly workflows: WorkflowFactory,
     private readonly dataset:   DatasetService,
+    private readonly ledger:    QueueLedgerService,
   ) {}
 
   async enqueue(input: EnqueueDatasetInput) {
@@ -51,7 +53,7 @@ export class DatasetQueueService {
     const blocked = !!input.dependsOnProfileId &&
       !(await this.dependencyHasImages(input.dependsOnProfileId));
 
-    return this.prisma.datasetJob.create({
+    const job = await this.prisma.datasetJob.create({
       data: {
         profileId:              profile.id,
         status:                 blocked ? 'blocked' : 'pending',
@@ -60,6 +62,10 @@ export class DatasetQueueService {
         referenceImageFilename: input.referenceImageFilename,
       },
     });
+    // A blocked job is waiting on another profile's dataset, so it must not be
+    // dispatchable yet — it enters the queue when promoteBlocked() releases it.
+    if (!blocked) await this.ledger.enqueue('dataset', job.id);
+    return job;
   }
 
   list(profileId?: string) {
@@ -74,6 +80,7 @@ export class DatasetQueueService {
     const job = await this.prisma.datasetJob.findUnique({ where: { id: jobId } });
     if (!job) throw new NotFoundException(`Job ${jobId} not found`);
     if (job.status === 'completed' || job.status === 'failed') return job;
+    await this.ledger.close('dataset', jobId, { status: 'cancelled', errorMessage: 'cancelled by user' });
     return this.prisma.datasetJob.update({
       where: { id: jobId },
       data:  { status: 'cancelled', completedAt: new Date() },
@@ -91,6 +98,8 @@ export class DatasetQueueService {
           where: { id: j.id },
           data:  { status: 'pending' },
         });
+        // Its dependency is satisfied — only now does it join the queue.
+        await this.ledger.enqueue('dataset', j.id);
       }
     }
   }
@@ -120,6 +129,10 @@ export class DatasetQueueService {
             completedAt:  new Date(),
             errorMessage: success ? null : 'ComfyUI reported non-success status',
           },
+        });
+        await this.ledger.close('dataset', j.id, {
+          status:       success ? 'completed' : 'failed',
+          errorMessage: success ? null : 'ComfyUI reported non-success status',
         });
       }
     }
@@ -153,13 +166,6 @@ export class DatasetQueueService {
     });
   }
 
-  /** Find the oldest pending dataset job, or null. Pipeline orders this against training jobs. */
-  async findNextPending() {
-    return this.prisma.datasetJob.findFirst({
-      where:   { status: 'pending' },
-      orderBy: { queuedAt: 'asc' },
-    });
-  }
 
   /**
    * Dispatch the given pending job to ComfyUI: builds the workflow, copies
@@ -177,12 +183,14 @@ export class DatasetQueueService {
         where: { id: jobId },
         data:  { status: 'running', startedAt: new Date(), comfyPromptId: promptId },
       });
+      await this.ledger.attachPrompt('dataset', jobId, promptId);
     } catch (e: any) {
       this.logger.error(`Dispatch failed for job ${jobId}: ${e.message}`);
       await this.prisma.datasetJob.update({
         where: { id: jobId },
         data:  { status: 'failed', errorMessage: e.message, completedAt: new Date() },
       });
+      await this.ledger.close('dataset', jobId, { status: 'failed', errorMessage: e.message });
     }
   }
 

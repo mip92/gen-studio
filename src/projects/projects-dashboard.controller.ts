@@ -6,6 +6,7 @@ import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { DatasetService } from '../training/dataset.service';
 import { probeWavDurationMs } from '../tts/wav-duration';
+import { ProjectStatsService } from './project-stats.service';
 
 const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 
@@ -20,6 +21,7 @@ export class ProjectsDashboardController {
   constructor(
     private readonly prisma:  PrismaService,
     private readonly dataset: DatasetService,
+    private readonly ledgerStats: ProjectStatsService,
   ) {}
 
   /**
@@ -158,156 +160,23 @@ export class ProjectsDashboardController {
   }
 
   /**
-   * Per-project pipeline statistics for the Overview page. Computes average
-   * wall-clock time for every job type (scene render, video i2v, video upscale,
-   * TTS, BGM, dataset, training), plus the count of completed jobs, the
-   * estimated regeneration count (shots with > 1 completed scene render),
-   * and the estimated number of generated images that have since been
-   * deleted from `Shot.renderedImages`.
+   * Per-project pipeline statistics for the Overview page.
+   *
+   * Everything comes from the queue ledger, which holds one record per attempt
+   * for every job type and survives the deletion of the shot, scene or project
+   * the work belonged to: real time spent, split into what reached the final cut
+   * and what didn't, the defect rate per stage, and the two remaining-time
+   * forecasts.
+   *
+   * This replaced a set of hand-rolled per-type AVERAGES plus a "deleted images"
+   * figure estimated as `completed renders × an assumed batch size of 5`. Both
+   * are now measured rather than guessed, so the estimates were removed instead
+   * of being shown next to the real numbers.
    */
   @Get('stats')
-  @ApiOperation({ summary: 'Pipeline timing + waste statistics for the Overview page' })
+  @ApiOperation({ summary: 'Time spent, useful vs wasted, and remaining-time forecast' })
   async stats(@Param('idOrSlug') idOrSlug: string) {
-    const project = await this.prisma.project.findFirst({
-      where:  { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
-      select: { id: true, slug: true, name: true },
-    });
-    if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
-
-    // Average wall-clock seconds for a job table, filtered to this project's
-    // shots/profiles. `started` and `completed` are the column names that
-    // bound the timing window; some tables (VideoRender.upscale*) use
-    // different columns.
-    const avgPair = async <
-      T extends Record<string, any>,
-    >(rows: T[], started: keyof T, completed: keyof T) => {
-      let sumMs = 0; let n = 0;
-      for (const r of rows) {
-        const s = r[started] as Date | null | undefined;
-        const c = r[completed] as Date | null | undefined;
-        if (!s || !c) continue;
-        const delta = (c as Date).getTime() - (s as Date).getTime();
-        if (delta < 0) continue;
-        sumMs += delta; n++;
-      }
-      return { count: n, avgSeconds: n > 0 ? Math.round(sumMs / n / 1000) : null };
-    };
-
-    // ── Scene render (SDXL) ──────────────────────────────────────────────
-    const sceneRows = await this.prisma.sceneRenderJob.findMany({
-      where:  { shot: { projectId: project.id }, status: 'completed' },
-      select: { id: true, shotId: true, startedAt: true, completedAt: true },
-    });
-    const sceneStats = await avgPair(sceneRows, 'startedAt', 'completedAt');
-
-    // Regeneration: shots with more than one completed scene render.
-    const perShotCounts = new Map<string, number>();
-    for (const r of sceneRows) perShotCounts.set(r.shotId, (perShotCounts.get(r.shotId) ?? 0) + 1);
-    const shotsRegenerated = [...perShotCounts.values()].filter((n) => n > 1).length;
-    const totalRegenerations = [...perShotCounts.values()].reduce((sum, n) => sum + Math.max(0, n - 1), 0);
-
-    // Deleted images: each completed scene render produces ~5 images (default
-    // batchSize). Compare to images currently in renderedImages arrays.
-    // Inaccurate when batchSize was customised — best-effort estimate.
-    const shots = await this.prisma.shot.findMany({
-      where:  { projectId: project.id },
-      select: { id: true, renderedImages: true },
-    });
-    let currentImages = 0;
-    for (const s of shots) {
-      const arr = (s.renderedImages as Array<unknown> | null) ?? [];
-      currentImages += Array.isArray(arr) ? arr.length : 0;
-    }
-    const generatedEstimate = sceneRows.length * 5;
-    const deletedEstimate   = Math.max(0, generatedEstimate - currentImages);
-
-    // ── Video i2v (Wan2.2) ───────────────────────────────────────────────
-    const videoRows = await this.prisma.videoRender.findMany({
-      where:  { shot: { projectId: project.id }, status: 'completed' },
-      select: { startedAt: true, completedAt: true, upscaleStartedAt: true, upscaleCompletedAt: true, upscaleStatus: true },
-    });
-    const videoStats = await avgPair(videoRows, 'startedAt', 'completedAt');
-    const upscaleRows = videoRows.filter((r) => r.upscaleStatus === 'completed');
-    const upscaleStats = await avgPair(upscaleRows, 'upscaleStartedAt', 'upscaleCompletedAt');
-
-    // ── TTS ──────────────────────────────────────────────────────────────
-    // Owner: either scene or shot, both FK to project chains. Filter by
-    // either-or so scene-level and shot-level TTS are both counted.
-    const ttsRows = await this.prisma.tTSJob.findMany({
-      where: {
-        status: 'completed',
-        OR: [
-          { shot:  { projectId: project.id } },
-          { scene: { projectId: project.id } },
-        ],
-      },
-      select: { startedAt: true, completedAt: true },
-    });
-    const ttsStats = await avgPair(ttsRows, 'startedAt', 'completedAt');
-
-    // ── BGM (ACE-Step via AudioRenderJob) ───────────────────────────────
-    const bgmRows = await this.prisma.audioRenderJob.findMany({
-      where: {
-        status: 'completed',
-        segment: { block: { projectId: project.id } },
-      },
-      select: { startedAt: true, completedAt: true },
-    });
-    const bgmStats = await avgPair(bgmRows, 'startedAt', 'completedAt');
-
-    // ── Dataset generation ──────────────────────────────────────────────
-    // DatasetJob FKs to CharacterProfile → Character. Character belongs to
-    // the project via legacy Character.projectId OR ProjectCharacter join.
-    const datasetRows = await this.prisma.datasetJob.findMany({
-      where: {
-        status: 'completed',
-        profile: {
-          character: {
-            OR: [
-              { projectId: project.id },
-              { projectLinks: { some: { projectId: project.id } } },
-            ],
-          },
-        },
-      },
-      select: { startedAt: true, completedAt: true },
-    });
-    const datasetStats = await avgPair(datasetRows, 'startedAt', 'completedAt');
-
-    // ── LoRA training ────────────────────────────────────────────────────
-    const trainingRows = await this.prisma.trainingJob.findMany({
-      where: {
-        status: 'completed',
-        profile: {
-          character: {
-            OR: [
-              { projectId: project.id },
-              { projectLinks: { some: { projectId: project.id } } },
-            ],
-          },
-        },
-      },
-      select: { startedAt: true, completedAt: true },
-    });
-    const trainingStats = await avgPair(trainingRows, 'startedAt', 'completedAt');
-
-    return {
-      project,
-      sceneRender:   sceneStats,
-      videoRender:   videoStats,
-      videoUpscale:  upscaleStats,
-      tts:           ttsStats,
-      bgm:           bgmStats,
-      dataset:       datasetStats,
-      training:      trainingStats,
-      waste: {
-        currentImages,
-        estimatedGenerated: generatedEstimate,
-        estimatedDeleted:   deletedEstimate,
-        shotsRegenerated,
-        totalRegenerations,
-      },
-    };
+    return this.ledgerStats.forProject(idOrSlug);
   }
 
   /**

@@ -3,8 +3,9 @@ import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, unlin
 import { createHash } from 'crypto';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { ComfyService } from '../comfy/comfy.service';
-import { normalizeStyleLora } from '../generation/scenes/scene-render.service';
+import { normalizeStyleLora, normalizeAnchorStyleLora } from '../generation/scenes/scene-render.service';
 import { QwenSceneGraphBuilder } from '../generation/scenes/qwen/qwen-scene-graph.builder';
 import { composeQwenInstruction, REALCOMIC_T2I_STYLE } from '../generation/scenes/qwen/qwen-prompt';
 import { AnchorValidationService, anchorCandidateDir } from '../validation/anchor-validation.service';
@@ -79,6 +80,21 @@ const ANCHOR_NEGATIVE =
   'chibi, kawaii, oversaturated color, glamour photography, fashion shoot, ' +
   'full body, multiple people, group photo, profile only, back view';
 
+export type AnchorPipeline = 'qwen' | 'flux_comic' | 'sdxl_comic';
+const ANCHOR_PIPELINES: readonly string[] = ['qwen', 'flux_comic', 'sdxl_comic'];
+
+/**
+ * Read `project.settings.anchorPipeline` — which graph draws the character
+ * anchor portraits, independent of the style that renders the SCENES. Returns
+ * null when unset/unrecognised so the caller falls back to the style default.
+ */
+export function normalizeAnchorPipeline(settings: unknown): AnchorPipeline | null {
+  const v = (settings as { anchorPipeline?: unknown } | null | undefined)?.anchorPipeline;
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  return ANCHOR_PIPELINES.includes(s) ? (s as AnchorPipeline) : null;
+}
+
 @Injectable()
 export class AnchorRenderService {
   private readonly logger = new Logger(AnchorRenderService.name);
@@ -87,6 +103,7 @@ export class AnchorRenderService {
     private readonly prisma: PrismaService,
     private readonly comfy:  ComfyService,
     private readonly anchorValidation: AnchorValidationService,
+    private readonly ledger: QueueLedgerService,
   ) {}
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -131,6 +148,7 @@ export class AnchorRenderService {
     const job = await (this.prisma as any).anchorRenderJob.create({
       data: { profileId, status: 'pending' },
     });
+    await this.ledger.enqueue('anchor', job.id);
     this.logger.log(`Anchor enqueue: profile=${profile.profileCode} jobId=${job.id}`);
     return job;
   }
@@ -153,6 +171,7 @@ export class AnchorRenderService {
     const job = await (this.prisma as any).anchorRenderJob.findUnique({ where: { id: jobId } });
     if (!job) throw new NotFoundException(`Anchor job ${jobId} not found`);
     if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') return job;
+    await this.ledger.close('anchor', jobId, { status: 'cancelled', errorMessage: 'cancelled by user' });
     return (this.prisma as any).anchorRenderJob.update({
       where: { id: jobId },
       data:  { status: 'cancelled', completedAt: new Date(), errorMessage: 'cancelled by user' },
@@ -160,16 +179,10 @@ export class AnchorRenderService {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // PUBLIC HOUSEKEEPING — called by PipelineQueueService.tick()
+  // PUBLIC HOUSEKEEPING — called by PipelineQueueService.tick() (polling only;
+  // dispatch order comes from the queue ledger)
   // ─────────────────────────────────────────────────────────────────────────
 
-  /** Returns the oldest pending anchor job (or null). */
-  async findNextPending() {
-    return (this.prisma as any).anchorRenderJob.findFirst({
-      where:   { status: 'pending' },
-      orderBy: { queuedAt: 'asc' },
-    });
-  }
 
   /** Dispatch a pending job to ComfyUI. Sets status=running and comfyPromptId. */
   async dispatchPending(jobId: string): Promise<void> {
@@ -191,12 +204,22 @@ export class AnchorRenderService {
     }
 
     const visualStyle = (project as any).visualStyle ?? 'photoreal_cinematic';
-    // Anchor workflow per visual style. Both share the node layout the patches
-    // below target (2=LoraLoader, 3/4=text, 6=KSampler, 8=SaveImage), so the
-    // same code drives the SDXL and Flux comic anchor graphs.
-    const workflowFilename = visualStyle === 'realcomic_qwen'
+    // Anchor pipeline defaults to the one implied by the visual style, but a
+    // project may pin a different one via settings.anchorPipeline. The live use
+    // case: realcomic_qwen films whose SCENES render on Qwen-Image-Edit-2511
+    // while their character ANCHORS render on Flux — Flux draws a cleaner,
+    // more European, better-composed reference portrait, and Qwen only ever
+    // needs it as an identity reference (it restyles to RealComic itself).
+    const anchorPipeline = normalizeAnchorPipeline((project as any).settings)
+      ?? (visualStyle === 'realcomic_qwen' ? 'qwen'
+        : visualStyle === 'graphic_novel_flux' ? 'flux_comic'
+        : 'sdxl_comic');
+    // Anchor workflow per pipeline. The SDXL and Flux comic graphs share the
+    // node layout the patches below target (2=LoraLoader, 3/4=text, 5=latent,
+    // 6=KSampler, 8=SaveImage); the Qwen graph does not (separate branch).
+    const workflowFilename = anchorPipeline === 'qwen'
       ? 'gen_anchor_portrait_realcomic_qwen_api.json'
-      : visualStyle === 'graphic_novel_flux'
+      : anchorPipeline === 'flux_comic'
         ? 'gen_anchor_portrait_flux_comic_api.json'
         : 'gen_anchor_portrait_graphic_novel_api.json';
     // Per-project workflow wins; fall back to the shared master template so a
@@ -214,7 +237,7 @@ export class AnchorRenderService {
 
     let wf = JSON.parse(readFileSync(workflowPath, 'utf-8')) as Record<string, any>;
 
-    if (visualStyle === 'realcomic_qwen') {
+    if (anchorPipeline === 'qwen') {
       // Qwen graph: different node layout AND the text input on
       // TextEncodeQwenImageEditPlus is named `prompt`, not `text` — the generic
       // patch block below would silently write a stray `.text` key and leave
@@ -251,7 +274,16 @@ export class AnchorRenderService {
     // different comic LoRA via settings.styleLora (the same override scene-render
     // applies), swap it here too — otherwise the character anchors would be drawn
     // with one comic LoRA while the scenes use another (two LoRAs in one project).
-    const styleLora = normalizeStyleLora((project as any).settings);
+    //
+    // EXCEPT when the anchor pipeline was pinned away from the project's own
+    // style: settings.styleLora then belongs to the SCENE base (e.g. a Qwen
+    // LoRA) and must not be loaded into a Flux LoraLoader. Such projects
+    // declare settings.anchorStyleLora for the anchor graph instead.
+    const pipelineMatchesStyle =
+      (visualStyle === 'graphic_novel_flux'  && anchorPipeline === 'flux_comic') ||
+      (visualStyle !== 'graphic_novel_flux'  && visualStyle !== 'realcomic_qwen' && anchorPipeline === 'sdxl_comic');
+    const styleLora = normalizeAnchorStyleLora((project as any).settings)
+      ?? (pipelineMatchesStyle ? normalizeStyleLora((project as any).settings) : null);
     const node2 = wf['2']?.inputs;
     if (styleLora && node2) {
       node2.lora_name = styleLora.name;
@@ -264,9 +296,9 @@ export class AnchorRenderService {
       this.logger.log(`Anchor ${profile.profileCode}: style LoRA override → ${styleLora.name}`);
     }
 
-    // graphic_novel_flux needs the western/realistic anti-anime prefix; the SDXL
+    // The Flux graph needs the western/realistic anti-anime prefix; the SDXL
     // comic prefix ("cell-shaded …") sends Flux portraits to anime.
-    const stylePrefix = visualStyle === 'graphic_novel_flux' ? FLUX_COMIC_STYLE : STYLE_PREFIX;
+    const stylePrefix = anchorPipeline === 'flux_comic' ? FLUX_COMIC_STYLE : STYLE_PREFIX;
     const positive = [stylePrefix, PORTRAIT_COMPOSITION, profile.promptBase].join(', ');
     const negative = (profile.negative && profile.negative.trim().length > 0)
       ? profile.negative
@@ -301,6 +333,7 @@ export class AnchorRenderService {
       where: { id: jobId },
       data:  { status: 'running', comfyPromptId: promptId, startedAt: new Date() },
     });
+    await this.ledger.attachPrompt('anchor', jobId, promptId);
     this.logger.log(`Anchor dispatch: jobId=${jobId} profile=${profileCode} → promptId=${promptId}`);
   }
 
@@ -354,6 +387,7 @@ export class AnchorRenderService {
           where: { id: j.id },
           data:  { status: 'completed', outputPath: candDir, completedAt: new Date() },
         });
+        await this.ledger.close('anchor', j.id, { status: 'completed', outputFilename: candDir });
         // Queue neural validation (runs later in the single-slot pipeline, ComfyUI
         // off). Best-effort: a failure here must NOT fail the render — the
         // candidates are on disk and can be re-validated manually.
@@ -374,6 +408,7 @@ export class AnchorRenderService {
       where: { id: jobId },
       data:  { status: 'failed', errorMessage: msg, completedAt: new Date() },
     });
+    await this.ledger.close('anchor', jobId, { status: 'failed', errorMessage: msg });
     this.logger.warn(`Anchor failed: jobId=${jobId} — ${msg}`);
   }
 

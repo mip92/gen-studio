@@ -2,25 +2,37 @@ import { InlineKeyboard } from 'grammy';
 import type { JobType, QueueFilters, QueueRow, StatusFilter } from './api';
 
 const TYPE_LABEL: Record<JobType, string> = {
-  training:      'train',
-  dataset:       'dataset',
-  scene:         'scene',
-  video:         'video',
-  video_upscale: 'vid-up',
-  tts:           'tts',
-  bgm:           'bgm',
+  training:          'train',
+  dataset:           'dataset',
+  scene:             'scene',
+  video:             'video',
+  video_post:        'fhd+fps',
+  tts:               'tts',
+  bgm:               'bgm',
+  anchor:            'anchor',
+  validation:        'qc-img',
+  anchor_validation: 'qc-anch',
+  caption:           'subs',
 };
 
-const ALL_TYPES: JobType[] = ['training', 'dataset', 'scene', 'video', 'video_upscale', 'tts', 'bgm'];
+const ALL_TYPES: JobType[] = [
+  'training', 'dataset', 'scene', 'video', 'video_post', 'tts',
+  'bgm', 'anchor', 'validation', 'anchor_validation', 'caption',
+];
 
+// Two-letter codes keep callback_data under Telegram's 64-byte cap.
 const TYPE_SHORT_TO_LONG: Record<string, JobType> = {
   tr: 'training',
   ds: 'dataset',
   sc: 'scene',
   vd: 'video',
-  vu: 'video_upscale',
+  vp: 'video_post',
   tt: 'tts',
   bg: 'bgm',
+  an: 'anchor',
+  qi: 'validation',
+  qa: 'anchor_validation',
+  su: 'caption',
 };
 const TYPE_LONG_TO_SHORT: Record<JobType, string> = Object.fromEntries(
   Object.entries(TYPE_SHORT_TO_LONG).map(([k, v]) => [v, k]),
@@ -84,14 +96,11 @@ function ageOf(r: QueueRow, now: number): string {
   return ageShort(r.startedAt ?? r.queuedAt, now);
 }
 
-/** Display target — project / specific subject of the job.
- *  - For training/dataset: project / character profile (profileCode).
- *  - For scene/video/upscale: project / shot code (profileCode).
- *  - For tts/bgm: project / shot or scene (profileCode). */
+/** Display target — project / what the job is working on. `label` is filled for
+ *  every job type by the queue ledger (shot code, music block, profile code…). */
 function fmtTarget(r: QueueRow): string {
   const proj = r.projectSlug || '-';
-  const subj = r.profileCode || r.characterCode || '-';
-  return `${proj} / ${subj}`;
+  return `${proj} / ${r.label || '-'}`;
 }
 
 export function renderQueueText(page: { rows: QueueRow[]; total: number }, f: QueueFilters): string {

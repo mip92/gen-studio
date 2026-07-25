@@ -3,15 +3,22 @@ import { PrismaService } from '../prisma/prisma.service';
 import { ComfyService } from '../comfy/comfy.service';
 import { EngineService } from './engine.service';
 import { PipelineQueueService } from './pipeline-queue.service';
+import { QueueLedgerService } from './queue-ledger.service';
+import { QueueSourceService } from './queue-source.service';
 
 /**
  * Runs once at backend startup:
  *   1. Kill any orphaned kohya processes left from a previous backend instance.
- *   2. Mark zombie jobs (status `running`/`preparing`/`captioning`/`training`)
- *      as `failed` so the queue can move past them. Without this, the FATHER_BASE
- *      9 May incident would repeat: backend restarts mid-captioning, the Python
- *      child dies, the DB row stays at `captioning` forever, queue blocks.
+ *   2. Resolve jobs that were in flight when the process died, so the single
+ *      queue slot is never pinned by a corpse. Without this, the FATHER_BASE
+ *      9 May incident repeats: backend restarts mid-captioning, the Python child
+ *      dies, the row stays `captioning` forever, the queue blocks.
  *   3. Start the unified pipeline worker.
+ *
+ * Step 2 is driven by the queue ledger rather than by a hand-written list of
+ * tables, so it covers every job type — including TTS, BGM, anchor renders and
+ * caption jobs, which previously had no boot recovery at all and could sit at
+ * `running` indefinitely after an unlucky restart.
  */
 @Injectable()
 export class PipelineBootService implements OnModuleInit {
@@ -22,11 +29,13 @@ export class PipelineBootService implements OnModuleInit {
     private readonly engine:   EngineService,
     private readonly comfy:    ComfyService,
     private readonly queue:    PipelineQueueService,
+    private readonly ledger:   QueueLedgerService,
+    private readonly source:   QueueSourceService,
   ) {}
 
   async onModuleInit(): Promise<void> {
     await this.killOrphanedSubprocesses();
-    await this.failZombieJobs();
+    await this.resolveInterruptedJobs();
     this.queue.start();
   }
 
@@ -37,66 +46,82 @@ export class PipelineBootService implements OnModuleInit {
     }
   }
 
-  private async failZombieJobs(): Promise<void> {
+  /**
+   * Decide the fate of every job that was mid-flight at shutdown.
+   *
+   * ComfyUI is a separate process, so a render can genuinely have survived (or
+   * even finished) while the backend was down. Anything ComfyUI still knows
+   * about is left `running` for the normal pollers to harvest; everything else —
+   * in-process work, dead subprocesses, prompts ComfyUI has forgotten — is
+   * failed so the queue can move on.
+   */
+  private async resolveInterruptedJobs(): Promise<void> {
     const reason = 'Backend restarted while job was active — marked failed by boot cleanup';
-    const completedAt = new Date();
+    const running = await this.ledger.byStatus('running');
+    let recovered = 0;
+    let failed    = 0;
 
-    const tr = await this.prisma.trainingJob.updateMany({
-      where: { status: { in: ['preparing', 'captioning', 'training'] } },
-      data:  { status: 'failed', errorMessage: reason, completedAt },
-    });
-    if (tr.count > 0) this.logger.warn(`Boot: failed ${tr.count} zombie training job(s)`);
-
-    const ds = await this.prisma.datasetJob.updateMany({
-      where: { status: 'running' },
-      data:  { status: 'failed', errorMessage: reason, completedAt },
-    });
-    if (ds.count > 0) this.logger.warn(`Boot: failed ${ds.count} zombie dataset job(s)`);
-
-    // Scene jobs are special: ComfyUI may have actually finished the prompt
-    // before we restarted. Don't naively fail them — peek at ComfyUI history;
-    // if the prompt completed with outputs, leave the job at 'running' so the
-    // pipeline tick's pollRunning() picks it up and moves the files normally.
-    // Only fail jobs that ComfyUI never actually produced anything for.
-    const sceneRunning = await this.prisma.sceneRenderJob.findMany({ where: { status: 'running' } });
-    let sceneRecovered = 0;
-    let sceneFailed    = 0;
-    for (const j of sceneRunning) {
-      let comfyHasOutputs = false;
-      if (j.comfyPromptId) {
-        const h = await this.comfy.getHistory(j.comfyPromptId).catch(() => null);
-        comfyHasOutputs = !!h?.status?.completed && Object.values(h.outputs ?? {}).some((o: any) => (o.images?.length ?? 0) > 0);
+    for (const e of running) {
+      if (await this.survivedInComfy(e.comfyPromptId)) {
+        recovered++;
+        continue;
       }
-      if (comfyHasOutputs) {
-        // Leave at 'running' — next tick's pollRunning() will harvest the outputs.
-        sceneRecovered++;
-      } else {
-        await this.prisma.sceneRenderJob.update({
-          where: { id: j.id },
-          data:  { status: 'failed', errorMessage: reason, completedAt },
-        });
-        sceneFailed++;
+      await this.source.fail(e.jobType, e.jobId, reason);
+      await this.ledger.close(e.jobType, e.jobId, { status: 'failed', errorMessage: reason });
+      failed++;
+    }
+
+    if (recovered > 0) this.logger.log(`Boot: ${recovered} job(s) still alive in ComfyUI — left running for the pollers`);
+    if (failed    > 0) this.logger.warn(`Boot: failed ${failed} interrupted job(s)`);
+
+    // Legacy safety net: rows that were left `running` by a build that predates
+    // the ledger have no queue entry to reconcile, so nothing above would ever
+    // free them. Sweep them once here, using the same ComfyUI-survival test.
+    await this.sweepLedgerlessRunningRows(reason);
+  }
+
+  /** True when ComfyUI still has this prompt queued, running, or finished with outputs. */
+  private async survivedInComfy(promptId: string | null): Promise<boolean> {
+    if (!promptId) return false;
+    const placement = await this.comfy.promptPlacement(promptId).catch(() => 'unknown' as const);
+    if (placement === 'running' || placement === 'pending') return true;
+    const h = await this.comfy.getHistory(promptId).catch(() => null);
+    return !!h?.status?.completed;
+  }
+
+  /**
+   * One-time bridge for rows that were mid-flight across the cutover to the
+   * ledger. Any `running` job row without a live queue entry is unreachable by
+   * the reconcile pass, so resolve it here and let the ledger record the outcome.
+   */
+  private async sweepLedgerlessRunningRows(reason: string): Promise<void> {
+    const p = this.prisma as any;
+    const scans: Array<[string, string, Record<string, unknown>]> = [
+      ['scene',             'sceneRenderJob',      { status: 'running' }],
+      ['video',             'videoRender',         { status: 'running' }],
+      ['video_post',        'videoRender',         { upscaleStatus: 'running' }],
+      ['tts',               'tTSJob',              { status: 'running' }],
+      ['bgm',               'audioRenderJob',      { status: 'running' }],
+      ['anchor',            'anchorRenderJob',     { status: 'running' }],
+      ['validation',        'imageValidationJob',  { status: 'running' }],
+      ['anchor_validation', 'anchorValidationJob', { status: 'running' }],
+      ['caption',           'captionJob',          { status: 'running' }],
+      ['dataset',           'datasetJob',          { status: 'running' }],
+      ['training',          'trainingJob',         { status: { in: ['preparing', 'captioning', 'training'] } }],
+    ];
+
+    let swept = 0;
+    for (const [jobType, delegate, where] of scans) {
+      const rows = await p[delegate].findMany({ where }).catch(() => []);
+      for (const row of rows) {
+        if (await this.ledger.findLive(jobType as any, row.id)) continue;  // handled above
+        const promptId = jobType === 'video_post' ? row.upscalePromptId : row.comfyPromptId;
+        if (await this.survivedInComfy(promptId ?? null)) continue;
+        await this.source.fail(jobType as any, row.id, reason);
+        await this.ledger.close(jobType as any, row.id, { status: 'failed', errorMessage: reason });
+        swept++;
       }
     }
-    if (sceneRecovered > 0) this.logger.log(`Boot: ${sceneRecovered} scene job(s) recoverable from ComfyUI history — left running`);
-    if (sceneFailed    > 0) this.logger.warn(`Boot: failed ${sceneFailed} zombie scene render job(s)`);
-
-    // Image-validation runs entirely in-process (Ollama HTTP calls, no external
-    // subprocess to recover). A restart mid-run orphans the row at 'running',
-    // which would jam the single-slot gate forever — fail them so the queue
-    // moves on. They're cheap and idempotent to re-trigger (auto or manual).
-    const val = await (this.prisma as any).imageValidationJob.updateMany({
-      where: { status: 'running' },
-      data:  { status: 'failed', errorMessage: reason, completedAt },
-    });
-    if (val.count > 0) this.logger.warn(`Boot: failed ${val.count} zombie image-validation job(s)`);
-
-    // Anchor-validation: same in-process Ollama pattern — orphaned 'running' rows
-    // jam the single-slot gate, so fail them on boot (cheap to re-trigger).
-    const anchorVal = await (this.prisma as any).anchorValidationJob.updateMany({
-      where: { status: 'running' },
-      data:  { status: 'failed', errorMessage: reason, completedAt },
-    });
-    if (anchorVal.count > 0) this.logger.warn(`Boot: failed ${anchorVal.count} zombie anchor-validation job(s)`);
+    if (swept > 0) this.logger.warn(`Boot: resolved ${swept} pre-ledger running row(s)`);
   }
 }

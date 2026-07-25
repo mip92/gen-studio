@@ -19,6 +19,7 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService } from '../../comfy/comfy.service';
 import { StartVideoInput, VideoRenderParams } from './video-job.types';
 import { stripPromptWeights } from '../scenes/scene-render.service';
+import { QueueLedgerService } from '../../pipeline/queue-ledger.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
@@ -37,11 +38,6 @@ const DISTILL_WORKFLOW_FILENAME = 'video_wan22_i2v_distill_api.json';
 // Allowlist of i2v workflow files the service is permitted to load — guards
 // loadTemplate against a row carrying an unexpected workflowFilename value.
 const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME, DISTILL_WORKFLOW_FILENAME]);
-// FPS interpolation (RIFE/FILM → 2× framerate). Standalone re-smooth path
-// (POST /videos/:id/interpolate) that operates on an already-upscaled FHD clip.
-// The model file (e.g. rife47.pth) must live in ComfyUI's
-// models/frame_interpolation/ — override the JSON default via env.
-const INTERP_WORKFLOW_FILENAME = 'video_fps_interp_api.json';
 // One-pass upscale→RIFE graph: a single ComfyUI prompt saves BOTH the FHD clip
 // and the FPS-interpolated (smooth) clip — one queue job, models load once,
 // nothing to reorder between the two steps, no intermediate mp4 decode. This is
@@ -68,17 +64,23 @@ const DEFAULT_FPS    = 16;
 export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(VideoRenderService.name);
   private poller: NodeJS.Timeout | null = null;
+  /** Guards against a slow poll overlapping the next tick of its own interval. */
+  private polling = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly comfy:  ComfyService,
+    private readonly ledger: QueueLedgerService,
   ) {}
 
   onModuleInit() {
-    this.poller = setInterval(() => this.poll().catch((e) => this.logger.warn(`poll: ${e?.message}`)), POLL_MS);
-    // One-shot sweep of old failed rows from before the auto-delete policy
-    // was added. Best-effort — don't crash the module if the DB is busy.
-    this.sweepFailedRows().catch((e) => this.logger.warn(`sweepFailedRows: ${e?.message}`));
+    this.poller = setInterval(() => void this.safePoll(), POLL_MS);
+    // NOTE: there used to be a boot-time sweep here that hard-deleted every
+    // `status='failed'` VideoRender in the database and reset every failed
+    // upscale/interp lifecycle to null. It ran on EVERY restart, which is why
+    // the video defect rate was unmeasurable: failures were erased before
+    // anyone could count them. Failures are now kept — they stay visible in the
+    // queue and their real elapsed time is billed to the film's waste total.
   }
   onModuleDestroy() {
     if (this.poller) clearInterval(this.poller);
@@ -119,13 +121,21 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     const count = Math.max(1, Math.min(8, input.count ?? 1));
     const workflowFilename = this.resolveWorkflowFilename(input.mode);
 
-    // Create N pending rows. Actual ComfyUI dispatch happens in PipelineQueueService.tick()
-    // which serializes video renders against scene renders, training and dataset jobs.
+    // Create N pending rows and put each in the queue. Actual ComfyUI dispatch
+    // happens in PipelineQueueService.tick(), which serialises every job type
+    // through the single GPU slot in queue order.
     const results = [];
     for (let i = 0; i < count; i++) {
       const seed = (i === 0 && input.seed !== undefined)
         ? input.seed
         : Math.floor(Math.random() * 2 ** 32);
+      const params = {
+        seed,
+        width:  input.width  ?? DEFAULT_WIDTH,
+        height: input.height ?? DEFAULT_HEIGHT,
+        length: input.length ?? DEFAULT_LENGTH,
+        fps:    input.fps    ?? DEFAULT_FPS,
+      };
       const row = await this.prisma.videoRender.create({
         data: {
           shotId:              shot.id,
@@ -133,26 +143,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
           motionPrompt:        input.motionPrompt?.trim() || '',
           status:              'pending',
           workflowFilename:    workflowFilename,
-          params: {
-            seed,
-            width:  input.width  ?? DEFAULT_WIDTH,
-            height: input.height ?? DEFAULT_HEIGHT,
-            length: input.length ?? DEFAULT_LENGTH,
-            fps:    input.fps    ?? DEFAULT_FPS,
-          },
+          params,
         },
       });
+      await this.ledger.enqueue('video', row.id, { workflowFilename, paramsSnapshot: params });
       results.push(row);
     }
     return results;
-  }
-
-  /** Find the oldest pending video render — used by PipelineQueueService for arbitration. */
-  findNextPending() {
-    return this.prisma.videoRender.findFirst({
-      where:   { status: 'pending' },
-      orderBy: { queuedAt: 'asc' },
-    });
   }
 
   /** Dispatch a pending video render to ComfyUI. Called by the pipeline tick. */
@@ -166,17 +163,21 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
 
     // Defence in depth: never render video for a renderMode='static' shot, even
     // if a pending row slipped in before the start() guard existed. Mark it
-    // 'skipped' (a terminal status that nextPending never re-selects and
-    // sweepFailedRows never deletes) so it neither renders nor loops, and NO
-    // file is touched — static shots keep their still PNG as the deliverable.
+    // 'skipped' (a terminal status the queue never re-selects) so it neither
+    // renders nor loops, and NO file is touched — static shots keep their still
+    // PNG as the deliverable.
     if (v.shot.renderMode === 'static') {
+      const why = "shot is renderMode='static'; video generation disabled";
       this.logger.warn(
         `dispatchPending video ${v.id}: shot ${v.shot.shotCode} is renderMode='static' — skipping (no video for static shots)`,
       );
       await this.prisma.videoRender.update({
         where: { id: v.id },
-        data:  { status: 'skipped', errorMessage: "shot is renderMode='static'; video generation disabled" },
+        data:  { status: 'skipped', errorMessage: why },
       });
+      // 'skipped' burned no GPU time, so it is billed to neither side of the
+      // useful/wasted split — but it still has to leave the queue.
+      await this.ledger.close('video', v.id, { status: 'skipped', errorMessage: why });
       return;
     }
 
@@ -184,11 +185,16 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, v.sourceImageFilename,
     );
     if (!existsSync(sourcePath)) {
-      // Source image vanished — no point keeping a doomed row around. The user
-      // asked us to drop failed-video records on the floor instead of leaving
-      // them in the gallery as error stubs.
-      this.logger.warn(`dispatchPending video ${v.id}: source image missing (${sourcePath}) — discarding row`);
-      await this.delete(v.id).catch((e) => this.logger.warn(`auto-delete ${v.id}: ${e?.message}`));
+      // Source image vanished. The row is kept as `failed` (it used to be
+      // hard-deleted, which is how failure history disappeared) — it stays out of
+      // the shot's clip list but remains in the queue with its reason.
+      const why = `Source image missing on disk: ${sourcePath}`;
+      this.logger.warn(`dispatchPending video ${v.id}: ${why} — failing the row`);
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  { status: 'failed', errorMessage: why, completedAt: new Date() },
+      });
+      await this.ledger.close('video', v.id, { status: 'failed', errorMessage: why });
       return;
     }
 
@@ -239,16 +245,30 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         where: { id: v.id },
         data:  { status: 'running', comfyPromptId: promptId, startedAt: new Date() },
       });
+      await this.ledger.attachPrompt('video', v.id, promptId);
     } catch (e: any) {
-      this.logger.error(`dispatchPending video ${v.id} failed — discarding row: ${e?.message}`);
+      const why = `ComfyUI dispatch failed: ${e?.message}`;
+      this.logger.error(`dispatchPending video ${v.id}: ${why}`);
       try { unlinkSync(inputDest); } catch { /* best-effort */ }
-      await this.delete(v.id).catch((err) => this.logger.warn(`auto-delete ${v.id}: ${err?.message}`));
+      await this.prisma.videoRender.update({
+        where: { id: v.id },
+        data:  { status: 'failed', errorMessage: why, completedAt: new Date() },
+      });
+      await this.ledger.close('video', v.id, { status: 'failed', errorMessage: why });
     }
   }
 
+  /**
+   * Clips of a shot, for the shot's video tab.
+   *
+   * Failed, cancelled and skipped renders are deliberately excluded: they are
+   * kept in the database (their time counts towards the film's waste total) and
+   * remain visible with their error in the queue, but a shot's clip list should
+   * only offer material that can actually be used.
+   */
   list(shotId: string) {
     return this.prisma.videoRender.findMany({
-      where:   { shotId },
+      where:   { shotId, status: { notIn: ['failed', 'cancelled', 'skipped'] } },
       orderBy: { queuedAt: 'desc' },
     });
   }
@@ -295,6 +315,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     // Each stage's queue "job" lives on this row (base/upscale/interp status +
     // promptId), so removing the row removes the job — we just stop ComfyUI too.
     await this.cancelInflightComfy(v, `video ${v.id} deleted`);
+
+    // Seal the ledger BEFORE the row and files go away. Both lifecycles on this
+    // row are separate queue entries, so both have to be finalised: whatever
+    // they had already spent is preserved as history, and anything unresolved
+    // becomes waste attributed to a hand-deleted artifact.
+    await this.ledger.finalizeForDeletion('video',      v.id, `video ${v.id} deleted`);
+    await this.ledger.finalizeForDeletion('video_post', v.id, `video ${v.id} deleted`);
 
     const shotDir = path.join(APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode);
     const toRemove = [
@@ -505,12 +532,18 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   // ── Upscale on demand ──────────────────────────────────────────────────────
 
   /**
-   * Queue a 4x-UltraSharp upscale → 1920×1080 pass on a completed video. The
-   * original `outputFilename` (832×480 preview) stays in place; the FHD output
-   * lands in `upscaledFilename`. Idempotent: re-calling on a video that already
-   * has `upscaleStatus = running` or `completed` is a no-op + returns the row.
+   * Queue the post pass on a completed video: ONE ComfyUI prompt that upscales
+   * to 1920×1080 and interpolates the framerate, saving the finished smooth clip.
+   *
+   * There is deliberately no separate "interpolate" job. Upscale and RIFE were
+   * split into two queue jobs before 2026-07-21, which forced ComfyUI to reload
+   * models between them and needed a special-case sticky rule in the dispatcher
+   * to claw the time back. One workflow, one job, one queue entry.
+   *
+   * Idempotent: a no-op while the pass is pending/running, or once it completed —
+   * pass `force` to run it again (that is what a re-interpolate request is now).
    */
-  async upscale(videoId: string) {
+  async upscale(videoId: string, opts: { force?: boolean } = {}) {
     const v = await this.prisma.videoRender.findUnique({
       where:   { id: videoId },
       include: { shot: { include: { project: true } } },
@@ -520,7 +553,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException(`Video ${videoId} is not completed yet`);
     }
     if (v.upscaleStatus === 'running' || v.upscaleStatus === 'pending') return v;
-    if (v.upscaleStatus === 'completed' && v.upscaledFilename) return v;
+    if (v.upscaleStatus === 'completed' && v.upscaledFilename && !opts.force) return v;
 
     const srcMp4 = path.join(
       APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, 'videos', v.outputFilename,
@@ -536,10 +569,10 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     mkdirSync(COMFY_INPUT, { recursive: true });
     copyFileSync(srcMp4, inputDest);
 
-    // Mark pending — PipelineQueueService.tick() will pick this up and dispatch.
-    // upscaleQueuedAt is the FIFO key for the upscale lifecycle; the row's main
-    // `queuedAt` belongs to the original render and is usually stale by now.
-    return this.prisma.videoRender.update({
+    // Mark pending, then queue it. `upscaleQueuedAt` is no longer an ordering
+    // key — queue position lives on the queue entry's rank — so it now records
+    // only what its name says: when the pass was requested.
+    const row = await this.prisma.videoRender.update({
       where: { id: v.id },
       data:  {
         upscaleStatus:       'pending',
@@ -548,20 +581,19 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         upscaleCompletedAt:  null,
         upscaleStartedAt:    null,
         upscalePromptId:     null,
-        // A new FHD pass invalidates any previously-interpolated clip — it was
-        // derived from the old upscale. Wipe the interp lifecycle + smooth file
-        // so the mandatory step re-runs against the fresh FHD output.
+        // A re-run invalidates the previously produced clip. The row forgets the
+        // old attempt, but the queue ledger keeps it as its own history entry, so
+        // the time it consumed is still counted.
         ...this.clearedInterpFields(),
       },
     });
-  }
-
-  /** Oldest video render with upscaleStatus='pending' — for pipeline arbitration. */
-  findNextPendingUpscale() {
-    return this.prisma.videoRender.findFirst({
-      where:   { upscaleStatus: 'pending' },
-      orderBy: { upscaleQueuedAt: 'asc' },
+    await this.ledger.enqueue('video_post', v.id, {
+      workflowFilename: COMBINED_WORKFLOW_FILENAME,
+      paramsSnapshot:   { multiplier: v.interpMultiplier ?? DEFAULT_INTERP_MULTIPLIER, source: v.outputFilename },
+      // A re-run means an earlier attempt's columns were just wiped from the row.
+      historyTruncated: !!opts.force,
     });
+    return row;
   }
 
   /** Dispatch a pending upscale to ComfyUI. Called by the pipeline tick. */
@@ -576,14 +608,12 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     const inputBasename = `upscale_${v.id}.mp4`;
     const inputDest     = path.join(COMFY_INPUT, inputBasename);
     if (!existsSync(inputDest)) {
+      const why = `Pre-staged mp4 vanished from COMFY_INPUT: ${inputDest}`;
       await this.prisma.videoRender.update({
         where: { id: v.id },
-        data:  {
-          upscaleStatus:       'failed',
-          upscaleErrorMessage: `Pre-staged mp4 vanished from COMFY_INPUT: ${inputDest}`,
-          upscaleCompletedAt:  new Date(),
-        },
+        data:  { upscaleStatus: 'failed', upscaleErrorMessage: why, upscaleCompletedAt: new Date() },
       });
+      await this.ledger.close('video_post', v.id, { status: 'failed', errorMessage: why });
       return;
     }
 
@@ -594,14 +624,12 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       // is the only upscale path; a missing combined workflow is a config error.
       const combined = this.loadCombinedTemplate(v.shot.project.slug);
       if (!combined) {
+        const why = `Combined upscale→RIFE workflow missing: data/${v.shot.project.slug}/comfy/${COMBINED_WORKFLOW_FILENAME}`;
         await this.prisma.videoRender.update({
           where: { id: v.id },
-          data:  {
-            upscaleStatus:       'failed',
-            upscaleErrorMessage: `Combined upscale→RIFE workflow missing: data/${v.shot.project.slug}/comfy/${COMBINED_WORKFLOW_FILENAME}`,
-            upscaleCompletedAt:  new Date(),
-          },
+          data:  { upscaleStatus: 'failed', upscaleErrorMessage: why, upscaleCompletedAt: new Date() },
         });
+        await this.ledger.close('video_post', v.id, { status: 'failed', errorMessage: why });
         try { unlinkSync(inputDest); } catch { /* best-effort */ }
         return;
       }
@@ -624,9 +652,15 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
           upscaleErrorMessage: null,
         },
       });
+      await this.ledger.attachPrompt('video_post', v.id, promptId);
     } catch (e: any) {
-      this.logger.error(`dispatchPendingUpscale ${v.id} failed — resetting upscale state: ${e?.message}`);
+      const why = `ComfyUI dispatch failed: ${e?.message}`;
+      this.logger.error(`dispatchPendingUpscale ${v.id}: ${why} — resetting the stage so the button re-offers it`);
       try { unlinkSync(inputDest); } catch { /* best-effort */ }
+      // Close the ledger entry FIRST: it is the permanent record of the failed
+      // attempt, and clearing the row's columns below removes the only other
+      // trace of it (and would leave the entry with nothing to reconcile against).
+      await this.ledger.close('video_post', v.id, { status: 'failed', errorMessage: why });
       await this.prisma.videoRender.update({
         where: { id: v.id },
         data:  this.clearedUpscaleFields(),
@@ -658,150 +692,29 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return wf;
   }
 
-  // ── FPS interpolation on demand (RIFE/FILM → 2× framerate) ───────────────────
+  // ── FPS interpolation ────────────────────────────────────────────────────────
+  //
+  // Interpolation is not a job of its own any more. It is the second half of the
+  // combined post pass (`video_upscale_interp_api.json`), which upscales and
+  // interpolates inside ONE ComfyUI prompt: models load once, there is nothing to
+  // order between the halves, and no intermediate mp4 is encoded and decoded.
+  //
+  // The standalone two-prompt path that used to live here was a rudiment of the
+  // pre-2026-07-21 design. It is gone, together with the dispatcher's
+  // special-case rule that existed only to stop the pair from thrashing ComfyUI's
+  // model cache.
 
   /**
-   * Queue a frame-interpolation pass on the FHD-upscaled clip — doubles the
-   * framerate for smooth playback. MANDATORY step before CapCut export. Can
-   * only run once the upscale has completed: it reads the FHD mp4 from
-   * `videos_fhd/` and writes the smoothed clip to `videos_smooth/`. Idempotent:
-   * re-calling while `interpStatus` is pending/running, or after it completed,
-   * is a no-op + returns the row.
+   * Re-run the post pass for a clip whose smooth output needs regenerating.
+   *
+   * Kept as the entry point behind `POST /videos/:id/interpolate`, but it no
+   * longer queues a separate interpolation: it re-runs the one combined pass,
+   * which is the only way the two steps happen at all.
    */
-  async interpolate(videoId: string, multiplier = DEFAULT_INTERP_MULTIPLIER) {
-    const v = await this.prisma.videoRender.findUnique({
-      where:   { id: videoId },
-      include: { shot: { include: { project: true } } },
-    });
-    if (!v) throw new NotFoundException(`Video ${videoId} not found`);
-    // Hard gate: interpolation operates on the upscaled FHD clip, so the upscale
-    // must be finished first. This is the "only after there's an upscaled video"
-    // invariant — enforced server-side, not just in the UI.
-    if (v.upscaleStatus !== 'completed' || !v.upscaledFilename) {
-      throw new BadRequestException(
-        `Video ${videoId} has no completed FHD upscale yet — interpolation runs on the upscaled clip.`,
-      );
-    }
-    if (v.interpStatus === 'running' || v.interpStatus === 'pending') return v;
-    if (v.interpStatus === 'completed' && v.interpFilename) return v;
-
-    const mult = Math.max(2, Math.min(8, Math.round(multiplier) || DEFAULT_INTERP_MULTIPLIER));
-
-    const srcMp4 = path.join(
-      APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, 'videos_fhd', v.upscaledFilename,
-    );
-    if (!existsSync(srcMp4)) {
-      throw new BadRequestException(`Upscaled mp4 missing on disk: ${srcMp4}`);
-    }
-
-    // Copy the FHD mp4 into COMFY_INPUT immediately so the source survives even
-    // if the user re-upscales or deletes before the pipeline tick dispatches.
-    const inputBasename = `interp_${v.id}.mp4`;
-    const inputDest     = path.join(COMFY_INPUT, inputBasename);
-    mkdirSync(COMFY_INPUT, { recursive: true });
-    copyFileSync(srcMp4, inputDest);
-
-    return this.prisma.videoRender.update({
-      where: { id: v.id },
-      data:  {
-        interpStatus:       'pending',
-        interpMultiplier:   mult,
-        interpQueuedAt:     new Date(),
-        interpErrorMessage: null,
-        interpCompletedAt:  null,
-        interpStartedAt:    null,
-        interpPromptId:     null,
-        interpFilename:     null,
-      },
-    });
+  async interpolate(videoId: string, _multiplier = DEFAULT_INTERP_MULTIPLIER) {
+    return this.upscale(videoId, { force: true });
   }
 
-  /** Oldest video render with interpStatus='pending' — for pipeline arbitration. */
-  findNextPendingInterp() {
-    return this.prisma.videoRender.findFirst({
-      where:   { interpStatus: 'pending' },
-      orderBy: { interpQueuedAt: 'asc' },
-    });
-  }
-
-  /** Dispatch a pending interpolation to ComfyUI. Called by the pipeline tick. */
-  async dispatchPendingInterp(videoId: string): Promise<void> {
-    const v = await this.prisma.videoRender.findUnique({
-      where:   { id: videoId },
-      include: { shot: { include: { project: true } } },
-    });
-    if (!v) throw new Error(`VideoRender ${videoId} not found`);
-    if (v.interpStatus !== 'pending') return;
-
-    const inputBasename = `interp_${v.id}.mp4`;
-    const inputDest     = path.join(COMFY_INPUT, inputBasename);
-    if (!existsSync(inputDest)) {
-      await this.prisma.videoRender.update({
-        where: { id: v.id },
-        data:  {
-          interpStatus:       'failed',
-          interpErrorMessage: `Pre-staged FHD mp4 vanished from COMFY_INPUT: ${inputDest}`,
-          interpCompletedAt:  new Date(),
-        },
-      });
-      return;
-    }
-
-    try {
-      const mult     = v.interpMultiplier ?? DEFAULT_INTERP_MULTIPLIER;
-      // The upscale preserves the render's source fps, so the smoothed output
-      // plays at native speed only when CreateVideo fps = sourceFps × multiplier.
-      const params   = (v.params ?? {}) as { fps?: number };
-      const outFps    = (params.fps ?? DEFAULT_FPS) * mult;
-      const template = this.loadInterpTemplate(v.shot.project.slug);
-      const workflow = this.patchInterp(template, {
-        sourceVideo:    inputBasename,
-        multiplier:     mult,
-        fps:            outFps,
-        filenamePrefix: `video_smooth/${v.shot.shotCode}/${v.id}`,
-      });
-      const { promptId } = await this.comfy.queuePrompt(workflow);
-      await this.prisma.videoRender.update({
-        where: { id: v.id },
-        data:  {
-          interpStatus:       'running',
-          interpPromptId:     promptId,
-          interpStartedAt:    new Date(),
-          interpErrorMessage: null,
-        },
-      });
-    } catch (e: any) {
-      this.logger.error(`dispatchPendingInterp ${v.id} failed — resetting interp state: ${e?.message}`);
-      try { unlinkSync(inputDest); } catch { /* best-effort */ }
-      await this.prisma.videoRender.update({
-        where: { id: v.id },
-        data:  this.clearedInterpFields(),
-      });
-    }
-  }
-
-  private loadInterpTemplate(projectSlug: string): Record<string, any> {
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', INTERP_WORKFLOW_FILENAME);
-    if (!existsSync(filePath)) {
-      throw new NotFoundException(`FPS interpolation workflow not found: ${filePath}`);
-    }
-    return JSON.parse(readFileSync(filePath, 'utf-8'));
-  }
-
-  private patchInterp(template: Record<string, any>, p: {
-    sourceVideo:    string;
-    multiplier:     number;
-    fps:            number;
-    filenamePrefix: string;
-  }): Record<string, any> {
-    const wf = structuredClone(template);
-    if (wf['1']) wf['1'].inputs.file            = p.sourceVideo;          // LoadVideo
-    if (wf['3']) wf['3'].inputs.model_name      = INTERP_MODEL_NAME;       // FrameInterpolationModelLoader
-    if (wf['4']) wf['4'].inputs.multiplier      = p.multiplier;            // FrameInterpolate
-    if (wf['5']) wf['5'].inputs.fps             = p.fps;                   // CreateVideo
-    if (wf['6']) wf['6'].inputs.filename_prefix = p.filenamePrefix;        // SaveVideo
-    return wf;
-  }
 
   /** Absolute path to the smoothed mp4 once `interpStatus=completed`. */
   async interpolatedFilePath(videoId: string): Promise<string> {
@@ -817,10 +730,23 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
 
   // ── Polling ────────────────────────────────────────────────────────────────
 
+  /**
+   * One poll at a time. A pass harvests ComfyUI history and moves mp4s, which
+   * can easily outlast the 4 s interval; without this guard several passes run
+   * concurrently, all see the same finished row, and all harvest it — producing
+   * duplicate file moves and duplicate history records.
+   */
+  private async safePoll(): Promise<void> {
+    if (this.polling) return;
+    this.polling = true;
+    try { await this.poll(); }
+    catch (e: any) { this.logger.warn(`poll: ${e?.message ?? e}`); }
+    finally { this.polling = false; }
+  }
+
   private async poll(): Promise<void> {
     await this.pollMainRenders();
     await this.pollUpscales();
-    await this.pollInterps();
   }
 
   /**
@@ -847,12 +773,14 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       const h = await this.comfy.getHistory(v.comfyPromptId).catch(() => null);
       if (!h?.status?.completed) {
         if (await this.isOrphaned(v.comfyPromptId, v.startedAt)) {
+          const why = 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog';
           this.logger.warn(`video ${v.id}: ComfyUI lost prompt ${v.comfyPromptId} (orphaned) — failing to free the slot`);
           this.cleanupInputCopy(v.id, v.sourceImageFilename);
           await this.prisma.videoRender.update({
             where: { id: v.id },
-            data:  { status: 'failed', completedAt: new Date(), errorMessage: 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog' },
+            data:  { status: 'failed', completedAt: new Date(), errorMessage: why },
           });
+          await this.ledger.close('video', v.id, { status: 'failed', errorMessage: why });
         }
         continue;
       }
@@ -882,16 +810,30 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
               completedAt:    new Date(),
             },
           });
+          await this.ledger.close('video', v.id, { status: 'completed', outputFilename: moved });
         } else {
-          this.logger.warn(`video ${v.id}: ComfyUI history had no video output — discarding row`);
+          // Kept as `failed` instead of hard-deleted: the row is the only trace
+          // that this render was attempted at all, and its elapsed time belongs in
+          // the film's waste total.
+          const why = 'ComfyUI history had no video output';
+          this.logger.warn(`video ${v.id}: ${why} — failing the row`);
           this.cleanupInputCopy(v.id, v.sourceImageFilename);
-          await this.delete(v.id).catch((e) => this.logger.warn(`auto-delete ${v.id}: ${e?.message}`));
+          await this.prisma.videoRender.update({
+            where: { id: v.id },
+            data:  { status: 'failed', completedAt: new Date(), errorMessage: why },
+          });
+          await this.ledger.close('video', v.id, { status: 'failed', errorMessage: why });
           continue;
         }
       } else {
-        this.logger.warn(`video ${v.id}: ComfyUI reported non-success status — discarding row`);
+        const why = `ComfyUI reported non-success status (${h.status.status_str ?? 'unknown'})`;
+        this.logger.warn(`video ${v.id}: ${why} — failing the row`);
         this.cleanupInputCopy(v.id, v.sourceImageFilename);
-        await this.delete(v.id).catch((e) => this.logger.warn(`auto-delete ${v.id}: ${e?.message}`));
+        await this.prisma.videoRender.update({
+          where: { id: v.id },
+          data:  { status: 'failed', completedAt: new Date(), errorMessage: why },
+        });
+        await this.ledger.close('video', v.id, { status: 'failed', errorMessage: why });
         continue;
       }
       this.cleanupInputCopy(v.id, v.sourceImageFilename);
@@ -905,11 +847,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       const h = await this.comfy.getHistory(v.upscalePromptId).catch(() => null);
       if (!h?.status?.completed) {
         if (await this.isOrphaned(v.upscalePromptId, v.upscaleStartedAt)) {
-          this.logger.warn(`upscale ${v.id}: ComfyUI lost prompt ${v.upscalePromptId} (orphaned) — failing to free the slot`);
+          const why = 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog';
+          this.logger.warn(`post ${v.id}: ComfyUI lost prompt ${v.upscalePromptId} (orphaned) — failing to free the slot`);
           await this.prisma.videoRender.update({
             where: { id: v.id },
-            data:  { upscaleStatus: 'failed', upscaleCompletedAt: new Date(), upscaleErrorMessage: 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog' },
+            data:  { upscaleStatus: 'failed', upscaleCompletedAt: new Date(), upscaleErrorMessage: why },
           });
+          await this.ledger.close('video_post', v.id, { status: 'failed', errorMessage: why });
         }
         continue;
       }
@@ -964,9 +908,11 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
                 interpErrorMessage: null,
               },
             });
+            await this.ledger.close('video_post', v.id, { status: 'completed', outputFilename: movedSmooth });
           } else {
-            // Legacy single-step upscale (FHD only, still in flight): record it
-            // and auto-chain the mandatory interpolation so it stays ONE action.
+            // A prompt from before the combined graph existed: it produced only
+            // the FHD clip. Record it and stop — the smooth clip now comes from
+            // re-running the one combined pass, never from a second job.
             await this.prisma.videoRender.update({
               where: { id: v.id },
               data: {
@@ -975,25 +921,27 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
                 upscaleCompletedAt: new Date(),
               },
             });
-            try {
-              await this.interpolate(v.id);
-            } catch (e: any) {
-              this.logger.warn(`auto-queue interp after legacy upscale ${v.id}: ${e?.message}`);
-            }
+            await this.ledger.close('video_post', v.id, { status: 'completed', outputFilename: movedFhd });
+            this.logger.warn(
+              `post ${v.id}: legacy FHD-only output — no smooth clip. Re-run the post pass to produce one.`,
+            );
           }
         } else {
-          // Upscale failed — but the underlying video is fine. Clear all upscale
-          // fields so the row looks "never upscaled" and the UI re-offers the
-          // button. We don't keep failed-upscale stubs around (same policy as
-          // failed video renders).
-          this.logger.warn(`upscale ${v.id}: ComfyUI history had no video output — resetting upscale state`);
+          // The pass produced nothing. The stage's columns are cleared so the UI
+          // re-offers the button, but the attempt itself is preserved in the queue
+          // ledger — that is where its elapsed time is billed.
+          const why = 'ComfyUI history had no video output';
+          this.logger.warn(`post ${v.id}: ${why} — resetting the stage`);
+          await this.ledger.close('video_post', v.id, { status: 'failed', errorMessage: why });
           await this.prisma.videoRender.update({
             where: { id: v.id },
             data:  this.clearedUpscaleFields(),
           });
         }
       } else {
-        this.logger.warn(`upscale ${v.id}: ComfyUI reported non-success status — resetting upscale state`);
+        const why = `ComfyUI reported non-success status (${h.status.status_str ?? 'unknown'})`;
+        this.logger.warn(`post ${v.id}: ${why} — resetting the stage`);
+        await this.ledger.close('video_post', v.id, { status: 'failed', errorMessage: why });
         await this.prisma.videoRender.update({
           where: { id: v.id },
           data:  this.clearedUpscaleFields(),
@@ -1001,90 +949,6 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       }
       this.cleanupUpscaleInputCopy(v.id);
     }
-  }
-
-  private async pollInterps(): Promise<void> {
-    const running = await this.prisma.videoRender.findMany({ where: { interpStatus: 'running' } });
-    for (const v of running) {
-      if (!v.interpPromptId) continue;
-      const h = await this.comfy.getHistory(v.interpPromptId).catch(() => null);
-      if (!h?.status?.completed) {
-        if (await this.isOrphaned(v.interpPromptId, v.interpStartedAt)) {
-          this.logger.warn(`interp ${v.id}: ComfyUI lost prompt ${v.interpPromptId} (orphaned) — failing to free the slot`);
-          await this.prisma.videoRender.update({
-            where: { id: v.id },
-            data:  { interpStatus: 'failed', interpCompletedAt: new Date(), interpErrorMessage: 'ComfyUI lost the prompt (orphaned) — auto-failed by watchdog' },
-          });
-        }
-        continue;
-      }
-
-      const success = h.status.status_str === 'success';
-      if (success) {
-        const outputFile = this.firstVideoOutput(h.outputs);
-        if (outputFile) {
-          let moved: string | null = null;
-          try {
-            moved = await this.moveOutputToShotDir(v.shotId, outputFile, 'videos_smooth');
-          } catch (e: any) {
-            this.logger.warn(`move interpolated video ${v.id}: ${e?.message}`);
-          }
-          if (!moved) {
-            this.logger.warn(`interp ${v.id}: completion seen but file not yet at COMFY_OUTPUT — will retry next tick`);
-            continue;
-          }
-          await this.prisma.videoRender.update({
-            where: { id: v.id },
-            data: {
-              interpStatus:      'completed',
-              interpFilename:    moved,
-              interpCompletedAt: new Date(),
-            },
-          });
-        } else {
-          // Interpolation failed — the underlying FHD clip is fine. Clear all
-          // interp fields so the row looks "never interpolated" and the UI
-          // re-offers the button (same policy as failed upscale).
-          this.logger.warn(`interp ${v.id}: ComfyUI history had no video output — resetting interp state`);
-          await this.prisma.videoRender.update({
-            where: { id: v.id },
-            data:  this.clearedInterpFields(),
-          });
-        }
-      } else {
-        this.logger.warn(`interp ${v.id}: ComfyUI reported non-success status — resetting interp state`);
-        await this.prisma.videoRender.update({
-          where: { id: v.id },
-          data:  this.clearedInterpFields(),
-        });
-      }
-      this.cleanupInterpInputCopy(v.id);
-    }
-  }
-
-  /**
-   * One-shot startup sweep: drop any leftover `status=failed` rows (from before
-   * the auto-delete policy) and reset `upscaleStatus=failed` back to null so
-   * the UI re-offers the upscale button.
-   */
-  private async sweepFailedRows(): Promise<void> {
-    const failed = await this.prisma.videoRender.findMany({ where: { status: 'failed' } });
-    for (const v of failed) {
-      await this.delete(v.id).catch((e) => this.logger.warn(`sweep delete ${v.id}: ${e?.message}`));
-    }
-    if (failed.length > 0) this.logger.log(`sweepFailedRows: deleted ${failed.length} failed video row(s)`);
-
-    const failedUpscales = await this.prisma.videoRender.updateMany({
-      where: { upscaleStatus: 'failed' },
-      data:  this.clearedUpscaleFields(),
-    });
-    if (failedUpscales.count > 0) this.logger.log(`sweepFailedRows: reset ${failedUpscales.count} failed upscale state(s)`);
-
-    const failedInterps = await this.prisma.videoRender.updateMany({
-      where: { interpStatus: 'failed' },
-      data:  this.clearedInterpFields(),
-    });
-    if (failedInterps.count > 0) this.logger.log(`sweepFailedRows: reset ${failedInterps.count} failed interp state(s)`);
   }
 
   private clearedUpscaleFields() {
@@ -1117,10 +981,6 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     try { unlinkSync(file); } catch { /* best-effort */ }
   }
 
-  private cleanupInterpInputCopy(videoId: string): void {
-    const file = path.join(COMFY_INPUT, `interp_${videoId}.mp4`);
-    try { unlinkSync(file); } catch { /* best-effort */ }
-  }
 
   /**
    * ComfyUI's history.outputs is `{ nodeId: { images?: [...], videos?: [...], gifs?: [...] } }`.

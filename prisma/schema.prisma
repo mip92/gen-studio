@@ -93,6 +93,15 @@ model Project {
   /// (no more render/upscale/FPS/TTS nagging — the deliverable already shipped).
   /// Null = still in production. Set/cleared from the project overview page.
   youtubeUrl              String?
+  /// Queue priority tier for "render this film first". 0 = normal. Higher wins,
+  /// evaluated BEFORE QueueEntry.rank, so raising it moves the project's whole
+  /// backlog — present AND future jobs — ahead of every lower-tier project
+  /// without rewriting a single queue row. Ties inside a tier keep their rank
+  /// order, so a project's internal ordering is preserved across a boost.
+  queuePriorityTier       Int          @default(0)
+  /// When the current tier was set. Newest boost wins among equal tiers, so
+  /// "prioritise this one now" beats a project boosted last week.
+  queuePrioritizedAt      DateTime?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1015,6 +1024,151 @@ model CaptionJob {
 
   @@index([status, queuedAt])
   @@map("caption_jobs")
+}
+
+// ─── Unified queue + render ledger ───────────────────────────────────────────
+//
+// ONE row per attempt at ONE unit of GPU/pipeline work, for every job type.
+// It is simultaneously:
+//   (a) the queue — `pending` rows ordered by (project tier, rank) are what the
+//       dispatcher picks from, so "position in the queue" is a real column and
+//       never a mutated timestamp again;
+//   (b) the permanent history — a row goes terminal and is then NEVER updated,
+//       NEVER deleted. Terminal rows accumulate and ARE the render history.
+//
+// It does NOT replace the per-type job tables (scene_render_jobs, video_renders,
+// tts_jobs, …). Those keep holding live ComfyUI polling state (promptId, params,
+// output filenames) and stay the "current state" layer. This table owns ordering
+// and history only, which is why it can be added additively.
+//
+// Deliberately FK-free: every upstream reference is a plain string id plus a
+// denormalized snapshot, exactly like the existing Shot.chosenVideoId /
+// Shot.approvedTTSJobId / MusicSegment.approvedJobId convention. A cascade
+// delete of a shot, scene, project or profile therefore CANNOT reach this table
+// — which is the whole point: the time spent on a deleted shot is still time
+// spent on the film.
+
+model QueueEntry {
+  id            String   @id @default(uuid())
+
+  /// training | dataset | scene | video | video_post | tts | bgm | anchor
+  /// | validation | anchor_validation | caption
+  ///
+  /// `video_post` is the combined one-pass upscale→RIFE job: ONE ComfyUI prompt
+  /// produces both the FHD and the smooth clip. There is deliberately no
+  /// separate `video_interp` type — the two-prompt split was a rudiment of the
+  /// pre-2026-07-21 two-step path.
+  jobType       String
+  /// Id of the row in the type-specific table this entry drives. NOT an FK.
+  /// For `video` and `video_post` this is the same VideoRender.id — the two
+  /// lifecycles on that row are two entries distinguished by jobType.
+  jobId         String
+  /// 1-based attempt counter within (jobType, jobId). Only ever exceeds 1 where
+  /// the source row is REUSED across retries (video_post resets its upscale*
+  /// fields on re-run) — the earlier attempt survives here as its own row even
+  /// though the source row no longer remembers it.
+  attemptNumber Int      @default(1)
+
+  status        String   @default("pending")  // pending | running | completed | failed | cancelled | skipped
+
+  /// Which mutually-exclusive engine this work needs, so the dispatcher can do
+  /// arbitration generically instead of via one method per job type:
+  ///   comfy      → ComfyUI must be alive (scene/video/video_post/bgm/anchor/dataset)
+  ///   ollama     → ComfyUI must be STOPPED, vision model needs the whole card
+  ///   whisper    → ComfyUI must be STOPPED (faster-whisper on GPU)
+  ///   kohya      → ComfyUI must be STOPPED (LoRA training)
+  ///   standalone → no arbitration (TTS python subprocess)
+  engineClass   String
+  /// Batching key: the WORKFLOW/MODEL identity, not the job type. Two entries
+  /// sharing a groupKey can run back-to-back without ComfyUI unloading and
+  /// reloading checkpoints (~30 s vs ~2.5 min), which is why the dispatcher
+  /// prefers to drain a groupKey before switching. Examples:
+  /// "video:video_wan22_i2v_api.json", "video_post", "scene:coffee",
+  /// "tts:qwen3", "ollama:vision", "kohya".
+  groupKey      String
+
+  /// Queue position. Ascending = dispatched earlier. New work appends at
+  /// max+RANK_GAP; reordering rewrites ONLY this column (never queuedAt), and a
+  /// drag to an arbitrary slot takes the midpoint between its new neighbours.
+  /// Float (not Int) so midpoint insertion practically never needs renumbering,
+  /// and (not Decimal) so it crosses the API as a plain JSON number.
+  rank          Float
+
+  // ── Denormalized snapshot: what this work WAS, still readable after every
+  //    upstream row is gone. Captured once at enqueue time.
+  projectId     String?
+  projectSlug   String?
+  projectName   String?
+  sceneId       String?
+  sceneKey      String?
+  shotId        String?
+  shotCode      String?
+  profileId     String?
+  profileCode   String?
+  characterCode String?
+  segmentId     String?
+  blockSlug     String?
+  /// Precomputed human label for the queue/history UI ("SH014B ↑FHD⏩FPS").
+  label         String
+
+  /// Workflow file actually used, when the job type has one. Snapshot — the
+  /// project's comfy/ folder may hold a different version later.
+  workflowFilename String?
+  comfyPromptId    String?
+  /// Basename this attempt produced, if any. Lets a history row still say WHAT
+  /// it made after the artifact and its source row are deleted.
+  outputFilename   String?
+  /// Render parameters at enqueue time (seed/width/height/length/fps, voice,
+  /// engine, …). Snapshot, so a deleted render is still reproducible.
+  paramsSnapshot   Json?
+
+  /// Cost bucket for the film's time accounting. Null while still in flight.
+  ///   useful → this attempt's output is what shipped (or it is necessary
+  ///            infrastructure with no competing candidate: QC, dataset, LoRA)
+  ///   wasted → everything else that consumed time: failures, cancellations,
+  ///            re-renders that lost to a later pick, vision-QC rejections,
+  ///            artifacts the user deleted, work orphaned by a container delete
+  outcome       String?
+  /// WHY it landed in that bucket: chosen | infra | superseded | rejected
+  /// | failed | cancelled | deleted | orphaned | unknown.
+  /// `unknown` is reserved for rows whose linkage genuinely can't be
+  /// reconstructed (see backfilled) — never guessed into useful or wasted.
+  outcomeReason String?
+  /// When outcome was last (re)computed. Terminal-and-classified rows are not
+  /// re-touched; a later edit must not rewrite history that was already true.
+  classifiedAt  DateTime?
+
+  queuedAt      DateTime  @default(now())
+  /// When this entry FIRST became the head of the queue but lost the slot to
+  /// same-groupKey batching. Persisted (not in-memory) so the anti-starvation
+  /// clock survives a backend restart. Cleared once it actually dispatches.
+  firstEligibleAt DateTime?
+  startedAt     DateTime?
+  completedAt   DateTime?
+  /// completedAt − startedAt, written once at close. Precomputed so the film's
+  /// total time is a SUM over an indexed column instead of 38k+ date deltas.
+  durationMs    Int?
+  errorMessage  String?
+
+  /// True = reconstructed by scripts/backfill_queue_entries.ts from the job
+  /// tables rather than recorded live. Its timings are real (they come from the
+  /// source row's startedAt/completedAt); its attemptNumber/groupKey/outcome are
+  /// best-effort reconstructions.
+  backfilled       Boolean  @default(false)
+  /// True where earlier attempts on this source row are known to have existed
+  /// but were destroyed before this ledger did (video_post field resets, and the
+  /// boot sweep that hard-deleted failed video renders). Honesty flag: waste
+  /// totals for such rows are a lower bound, not a fact.
+  historyTruncated Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  @@index([status, rank])
+  @@index([status, engineClass])
+  @@index([jobType, jobId])
+  @@index([jobType, status])
+  @@index([projectId, status])
+  @@index([projectId, outcome])
+  @@map("queue_entries")
 }
 
 /// Visual-style registry. Each row defines a complete style: style-block tokens

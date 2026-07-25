@@ -13,6 +13,9 @@ import { ImageValidationService } from '../validation/image-validation.service';
 import { AnchorValidationService } from '../validation/anchor-validation.service';
 import { YoutubeCaptionsService } from '../youtube/youtube-captions.service';
 import { EngineService } from './engine.service';
+import { QueueLedgerService, QueueEntryRow } from './queue-ledger.service';
+import { QueueSourceService } from './queue-source.service';
+import { needsComfyStopped } from './queue-entry.types';
 
 const POLL_MS = 5_000;
 
@@ -23,23 +26,39 @@ const CAPTIONING_HANG_THRESHOLD_MS = 15 * 60 * 1000;   // 15 min
 const TRAINING_LOG_STALL_MS = 20 * 60 * 1000;          // 20 min
 
 /**
- * Single orchestrator for ALL GPU-using work. Runs one job at a time across
- * dataset_jobs and training_jobs, with engine arbitration:
+ * Single orchestrator for ALL GPU-using work: one job at a time, across every
+ * job type, in one order.
  *
- *   - dataset job → needs ComfyUI alive (user runs it manually)
- *   - training job → kohya needs exclusive GPU; pipeline kills ComfyUI first
+ * Ordering and history both live in `queue_entries` (QueueLedgerService). This
+ * service no longer merges twelve tables in memory to guess the order, and no
+ * longer reorders anything by rewriting timestamps — it asks the ledger which
+ * entry is next, claims the slot atomically, arbitrates the engine, and hands
+ * the work to the owning service.
  *
- * Failure isolation: any failed job is marked `failed` and the queue moves on
- * to the next pending one. Hang detection force-fails jobs whose subprocesses
- * died silently (the FATHER_BASE captioning incident).
+ * Batching: alternating job types makes ComfyUI unload and reload checkpoints on
+ * every single job (~2.5 min instead of ~30 s), so the ledger prefers an entry
+ * sharing the currently-loaded workflow. That preference is bounded by a run cap
+ * and a starvation clock, so a job the user just pulled to the front is delayed
+ * a little, never indefinitely.
+ *
+ * Failure isolation: a failed job is closed as failed and the queue moves on.
+ * Hang detection force-fails jobs whose subprocesses died silently, and the
+ * ledger reconciles itself against the job tables every tick, so a missed
+ * completion costs one tick instead of stalling the line.
  */
 @Injectable()
 export class PipelineQueueService {
   private readonly logger = new Logger(PipelineQueueService.name);
   private worker?: NodeJS.Timeout;
   private ticking = false;
-  /** Last dispatched member of the upscale/interp pair — used for same-workflow batching (see tick). */
-  private lastVideoPostType: 'video_upscale' | 'video_interp' | null = null;
+
+  /**
+   * Same-workflow batching state: which group the last dispatch belonged to and
+   * how many of them have run back-to-back. Purely an optimisation hint — the
+   * authoritative "how long has the head been waiting" clock is persisted on the
+   * entry itself, so a restart cannot grant a group a fresh grace window.
+   */
+  private batch: { lastGroupKey: string | null; runLength: number } = { lastGroupKey: null, runLength: 0 };
 
   constructor(
     private readonly prisma:   PrismaService,
@@ -54,6 +73,8 @@ export class PipelineQueueService {
     private readonly anchorValidation: AnchorValidationService,
     private readonly captions: YoutubeCaptionsService,
     private readonly engine:   EngineService,
+    private readonly ledger:   QueueLedgerService,
+    private readonly source:   QueueSourceService,
   ) {}
 
   start(): void {
@@ -82,336 +103,145 @@ export class PipelineQueueService {
     await this.scenes.pollRunning();
     await this.anchors.pollRunning();
     await this.detectHungJobs();
+    // Bring the ledger back in line with the job tables before reading the slot:
+    // closes entries whose work already finished, releases dead claims, adopts
+    // rows that started outside the queue.
+    await this.ledger.reconcileLive();
 
-    // ── 2. Anything still running? ─────────────────────────────────────────
-    // TTS is included in the activity check so it participates in the same
-    // single-slot serialisation as GPU work — the user's invariant is "all
-    // jobs enter and leave the queue through one path, in FIFO order".
-    const trainingActive = await this.prisma.trainingJob.count({
-      where: { status: { in: ['preparing', 'captioning', 'training'] } },
-    });
-    const datasetActive = await this.prisma.datasetJob.count({
-      where: { status: 'running' },
-    });
-    const sceneActive = await this.prisma.sceneRenderJob.count({
-      where: { status: 'running' },
-    });
-    const videoActive = await this.prisma.videoRender.count({
-      where: { OR: [{ status: 'running' }, { upscaleStatus: 'running' }, { interpStatus: 'running' }] },
-    });
-    const ttsActive = await this.prisma.tTSJob.count({
-      where: { status: 'running' },
-    });
-    const bgmActive = await this.prisma.audioRenderJob.count({
-      where: { status: 'running' },
-    });
-    // Anchor portrait renders share the same single-slot serialisation as
-    // every other GPU job. Cast keeps the build green until Prisma client is
-    // regenerated to know about anchor_render_jobs.
-    const anchorActive = await (this.prisma as any).anchorRenderJob.count({
-      where: { status: 'running' },
-    });
-    // Image-validation (Ollama vision) shares the single GPU slot too — it needs
-    // ComfyUI OFF, so it must never run concurrently with a ComfyUI job.
-    const validationActive = await (this.prisma as any).imageValidationJob.count({
-      where: { status: 'running' },
-    });
-    // Anchor-validation (Ollama vision) shares the same single GPU slot — same
-    // ComfyUI-off arbitration as image-validation.
-    const anchorValidationActive = await (this.prisma as any).anchorValidationJob.count({
-      where: { status: 'running' },
-    });
-    // Caption jobs (faster-whisper transcription) hold the single slot too — CPU
-    // work, but the queue serialises everything, so a transcription pauses renders.
-    const captionActive = await (this.prisma as any).captionJob.count({
-      where: { status: 'running' },
-    });
-    if (trainingActive > 0 || datasetActive > 0 || sceneActive > 0 || videoActive > 0 || ttsActive > 0 || bgmActive > 0 || anchorActive > 0 || validationActive > 0 || anchorValidationActive > 0 || captionActive > 0) return;
+    // ── 2. Is the single slot free? ────────────────────────────────────────
+    // One indexed query, guaranteed by a partial unique index to match at most
+    // one row — this replaces the ten separate per-table `count(running)` calls.
+    if (await this.ledger.running()) return;
 
-    // ── 3. Pick oldest pending across all queues ───────────────────────────
-    const [nextTraining, nextDataset, nextScene, nextVideo, nextUpscale, nextInterp, nextTTS, nextBgm, nextAnchor, nextValidation, nextAnchorValidation, nextCaption] = await Promise.all([
-      this.prisma.trainingJob.findFirst({ where: { status: 'pending' }, orderBy: { queuedAt: 'asc' } }),
-      this.datasets.findNextPending(),
-      this.scenes.findNextPending(),
-      this.videos.findNextPending(),
-      this.videos.findNextPendingUpscale(),
-      this.videos.findNextPendingInterp(),
-      this.tts.findNextPending(),
-      this.bgm.findNextPending(),
-      this.anchors.findNextPending(),
-      this.validation.findNextPending(),
-      this.anchorValidation.findNextPending(),
-      this.captions.findNextPending(),
-    ]);
+    // ── 3. Who's next? ────────────────────────────────────────────────────
+    const winner = await this.ledger.selectNext(this.batch);
+    if (!winner) return;
 
-    type Pick = { type: 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'tts' | 'bgm' | 'anchor' | 'validation' | 'anchor_validation' | 'caption'; id: string; ts: number };
-    const candidates: Pick[] = [];
-    if (nextTraining) candidates.push({ type: 'training', id: nextTraining.id, ts: nextTraining.queuedAt.getTime() });
-    if (nextDataset)  candidates.push({ type: 'dataset',  id: nextDataset.id,  ts: nextDataset.queuedAt.getTime() });
-    if (nextScene)    candidates.push({ type: 'scene',    id: nextScene.id,    ts: nextScene.queuedAt.getTime() });
-    if (nextVideo)    candidates.push({ type: 'video',    id: nextVideo.id,    ts: nextVideo.queuedAt.getTime() });
-    if (nextUpscale)  candidates.push({
-      type: 'video_upscale',
-      id:   nextUpscale.id,
-      // Upscale FIFO uses upscaleQueuedAt — the row's main `queuedAt` is from
-      // the original render and would let stale upscales win every arbitration.
-      // Legacy rows (before the upscaleQueuedAt migration) fall back to it.
-      ts:   (nextUpscale.upscaleQueuedAt ?? nextUpscale.queuedAt).getTime(),
-    });
-    if (nextInterp)   candidates.push({
-      type: 'video_interp',
-      id:   nextInterp.id,
-      // Interp FIFO uses interpQueuedAt — same rationale as upscaleQueuedAt.
-      ts:   (nextInterp.interpQueuedAt ?? nextInterp.queuedAt).getTime(),
-    });
-    if (nextTTS)      candidates.push({ type: 'tts',      id: nextTTS.id,      ts: nextTTS.queuedAt.getTime() });
-    if (nextBgm)      candidates.push({ type: 'bgm',      id: nextBgm.id,      ts: nextBgm.queuedAt.getTime() });
-    if (nextAnchor)   candidates.push({ type: 'anchor',   id: nextAnchor.id,   ts: nextAnchor.queuedAt.getTime() });
-    if (nextValidation) candidates.push({ type: 'validation', id: nextValidation.id, ts: nextValidation.queuedAt.getTime() });
-    if (nextAnchorValidation) candidates.push({ type: 'anchor_validation', id: nextAnchorValidation.id, ts: nextAnchorValidation.queuedAt.getTime() });
-    if (nextCaption) candidates.push({ type: 'caption', id: nextCaption.id, ts: nextCaption.queuedAt.getTime() });
-    if (candidates.length === 0) return;
-
-    candidates.sort((a, b) => a.ts - b.ts);
-    let winner = candidates[0];
-
-    // Same-workflow batching for the upscale/interp pair (user 2026-07-16):
-    // alternating the two graphs makes ComfyUI unload/reload models on EVERY
-    // job (~2.5 min each instead of ~30 s). When the FIFO winner is one of the
-    // pair but the previous dispatch was the other one and that pool still has
-    // work, stay on the previous type until its pool drains — one model swap
-    // per pool instead of one per job. Other job types are unaffected (they
-    // only ever win by being oldest, and we never steal their win).
-    if (
-      (winner.type === 'video_upscale' || winner.type === 'video_interp') &&
-      this.lastVideoPostType &&
-      this.lastVideoPostType !== winner.type
-    ) {
-      const sticky = candidates.find((c) => c.type === this.lastVideoPostType);
-      if (sticky) winner = sticky;
+    // Reserve the slot BEFORE arbitrating engines: starting or stopping ComfyUI
+    // can take up to two minutes, and the slot must not look free meanwhile.
+    if (!await this.ledger.claim(winner.id)) {
+      this.logger.warn(`claim lost for ${winner.jobType}/${winner.jobId} — retrying next tick`);
+      return;
     }
-    if (winner.type === 'video_upscale' || winner.type === 'video_interp') {
-      this.lastVideoPostType = winner.type;
-    }
+    this.noteBatch(winner.groupKey);
 
-    if (winner.type === 'training')           await this.dispatchTraining(winner.id);
-    else if (winner.type === 'dataset')       await this.dispatchDataset(winner.id);
-    else if (winner.type === 'scene')         await this.dispatchScene(winner.id);
-    else if (winner.type === 'video')         await this.dispatchVideo(winner.id);
-    else if (winner.type === 'video_upscale') await this.dispatchVideoUpscale(winner.id);
-    else if (winner.type === 'video_interp')  await this.dispatchVideoInterp(winner.id);
-    else if (winner.type === 'tts')           await this.dispatchTTS(winner.id);
-    else if (winner.type === 'bgm')           await this.dispatchBgm(winner.id);
-    else if (winner.type === 'anchor')        await this.dispatchAnchor(winner.id);
-    else if (winner.type === 'validation')    await this.dispatchValidation(winner.id);
-    else if (winner.type === 'anchor_validation') await this.dispatchAnchorValidation(winner.id);
-    else                                       await this.dispatchCaption(winner.id);
+    if (!await this.prepareEngine(winner)) return;
+    await this.dispatch(winner);
+  }
+
+  /** Track consecutive same-group dispatches so batching can cap its own run. */
+  private noteBatch(groupKey: string): void {
+    this.batch = groupKey === this.batch.lastGroupKey
+      ? { lastGroupKey: groupKey, runLength: this.batch.runLength + 1 }
+      : { lastGroupKey: groupKey, runLength: 1 };
   }
 
   /**
-   * Dispatch a caption job. Whisper runs on CPU, so ComfyUI can stay alive (idle)
-   * — the single-slot guard already prevents any other job from running. Mark
-   * running synchronously so the next tick sees the held slot, then fire the async
-   * transcription+upload (which self-updates the row to completed/failed).
+   * Make the GPU ready for this entry's engine class.
+   *
+   * ComfyUI jobs need it alive (cold start ~30-60 s, auto-started); the vision
+   * model, whisper and kohya need it gone — they cannot share the 16 GB card.
+   * One switch on `engineClass` replaces the eight near-identical dispatch
+   * wrappers this service used to carry.
+   *
+   * Returns false when the engine could not be prepared, having already failed
+   * the job in both its own table and the ledger — the slot is freed and the
+   * queue moves on next tick.
    */
-  private async dispatchCaption(jobId: string): Promise<void> {
-    // Whisper runs on the GPU (float16) — stop ComfyUI first to free VRAM, same
-    // arbitration as validation. The next render auto-restarts ComfyUI.
-    this.logger.log(`Dispatching caption job ${jobId} — stopping ComfyUI to free the GPU for whisper`);
-    try {
-      await this.engine.stopComfy();
-    } catch (e: any) {
-      this.logger.warn(`stopComfy failed (proceeding anyway): ${e.message}`);
+  private async prepareEngine(e: QueueEntryRow): Promise<boolean> {
+    const cls = e.engineClass as any;
+
+    if (cls === 'standalone') return true;   // TTS subprocess: no arbitration
+
+    if (needsComfyStopped(cls)) {
+      this.logger.log(`Dispatching ${e.jobType} ${e.jobId} (${e.label}) — stopping ComfyUI to free the GPU`);
+      try { await this.engine.stopComfy(); }
+      catch (err: any) { this.logger.warn(`stopComfy failed (proceeding anyway): ${err.message}`); }
+      return true;
     }
-    await (this.prisma as any).captionJob.update({
-      where: { id: jobId },
-      data:  { status: 'running', startedAt: new Date() },
-    });
-    void this.captions.run(jobId).catch((e) => {
-      this.logger.error(`caption run ${jobId} threw: ${e?.message ?? e}`);
-    });
-  }
 
-  /**
-   * Dispatch an anchor-validation job. Same OPPOSITE arbitration as image
-   * validation: stop ComfyUI so the whole GPU is free for the Ollama vision
-   * model, mark running synchronously so the next tick sees the held slot, then
-   * fire the async scoring (which self-updates the row to completed/failed).
-   */
-  private async dispatchAnchorValidation(jobId: string): Promise<void> {
-    this.logger.log(`Dispatching anchor validation ${jobId} — stopping ComfyUI first to free the GPU`);
-    try {
-      await this.engine.stopComfy();
-    } catch (e: any) {
-      this.logger.warn(`stopComfy failed (proceeding anyway): ${e.message}`);
-    }
-    await (this.prisma as any).anchorValidationJob.update({
-      where: { id: jobId },
-      data:  { status: 'running', startedAt: new Date() },
-    });
-    void this.anchorValidation.run(jobId).catch((e) => {
-      this.logger.error(`anchor validation run ${jobId} threw: ${e?.message ?? e}`);
-    });
-  }
-
-  /**
-   * Dispatch an image-validation job. OPPOSITE arbitration to ComfyUI jobs:
-   * stop ComfyUI first so the whole GPU is free for the Ollama vision model
-   * (mirrors dispatchTraining). We mark the job `running` synchronously BEFORE
-   * firing the async scoring, so the very next tick sees the held slot and
-   * doesn't double-dispatch. The scoring self-updates the row to completed/failed.
-   */
-  private async dispatchValidation(jobId: string): Promise<void> {
-    this.logger.log(`Dispatching image validation ${jobId} — stopping ComfyUI first to free the GPU`);
-    try {
-      await this.engine.stopComfy();
-    } catch (e: any) {
-      this.logger.warn(`stopComfy failed (proceeding anyway): ${e.message}`);
-    }
-    await (this.prisma as any).imageValidationJob.update({
-      where: { id: jobId },
-      data:  { status: 'running', startedAt: new Date() },
-    });
-    void this.validation.run(jobId).catch((e) => {
-      this.logger.error(`validation run ${jobId} threw: ${e?.message ?? e}`);
-    });
-  }
-
-  /**
-   * Dispatch an anchor portrait render. Auto-starts ComfyUI if needed (cold
-   * start ~30-60s) — same arbitration as scene/dataset/video/bgm jobs.
-   */
-  private async dispatchAnchor(jobId: string): Promise<void> {
-    if (!(await this.ensureComfyAlive('anchor', jobId))) return;
-    this.logger.log(`Dispatching anchor render ${jobId} via ComfyUI`);
-    await this.anchors.dispatchPending(jobId);
-  }
-
-  /**
-   * Dispatch a pending TTS job. Fire-and-forget like training — the python
-   * subprocess updates the row's status, and the next tick observes
-   * `status='running'` to keep the global serialisation slot held.
-   */
-  private async dispatchTTS(jobId: string): Promise<void> {
-    this.logger.log(`Dispatching TTS job ${jobId}`);
-    void this.tts.dispatchPending(jobId).catch((e) => {
-      this.logger.error(`tts dispatchPending ${jobId} threw: ${e?.message ?? e}`);
-    });
-  }
-
-  private async dispatchVideo(videoId: string): Promise<void> {
-    if (!(await this.ensureComfyAlive('video', videoId))) return;
-    this.logger.log(`Dispatching video render ${videoId} via ComfyUI`);
-    await this.videos.dispatchPending(videoId);
-  }
-
-  private async dispatchBgm(jobId: string): Promise<void> {
-    if (!(await this.ensureComfyAlive('bgm', jobId))) return;
-    this.logger.log(`Dispatching BGM (ACE-Step) job ${jobId} via ComfyUI`);
-    await this.bgm.dispatchPending(jobId);
-  }
-
-  private async dispatchVideoUpscale(videoId: string): Promise<void> {
-    if (!(await this.ensureComfyAlive('video_upscale', videoId))) return;
-    this.logger.log(`Dispatching video upscale ${videoId} via ComfyUI`);
-    await this.videos.dispatchPendingUpscale(videoId);
-  }
-
-  private async dispatchVideoInterp(videoId: string): Promise<void> {
-    if (!(await this.ensureComfyAlive('video_interp', videoId))) return;
-    this.logger.log(`Dispatching video FPS interpolation ${videoId} via ComfyUI`);
-    await this.videos.dispatchPendingInterp(videoId);
-  }
-
-  // ── Engine arbitration + dispatch ────────────────────────────────────────
-
-  private async dispatchTraining(jobId: string): Promise<void> {
-    this.logger.log(`Dispatching training job ${jobId} — stopping ComfyUI first`);
-    try {
-      await this.engine.stopComfy();
-    } catch (e: any) {
-      this.logger.warn(`stopComfy failed (proceeding anyway): ${e.message}`);
-    }
-    // runPipeline is long-running and self-managing — it updates its own status.
-    // We fire-and-forget; the next tick will observe status === 'preparing' and
-    // wait for completion.
-    void this.training.runPipeline(jobId).catch((e) => {
-      this.logger.error(`runPipeline ${jobId} threw: ${e?.message ?? e}`);
-    });
-  }
-
-  private async dispatchDataset(jobId: string): Promise<void> {
-    if (!(await this.ensureComfyAlive('dataset', jobId))) return;
-    this.logger.log(`Dispatching dataset job ${jobId} via ComfyUI`);
-    await this.datasets.dispatchPending(jobId);
-  }
-
-  private async dispatchScene(jobId: string): Promise<void> {
-    if (!(await this.ensureComfyAlive('scene', jobId))) return;
-    this.logger.log(`Dispatching scene render job ${jobId} via ComfyUI`);
-    await this.scenes.dispatchPending(jobId);
-  }
-
-  /**
-   * Ensure ComfyUI is alive before dispatching a ComfyUI-dependent job. If it's
-   * down, auto-start it (cold start ~30-60s, we wait up to 2 min). If the
-   * startup fails, mark the calling job as `failed` and return false so the
-   * caller skips dispatch — the next pending pickup happens on the next tick.
-   */
-  private async ensureComfyAlive(
-    jobType: 'dataset' | 'scene' | 'video' | 'video_upscale' | 'video_interp' | 'bgm' | 'anchor',
-    jobId: string,
-  ): Promise<boolean> {
+    // engineClass === 'comfy'
     if (await this.engine.isComfyAlive()) return true;
-    this.logger.log(`${jobType} job ${jobId} needs ComfyUI — auto-starting…`);
-    // Free the vision model's VRAM first — validation and ComfyUI can't both
-    // hold the 16 GB card. Best-effort; no-op if nothing is loaded.
+    this.logger.log(`${e.jobType} ${e.jobId} needs ComfyUI — auto-starting…`);
+    // Free the vision model's VRAM first; ComfyUI and Ollama can't both hold the
+    // card. Best-effort, no-op when nothing is loaded.
     await this.engine.unloadOllama();
     try {
       await this.engine.startComfy();
       return true;
-    } catch (e: any) {
-      this.logger.error(`startComfy failed for ${jobType} ${jobId}: ${e.message}`);
-      const errMsg = `ComfyUI auto-start failed: ${e.message}`;
-      const ts     = new Date();
-      if (jobType === 'dataset') {
-        await this.prisma.datasetJob.update({
-          where: { id: jobId },
-          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
-        });
-      } else if (jobType === 'scene') {
-        await this.prisma.sceneRenderJob.update({
-          where: { id: jobId },
-          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
-        });
-      } else if (jobType === 'video') {
-        await this.prisma.videoRender.update({
-          where: { id: jobId },
-          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
-        });
-      } else if (jobType === 'video_upscale') {
-        await this.prisma.videoRender.update({
-          where: { id: jobId },
-          data:  { upscaleStatus: 'failed', upscaleErrorMessage: errMsg, upscaleCompletedAt: ts },
-        });
-      } else if (jobType === 'video_interp') {
-        await this.prisma.videoRender.update({
-          where: { id: jobId },
-          data:  { interpStatus: 'failed', interpErrorMessage: errMsg, interpCompletedAt: ts },
-        });
-      } else if (jobType === 'anchor') {
-        await (this.prisma as any).anchorRenderJob.update({
-          where: { id: jobId },
-          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
-        });
-      } else {
-        await this.prisma.audioRenderJob.update({
-          where: { id: jobId },
-          data:  { status: 'failed', errorMessage: errMsg, completedAt: ts },
-        });
-      }
+    } catch (err: any) {
+      const msg = `ComfyUI auto-start failed: ${err.message}`;
+      this.logger.error(`startComfy failed for ${e.jobType} ${e.jobId}: ${err.message}`);
+      await this.source.fail(e.jobType, e.jobId, msg);
+      await this.ledger.close(e.jobType, e.jobId, { status: 'failed', errorMessage: msg });
       return false;
     }
+  }
+
+  /**
+   * Hand the claimed work to the service that owns it.
+   *
+   * Long-running, self-managing jobs (training, TTS, the vision passes, caption
+   * transcription) are fired and forgotten: they update their own row, and the
+   * ledger's reconcile pass closes the entry from that row's terminal state.
+   */
+  private async dispatch(e: QueueEntryRow): Promise<void> {
+    this.logger.log(`Dispatching ${e.jobType} ${e.jobId} — ${e.label} [${e.groupKey}]`);
+    try {
+      switch (e.jobType) {
+        case 'training':
+          // runPipeline is long-running and self-managing.
+          void this.training.runPipeline(e.jobId).catch((err) =>
+            this.logger.error(`runPipeline ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
+        case 'dataset':    await this.datasets.dispatchPending(e.jobId); return;
+        case 'scene':      await this.scenes.dispatchPending(e.jobId);   return;
+        case 'video':      await this.videos.dispatchPending(e.jobId);   return;
+        // ONE queue job for the combined upscale→RIFE pass: a single ComfyUI
+        // prompt yields both the FHD and the smooth clip.
+        case 'video_post': await this.videos.dispatchPendingUpscale(e.jobId); return;
+        case 'bgm':        await this.bgm.dispatchPending(e.jobId);      return;
+        case 'anchor':     await this.anchors.dispatchPending(e.jobId);  return;
+        case 'tts':
+          void this.tts.dispatchPending(e.jobId).catch((err) =>
+            this.logger.error(`tts dispatchPending ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
+        case 'validation':
+          await this.markSourceRunning('imageValidationJob', e.jobId);
+          void this.validation.run(e.jobId).catch((err) =>
+            this.logger.error(`validation run ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
+        case 'anchor_validation':
+          await this.markSourceRunning('anchorValidationJob', e.jobId);
+          void this.anchorValidation.run(e.jobId).catch((err) =>
+            this.logger.error(`anchor validation run ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
+        case 'caption':
+          await this.markSourceRunning('captionJob', e.jobId);
+          void this.captions.run(e.jobId).catch((err) =>
+            this.logger.error(`caption run ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
+      }
+    } catch (err: any) {
+      // The owning service normally records its own failure; this catches the
+      // case where dispatch blew up before it could.
+      const msg = `dispatch failed: ${err?.message ?? err}`;
+      this.logger.error(`${e.jobType} ${e.jobId}: ${msg}`);
+      await this.source.fail(e.jobType, e.jobId, msg);
+      await this.ledger.close(e.jobType, e.jobId, { status: 'failed', errorMessage: msg });
+    }
+  }
+
+  /**
+   * Mark a fire-and-forget job's own row `running` before launching it, so the
+   * row and the claimed queue entry agree immediately (the reconcile pass would
+   * otherwise see a running entry over a pending row).
+   */
+  private async markSourceRunning(delegate: string, jobId: string): Promise<void> {
+    await (this.prisma as any)[delegate].update({
+      where: { id: jobId },
+      data:  { status: 'running', startedAt: new Date() },
+    });
   }
 
   // ── Hang detection ───────────────────────────────────────────────────────
@@ -462,6 +292,7 @@ export class PipelineQueueService {
         completedAt:  new Date(),
       },
     });
+    await this.ledger.close('training', jobId, { status: 'failed', errorMessage: reason });
   }
 }
 

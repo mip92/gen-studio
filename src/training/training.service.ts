@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { existsSync, rmSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { DatasetService } from './dataset.service';
 import { TrainerService } from './trainer.service';
 import { EngineService } from '../pipeline/engine.service';
@@ -31,6 +32,7 @@ export class TrainingService {
     private readonly dataset: DatasetService,
     private readonly trainer: TrainerService,
     private readonly engine:  EngineService,
+    private readonly ledger:  QueueLedgerService,
   ) {}
 
   /**
@@ -72,7 +74,7 @@ export class TrainingService {
       networkDim: input.networkDim ?? 32,
     };
 
-    return this.prisma.trainingJob.create({
+    const job = await this.prisma.trainingJob.create({
       data: {
         profileId:    profile.id,
         status:       'pending',
@@ -81,6 +83,8 @@ export class TrainingService {
         progress:     inputSnapshot,
       },
     });
+    await this.ledger.enqueue('training', job.id, { paramsSnapshot: inputSnapshot });
+    return job;
   }
 
   async getJob(id: string) {
@@ -98,6 +102,7 @@ export class TrainingService {
     const job = await this.prisma.trainingJob.findUnique({ where: { id } });
     if (!job) throw new NotFoundException(`Training job ${id} not found`);
     if (['completed','failed','cancelled'].includes(job.status)) return job;
+    await this.ledger.close('training', id, { status: 'cancelled', errorMessage: 'Manually cancelled' });
     return this.prisma.trainingJob.update({
       where: { id },
       data:  {
@@ -199,6 +204,7 @@ export class TrainingService {
     });
     if (!profile) {
       await this.update(jobId, { status: 'failed', errorMessage: 'Profile vanished', completedAt: new Date() });
+      await this.ledger.close('training', jobId, { status: 'failed', errorMessage: 'Profile vanished' });
       return;
     }
 
@@ -291,6 +297,7 @@ export class TrainingService {
         outputLoraPath: handle.outputLora,
         completedAt:    new Date(),
       });
+      await this.ledger.close('training', jobId, { status: 'completed', outputFilename: handle.outputLora });
       this.logger.log(`Training ${jobId} done → ${handle.outputLora}`);
     } catch (err: any) {
       this.logger.error(`Training ${jobId} failed: ${err.message}`);
@@ -300,6 +307,7 @@ export class TrainingService {
         errorMessage: err.message,
         completedAt:  new Date(),
       });
+      await this.ledger.close('training', jobId, { status: 'failed', errorMessage: err.message });
     }
   }
 

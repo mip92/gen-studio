@@ -4,6 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync 
 import * as os from 'os';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 
 const APP_ROOT             = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 const KOHYA_PYTHON         = process.env.KOHYA_PYTHON ?? 'E:\\kohya_ss\\venv\\Scripts\\python.exe';
@@ -43,18 +44,15 @@ export interface AnchorVerdict {
 export class AnchorValidationService {
   private readonly logger = new Logger(AnchorValidationService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ledger: QueueLedgerService,
+  ) {}
 
   private get db(): any { return this.prisma as any; }
 
   // ── Queue-aware API (used by PipelineQueueService) ──────────────────────────
 
-  async findNextPending() {
-    return this.db.anchorValidationJob.findFirst({
-      where:   { status: 'pending' },
-      orderBy: { queuedAt: 'asc' },
-    });
-  }
 
   /** Recent anchor-validation jobs for a profile (newest first) — UI polls this. */
   list(profileId: string) {
@@ -100,7 +98,7 @@ export class AnchorValidationService {
       where: { profileId, status: { in: ['pending', 'running'] } },
     });
     if (inflight > 0) return null;
-    return this.db.anchorValidationJob.create({
+    const job = await this.db.anchorValidationJob.create({
       data: {
         profileId,
         status:         'pending',
@@ -108,6 +106,8 @@ export class AnchorValidationService {
         candidates:     clean as any,
       },
     });
+    await this.ledger.enqueue('anchor_validation', job.id, { paramsSnapshot: { candidates: clean } });
+    return job;
   }
 
   /**
@@ -169,6 +169,7 @@ export class AnchorValidationService {
           completedAt:     new Date(),
         },
       });
+      await this.ledger.close('anchor_validation', jobId, { status: 'completed', outputFilename: winner?.filename ?? null });
       if (winner) {
         this.logger.log(`Anchor validation ${jobId}: picked ${winner.filename} (score ${winner.score}) for ${profile.profileCode} out of ${pool.length}`);
       } else {
@@ -180,6 +181,7 @@ export class AnchorValidationService {
         where: { id: jobId },
         data:  { status: 'failed', errorMessage: String(e?.message ?? e), completedAt: new Date() },
       }).catch(() => {});
+      await this.ledger.close('anchor_validation', jobId, { status: 'failed', errorMessage: String(e?.message ?? e) });
     }
   }
 

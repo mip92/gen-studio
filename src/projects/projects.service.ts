@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { existsSync, readdirSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { UpdateProjectDto } from './dto/update-project.dto';
 
@@ -12,7 +13,10 @@ const COMFY_LORA_ROOT = process.env.COMFY_LORA_ROOT ?? 'E:\\ComfyUI\\models\\lor
 
 @Injectable()
 export class ProjectsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ledger: QueueLedgerService,
+  ) {}
 
   /**
    * List the comic/graphic-novel style LoRAs available on disk
@@ -123,8 +127,18 @@ export class ProjectsService {
     `;
   }
 
+  /**
+   * Delete a project and its whole subtree.
+   *
+   * Same contract as deleting a scene, one level up: interrupt anything still
+   * running for it, then seal its queue entries so the film's spent hours remain
+   * on record. Every entry carries the project id in its snapshot, so this covers
+   * scenes, shots, music and character work in one call — and the records survive
+   * in the ledger, which has no foreign key for the cascade to follow.
+   */
   async remove(id: string) {
     await this.findOne(id);
+    await this.ledger.cancelAndSealUnder({ projectId: id }, `project ${id} deleted`);
     return this.prisma.project.delete({ where: { id } });
   }
 }

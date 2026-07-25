@@ -15,6 +15,7 @@ import { VoiceoversModule } from './voiceovers/voiceovers.module';
 import { BgmModule } from './bgm/bgm.module';
 import { ExportsModule } from './exports/exports.module';
 import { PipelineModule } from './pipeline/pipeline.module';
+import { QueueLedgerModule } from './pipeline/queue-ledger.module';
 import { ActionsModule } from './actions/actions.module';
 import { LocationsModule } from './locations/locations.module';
 import { PropsModule } from './props/props.module';
@@ -25,6 +26,10 @@ import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
     PrismaModule,
+    // Global: the queue/ledger is reached by every job service, the delete paths
+    // and the stats endpoint. Registered here so it exists regardless of which
+    // feature module happens to load first.
+    QueueLedgerModule,
     ProjectsModule,
     CharactersModule,
     ScenesModule,

@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { probeWavDurationMs } from './wav-duration';
 
 const APP_ROOT      = process.env.APP_ROOT      ?? path.resolve(__dirname, '..', '..', '..');
@@ -157,7 +158,10 @@ const MODEL_VOICES: Record<string, readonly string[]> = {
 export class TTSService {
   private readonly logger = new Logger(TTSService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ledger: QueueLedgerService,
+  ) {}
 
   /**
    * Scan .silero_cache/ for .pt model files and return them with their voice
@@ -302,7 +306,7 @@ export class TTSService {
       this.validateCommonInput(input, projectEngine(scene.project));
     const engineCols = await this.resolveEngineColumns(scene.project, input);
 
-    return this.prisma.tTSJob.create({
+    const job = await this.prisma.tTSJob.create({
       data: {
         sceneId: scene.id,
         text,
@@ -315,6 +319,8 @@ export class TTSService {
         ...engineCols,
       },
     });
+    await this.ledger.enqueue('tts', job.id, { paramsSnapshot: { voice, sampleRate, rate, sentencePauseSec, modelFilename, ...engineCols } });
+    return job;
   }
 
   /**
@@ -340,47 +346,7 @@ export class TTSService {
       this.validateCommonInput(input, projectEngine(shot.project));
     const engineCols = await this.resolveEngineColumns(shot.project, input);
 
-    // Queue placement. Single-slot queue: one job runs at a time and the
-    // running job CANNOT be preempted. So "front of queue" = SECOND position —
-    // strictly AFTER the currently-running job, BEFORE every pending job:
-    //   queuedAt = running.queuedAt + 1ms   (running < this < all pending)
-    // If nothing is running, it becomes the next job (1ms-... before the
-    // earliest pending). Default front=false keeps natural FIFO (end).
-    let queuedAt: Date | undefined;
-    if (input.front) {
-      const rows = await this.prisma.$queryRawUnsafe<Array<{ running: Date | null; pending: Date | null }>>(
-        `SELECT
-           (SELECT MAX(q) FROM (
-              SELECT MAX("queuedAt") q FROM tts_jobs           WHERE status='running'
-              UNION ALL SELECT MAX("queuedAt") FROM video_renders      WHERE status='running'
-              UNION ALL SELECT MAX("queuedAt") FROM scene_render_jobs  WHERE status='running'
-              UNION ALL SELECT MAX("queuedAt") FROM dataset_jobs       WHERE status='running'
-              UNION ALL SELECT MAX("queuedAt") FROM training_jobs      WHERE status='running'
-              UNION ALL SELECT MAX("queuedAt") FROM audio_render_jobs  WHERE status='running'
-              UNION ALL SELECT MAX("queuedAt") FROM anchor_render_jobs WHERE status='running'
-           ) r) AS running,
-           (SELECT MIN(q) FROM (
-              SELECT MIN("queuedAt") q FROM tts_jobs           WHERE status='pending'
-              UNION ALL SELECT MIN("queuedAt") FROM video_renders      WHERE status='pending'
-              UNION ALL SELECT MIN("queuedAt") FROM scene_render_jobs  WHERE status='pending'
-              UNION ALL SELECT MIN("queuedAt") FROM dataset_jobs       WHERE status='pending'
-              UNION ALL SELECT MIN("queuedAt") FROM training_jobs      WHERE status='pending'
-              UNION ALL SELECT MIN("queuedAt") FROM audio_render_jobs  WHERE status='pending'
-              UNION ALL SELECT MIN("queuedAt") FROM anchor_render_jobs WHERE status='pending'
-           ) p) AS pending`,
-      );
-      const running = rows?.[0]?.running ? new Date(rows[0].running as unknown as string) : null;
-      const pending = rows?.[0]?.pending ? new Date(rows[0].pending as unknown as string) : null;
-      if (running) {
-        queuedAt = new Date(running.getTime() + 1);          // right behind the running job (2nd)
-      } else if (pending) {
-        queuedAt = new Date(pending.getTime() - 1000);       // nothing running → run next
-      } else {
-        queuedAt = new Date();                               // empty queue
-      }
-    }
-
-    return this.prisma.tTSJob.create({
+    const job = await this.prisma.tTSJob.create({
       data: {
         shotId:  shot.id,
         text,
@@ -390,18 +356,21 @@ export class TTSService {
         sentencePauseSec,
         modelFilename,
         status:  'pending',
-        ...(queuedAt ? { queuedAt } : {}),
         ...engineCols,
       },
     });
+    // Queue placement is the ledger's job now. `input.front` puts the entry ahead
+    // of every pending one — the single slot is non-preemptible, so that is
+    // exactly "next to run". This used to be a hand-copied raw-SQL UNION over
+    // seven tables that had already drifted out of sync with the queue's own
+    // copy of the same rule.
+    await this.ledger.enqueue('tts', job.id, {
+      front:          !!input.front,
+      paramsSnapshot: { voice, sampleRate, rate, sentencePauseSec, modelFilename, ...engineCols },
+    });
+    return job;
   }
 
-  findNextPending() {
-    return this.prisma.tTSJob.findFirst({
-      where:   { status: 'pending' },
-      orderBy: { queuedAt: 'asc' },
-    });
-  }
 
   list(sceneId: string) {
     return this.prisma.tTSJob.findMany({
@@ -785,6 +754,7 @@ export class TTSService {
         errorMessage:   null,
       },
     });
+    await this.ledger.close('tts', job.id, { status: 'completed', outputFilename: outFilename });
     this.logger.log(`TTS job ${job.id} → ${outPath}${durationMs ? ` (${durationMs}ms)` : ''}`);
   }
 
@@ -798,6 +768,7 @@ export class TTSService {
         completedAt:  new Date(),
       },
     });
+    await this.ledger.close('tts', jobId, { status: 'failed', errorMessage: message });
   }
 
   /**
@@ -844,6 +815,10 @@ export class TTSService {
       }
     }
 
+    // Seal the ledger before the row disappears, so the time this take consumed
+    // survives its deletion.
+    await this.ledger.finalizeForDeletion('tts', job.id, `TTS job ${job.id} deleted`);
+
     // Clear owner's approvedTTSJobId if it pointed at this row.
     const ops: any[] = [this.prisma.tTSJob.delete({ where: { id: job.id } })];
     if (job.sceneId) {
@@ -887,6 +862,9 @@ export class TTSService {
           catch (e: any) { this.logger.warn(`purge tts ${t.id}: failed to unlink ${filePath}: ${e?.message}`); }
         }
       }
+    }
+    for (const t of targets) {
+      await this.ledger.finalizeForDeletion('tts', t.id, `TTS purged for scene ${sceneId}`);
     }
     await this.prisma.$transaction([
       this.prisma.scene.updateMany({
@@ -988,7 +966,7 @@ export class TTSService {
         if (job?.status === 'completed') { skipped++; continue; }
       }
 
-      await this.prisma.tTSJob.create({
+      const job = await this.prisma.tTSJob.create({
         data: {
           shotId:           shot.id,
           text,
@@ -1001,6 +979,7 @@ export class TTSService {
           ...engineCols,
         },
       });
+      await this.ledger.enqueue('tts', job.id, { paramsSnapshot: { voice, ...engineCols } });
       queued++;
     }
     return { queued, skipped, total: scene.shots.length };

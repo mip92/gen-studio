@@ -5,6 +5,7 @@ import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService, QueuePromptResult } from '../../comfy/comfy.service';
 import { ImageValidationService } from '../../validation/image-validation.service';
+import { QueueLedgerService } from '../../pipeline/queue-ledger.service';
 import { SceneFactory } from './scene.factory';
 import { SceneStrategy } from './scene-strategy';
 import { SceneJobParams, SceneParticipant } from './scene-job.types';
@@ -99,6 +100,7 @@ export class SceneRenderService {
     private readonly comfy:   ComfyService,
     private readonly scenes:  SceneFactory,
     private readonly validation: ImageValidationService,
+    private readonly ledger: QueueLedgerService,
   ) {}
 
   // ── Queue-aware API (used by PipelineQueueService) ──────────────────────────
@@ -131,13 +133,15 @@ export class SceneRenderService {
     // Strip non-serialisable / control fields (shotId is on the row itself;
     // dryRun + replace don't belong in the persisted render params).
     const { shotId, dryRun: _dryRun, replace: _replace, ...params } = input;
-    return this.prisma.sceneRenderJob.create({
+    const job = await this.prisma.sceneRenderJob.create({
       data: {
         shotId,
         status: 'pending',
         params: params as any,
       },
     });
+    await this.ledger.enqueue('scene', job.id, { paramsSnapshot: params });
+    return job;
   }
 
   /**
@@ -167,13 +171,17 @@ export class SceneRenderService {
       ORDER BY sc."sortOrder", s."shotCode"
     `;
     if (eligible.length === 0) return { enqueued: 0 };
-    await this.prisma.sceneRenderJob.createMany({
-      data: eligible.map((e) => ({
-        shotId: e.id,
-        status: 'pending',
-        params: (opts?.validate === true ? { validate: true } : {}) as any,
-      })),
-    });
+    // One row at a time rather than createMany: every job has to be registered in
+    // the queue, and the queue needs each row's id. A createMany here would insert
+    // rows the dispatcher cannot see at all — it selects work exclusively from the
+    // queue ledger — so the whole batch would sit `pending` forever, silently.
+    const params = (opts?.validate === true ? { validate: true } : {}) as any;
+    for (const e of eligible) {
+      const job = await this.prisma.sceneRenderJob.create({
+        data: { shotId: e.id, status: 'pending', params },
+      });
+      await this.ledger.enqueue('scene', job.id, { paramsSnapshot: params });
+    }
     return { enqueued: eligible.length };
   }
 
@@ -213,12 +221,6 @@ export class SceneRenderService {
     this.logger.log(`wipePreviousRenders: shot ${shot.shotCode} cleared ${list.length} previous render(s)`);
   }
 
-  async findNextPending() {
-    return this.prisma.sceneRenderJob.findFirst({
-      where:   { status: 'pending' },
-      orderBy: { queuedAt: 'asc' },
-    });
-  }
 
   /** Dispatch one pending job: build workflow, submit to ComfyUI, mark running. */
   async dispatchPending(jobId: string): Promise<void> {
@@ -243,12 +245,14 @@ export class SceneRenderService {
           params:        { ...params, _resolvedPositive: result.positive } as any,
         },
       });
+      await this.ledger.attachPrompt('scene', jobId, result.job.promptId);
     } catch (e: any) {
       this.logger.error(`Scene dispatch ${jobId} failed: ${e.message}`);
       await this.prisma.sceneRenderJob.update({
         where: { id: jobId },
         data:  { status: 'failed', errorMessage: e.message, completedAt: new Date() },
       });
+      await this.ledger.close('scene', jobId, { status: 'failed', errorMessage: e.message });
     }
   }
 
@@ -285,13 +289,20 @@ export class SceneRenderService {
             this.logger.warn(`validation enqueue for shot ${j.shotId} failed: ${e?.message ?? e}`));
         }
       }
+      const failure = success && filenames.length > 0
+        ? null
+        : (success ? 'ComfyUI produced no images' : 'ComfyUI reported non-success status');
       await this.prisma.sceneRenderJob.update({
         where: { id: j.id },
         data:  {
-          status:       success ? 'completed' : 'failed',
+          status:       failure ? 'failed' : 'completed',
           completedAt:  new Date(),
-          errorMessage: success ? null : 'ComfyUI reported non-success status',
+          errorMessage: failure,
         },
+      });
+      await this.ledger.close('scene', j.id, {
+        status:       failure ? 'failed' : 'completed',
+        errorMessage: failure,
       });
       // Clear in-flight marker on the shot once we've recorded results.
       await this.prisma.shot.update({
@@ -790,6 +801,7 @@ export class SceneRenderService {
       reduxClipVision: REDUX_CLIP_VISION_NAME,
       anchorImagePaths,
       qwenStyleLora,
+      qwenReferenceLatents: normalizeQwenReferenceLatents((shot.project as any).settings),
     };
 
     const workflow = strategy.buildPrompt(template, params);
@@ -892,7 +904,41 @@ function escapeRegex(s: string): string {
 export function normalizeStyleLora(
   settings: unknown,
 ): { name: string; strengthModel?: number; strengthClip?: number } | null {
-  const s = (settings as { styleLora?: unknown } | null | undefined)?.styleLora;
+  return normalizeLoraSetting(settings, 'styleLora');
+}
+
+/**
+ * Read `project.settings.qwenReferenceLatents` — whether the Qwen encode nodes
+ * keep their `vae` wire, i.e. whether references also travel as near-pixel
+ * `reference_latents` on top of the 384x384 VL semantics. Returns undefined
+ * when unset so each strategy applies its own default (OFF for realcomic_qwen
+ * scenes, ON for the dual-character overlay). Exists as a project setting so
+ * the paste-vs-style trade-off can be A/B'd on one project without a code
+ * change — see QwenGraphSpec.referenceLatents for the full mechanism.
+ */
+export function normalizeQwenReferenceLatents(settings: unknown): boolean | undefined {
+  const v = (settings as { qwenReferenceLatents?: unknown } | null | undefined)?.qwenReferenceLatents;
+  return typeof v === 'boolean' ? v : undefined;
+}
+
+/**
+ * Read `project.settings.anchorStyleLora` — the style LoRA used ONLY by the
+ * anchor-portrait graph. Needed when a project renders its SCENES on one base
+ * (Qwen-Image-Edit-2511 + RealComic) but its character ANCHORS on another
+ * (Flux + a comic LoRA): `styleLora` then holds a Qwen LoRA that would be
+ * garbage in the Flux LoraLoader. Same accepted shapes as styleLora.
+ */
+export function normalizeAnchorStyleLora(
+  settings: unknown,
+): { name: string; strengthModel?: number; strengthClip?: number } | null {
+  return normalizeLoraSetting(settings, 'anchorStyleLora');
+}
+
+function normalizeLoraSetting(
+  settings: unknown,
+  key: 'styleLora' | 'anchorStyleLora',
+): { name: string; strengthModel?: number; strengthClip?: number } | null {
+  const s = (settings as Record<string, unknown> | null | undefined)?.[key];
   if (!s) return null;
   if (typeof s === 'string') {
     return s.trim().length > 0 ? { name: s.trim() } : null;

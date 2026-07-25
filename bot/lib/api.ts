@@ -1,20 +1,37 @@
+/** Mirrors JobType in src/pipeline/queue-entry.types.ts — keep the two in step.
+ *  `video_post` is the combined upscale+RIFE job that replaced the old
+ *  video_upscale/video_interp pair. */
 export type JobType =
-  | 'training' | 'dataset' | 'scene' | 'video' | 'video_upscale' | 'tts' | 'bgm';
+  | 'training' | 'dataset' | 'scene' | 'video' | 'video_post' | 'tts'
+  | 'bgm' | 'anchor' | 'validation' | 'anchor_validation' | 'caption';
 
+/** Mirrors the /pipeline/queue row shape (one row per attempt, from the queue ledger). */
 export interface QueueRow {
   type:           JobType;
-  id:             string;
+  /** Queue entry id — the handle the reorder/cancel endpoints take. */
+  entryId:        string;
+  /** Id of the row in the type-specific table. */
+  jobId:          string;
+  attemptNumber:  number;
   status:         string;
-  profileCode:    string;
-  characterCode:  string;
-  projectSlug:    string;
+  /** What is being worked on (shot code, music block, profile…). */
+  label:          string;
+  /** Where it sits — scene key, character code, or music block. */
+  context:        string | null;
+  projectSlug:    string | null;
   projectId:      string | null;
   shotId:         string | null;
-  triggerToken:   string | null;
+  profileCode:    string | null;
+  /** 1-based place in the pending queue; null unless pending. */
+  position:       number | null;
   queuedAt:       string;
   startedAt:      string | null;
   completedAt:    string | null;
+  /** Real elapsed ms (live while running). */
+  durationMs:     number | null;
   errorMessage:   string | null;
+  /** 'useful' | 'wasted' | null (not decided yet). */
+  outcome:        string | null;
   isFirstPending: boolean;
   isLastPending:  boolean;
 }

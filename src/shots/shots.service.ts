@@ -2,6 +2,7 @@ import { Injectable, Logger, NotFoundException, BadRequestException } from '@nes
 import { existsSync, unlinkSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { CreateShotDto } from './dto/create-shot.dto';
 import { UpdateShotDto } from './dto/update-shot.dto';
 
@@ -53,7 +54,10 @@ const SHOT_FULL_INCLUDE = {
 export class ShotsService {
   private readonly logger = new Logger(ShotsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ledger: QueueLedgerService,
+  ) {}
 
   findAll(projectIdOrSlug: string, sceneId?: string) {
     return this.prisma.shot.findMany({
@@ -201,12 +205,27 @@ export class ShotsService {
 
   async remove(projectIdOrSlug: string, shotId: string) {
     await this.findOne(projectIdOrSlug, shotId);
+    await this.sealBeforeDelete(shotId);
     return this.prisma.shot.delete({ where: { id: shotId } });
   }
 
   async removeById(shotId: string) {
     await this.findById(shotId);
+    await this.sealBeforeDelete(shotId);
     return this.prisma.shot.delete({ where: { id: shotId } });
+  }
+
+  /**
+   * Prepare a shot for deletion: stop any work still running for it and turn its
+   * open queue entries into permanent records.
+   *
+   * Both halves used to be missing. Deleting a shot mid-render left ComfyUI
+   * burning GPU on a render whose row had already cascade-vanished, and the
+   * cascade also erased every trace of the time the shot had consumed — the shot
+   * disappeared from the statistics as if it had been free.
+   */
+  private async sealBeforeDelete(shotId: string): Promise<void> {
+    await this.ledger.cancelAndSealUnder({ shotId }, `shot ${shotId} deleted`);
   }
 
   // ── Rendered candidates / variants ──────────────────────────────────────

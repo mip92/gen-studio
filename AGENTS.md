@@ -310,3 +310,43 @@ If a request says "fix the rendered video", look at:
 If the fix requires touching the engine (the `.json` templates or the
 hardcoded TS defaults), that's a sign the engine is missing a DB-driven
 field — add the field instead of patching the engine.
+
+---
+
+## 13. The queue lives in `queue_entries` — and so does render history
+
+`queue_entries` is BOTH the queue and the permanent per-attempt render history.
+A row is born `pending`, is claimed into `running`, then goes terminal and is
+**never updated or deleted again**. Terminal rows accumulate and ARE the history.
+
+Consequences worth knowing before you touch anything nearby:
+
+- **Creating a job row is not enough.** The dispatcher picks work *only* from
+  `queue_entries` (`QueueLedgerService.selectNext`). Any new code path that
+  inserts a `SceneRenderJob` / `VideoRender` / `TTSJob` / … must also call
+  `ledger.enqueue(jobType, jobId)`, or the job sits `pending` forever with no
+  error anywhere. `createMany` is therefore unusable for job rows — the ledger
+  needs each row's id.
+- **Finishing a job row is not enough either.** Every terminal transition must
+  call `ledger.close(...)`. A missed close only costs one tick (the reconcile
+  pass closes it from the row's own state), but the elapsed time is then measured
+  from the reconcile, not from the real completion.
+- **Queue position is `rank` (a float), never `queuedAt`.** `queuedAt` means only
+  "when the work was requested". Reordering rewrites `rank`; whole-project
+  priority is `Project.queuePriorityTier`, which is sticky — future jobs of that
+  project inherit it.
+- **The ledger has no foreign keys, on purpose.** Deleting a shot, scene or
+  project must NOT erase the record of time spent on it. Delete paths call
+  `ledger.cancelAndSealUnder(scope, reason)` first, which stops in-flight ComfyUI
+  work and seals the open entries.
+- **Two hand-written partial unique indexes** live in
+  `prisma/migrations/20260725_add_queue_entries/migration.sql`:
+  `queue_entries_one_running` (at most one row may be `running` — the single-GPU
+  invariant, enforced by the database) and `queue_entries_one_live_per_job`.
+  Prisma's DSL cannot express partial indexes, so `prisma migrate dev` may offer
+  to drop them as "drift" — **decline, and re-add them to any regenerated
+  migration.** Losing them makes double-dispatch possible again.
+- **Failures are kept.** There used to be a boot sweep that hard-deleted every
+  `status='failed'` VideoRender on every restart, which is why the video defect
+  rate was unmeasurable. Don't reintroduce anything like it: waste statistics are
+  computed from those rows.

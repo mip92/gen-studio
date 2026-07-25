@@ -1,10 +1,14 @@
 import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { CreateSceneDto } from './dto/create-scene.dto';
 
 @Injectable()
 export class ScenesService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ledger: QueueLedgerService,
+  ) {}
 
   findAll(projectIdOrSlug: string) {
     return this.prisma.scene.findMany({
@@ -58,8 +62,18 @@ export class ScenesService {
     return scene;
   }
 
+  /**
+   * Delete a scene and everything under it.
+   *
+   * The cascade removes every shot and every job row beneath them, so before it
+   * fires: stop work that is still running (otherwise ComfyUI keeps rendering for
+   * a scene that no longer exists) and seal the queue entries, so the hours the
+   * scene consumed survive it. Shot-level entries carry the scene id in their
+   * snapshot, so one call covers the whole subtree.
+   */
   async remove(projectIdOrSlug: string, sceneId: string) {
     await this.findOne(projectIdOrSlug, sceneId);
+    await this.ledger.cancelAndSealUnder({ sceneId }, `scene ${sceneId} deleted`);
     return this.prisma.scene.delete({ where: { id: sceneId } });
   }
 }

@@ -17,6 +17,7 @@ import {
 } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { ComfyService } from '../comfy/comfy.service';
 import {
   StartRenderInput,
@@ -46,17 +47,17 @@ const WORKFLOW_FILENAME = 'bgm_acestep_api.json';
 export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(BgmRenderService.name);
   private poller: NodeJS.Timeout | null = null;
+  /** Guards against a slow poll overlapping the next tick of its own interval. */
+  private polling = false;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly comfy:  ComfyService,
+    private readonly ledger: QueueLedgerService,
   ) {}
 
   onModuleInit() {
-    this.poller = setInterval(
-      () => this.poll().catch((e) => this.logger.warn(`poll: ${e?.message}`)),
-      POLL_MS,
-    );
+    this.poller = setInterval(() => void this.safePoll(), POLL_MS);
   }
   onModuleDestroy() {
     if (this.poller) clearInterval(this.poller);
@@ -135,6 +136,7 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
           params:           params as any,
         },
       });
+      await this.ledger.enqueue('bgm', row.id, { workflowFilename: WORKFLOW_FILENAME, paramsSnapshot: params });
       results.push(row);
     }
     return results;
@@ -142,12 +144,6 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
 
   // ── Pipeline queue hooks ──────────────────────────────────────────────────
 
-  findNextPending() {
-    return this.prisma.audioRenderJob.findFirst({
-      where:   { status: 'pending' },
-      orderBy: { queuedAt: 'asc' },
-    });
-  }
 
   /**
    * Dispatch a pending AudioRenderJob to ComfyUI. Called by PipelineQueueService
@@ -182,6 +178,7 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         where: { id: job.id },
         data:  { status: 'running', comfyPromptId: promptId, startedAt: new Date() },
       });
+      await this.ledger.attachPrompt('bgm', job.id, promptId);
     } catch (e: any) {
       this.logger.error(`dispatchPending audio ${job.id} failed: ${e?.message}`);
       await this.fail(job.id, e?.message ?? String(e));
@@ -189,6 +186,15 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
   }
 
   // ── Polling ───────────────────────────────────────────────────────────────
+
+  /** One poll at a time — see the note on VideoRenderService.safePoll. */
+  private async safePoll(): Promise<void> {
+    if (this.polling) return;
+    this.polling = true;
+    try { await this.poll(); }
+    catch (e: any) { this.logger.warn(`poll: ${e?.message ?? e}`); }
+    finally { this.polling = false; }
+  }
 
   private async poll(): Promise<void> {
     const running = await this.prisma.audioRenderJob.findMany({
@@ -231,6 +237,7 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
           errorMessage:   null,
         },
       });
+      await this.ledger.close('bgm', job.id, { status: 'completed', outputFilename: moved });
     }
   }
 
@@ -243,6 +250,7 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         completedAt:  new Date(),
       },
     });
+    await this.ledger.close('bgm', jobId, { status: 'failed', errorMessage: message.slice(0, 4000) });
   }
 
   // ── Workflow patch ────────────────────────────────────────────────────────
@@ -434,6 +442,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         catch (e: any) { this.logger.warn(`delete audio ${jobId}: unlink failed: ${e?.message}`); }
       }
     }
+
+    // Seal the ledger before the row goes, so the render time is still counted.
+    await this.ledger.finalizeForDeletion('bgm', j.id, `audio job ${j.id} deleted`);
 
     await this.prisma.$transaction([
       this.prisma.musicSegment.updateMany({

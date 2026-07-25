@@ -4,6 +4,7 @@ import { createReadStream, existsSync, mkdirSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { google } from 'googleapis';
 import { PrismaService } from '../prisma/prisma.service';
+import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { YoutubeAuthService } from './youtube-auth.service';
 
 const APP_ROOT   = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
@@ -68,6 +69,7 @@ export class YoutubeCaptionsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly auth:   YoutubeAuthService,
+    private readonly ledger: QueueLedgerService,
   ) {}
 
   /** Enqueue a caption job for a project's uploaded video. */
@@ -85,6 +87,7 @@ export class YoutubeCaptionsService {
     const job = await (this.prisma as any).captionJob.create({
       data: { projectId: project.id, videoId, videoPath, language },
     });
+    await this.ledger.enqueue('caption', job.id, { paramsSnapshot: { videoId, videoPath, language } });
     this.logger.log(`Enqueued caption job ${job.id} for video ${videoId}`);
     return this.view(job);
   }
@@ -103,6 +106,7 @@ export class YoutubeCaptionsService {
     const job = await (this.prisma as any).captionJob.create({
       data: { projectId: project.id, videoId: '', videoPath, language },
     });
+    await this.ledger.enqueue('caption', job.id, { paramsSnapshot: { videoPath, language, transcribeOnly: true } });
     this.logger.log(`Enqueued TRANSCRIBE-only caption job ${job.id} for ${videoPath}`);
     return this.view(job);
   }
@@ -132,12 +136,6 @@ export class YoutubeCaptionsService {
     return true;
   }
 
-  /** Oldest pending caption job — consumed by PipelineQueueService.tick(). */
-  findNextPending() {
-    return (this.prisma as any).captionJob.findFirst({
-      where: { status: 'pending' }, orderBy: { queuedAt: 'asc' },
-    });
-  }
 
   /** Latest caption job for a project (for the UI to poll). */
   async latestForProject(idOrSlug: string): Promise<CaptionJobView | null> {
@@ -211,6 +209,7 @@ export class YoutubeCaptionsService {
         where: { id: jobId },
         data:  { status: 'completed', uploaded, srtPath, completedAt: new Date() },
       });
+      await this.ledger.close('caption', jobId, { status: 'completed', outputFilename: srtPath });
       this.logger.log(`Caption job ${jobId} done → SRT ${srtPath}${uploaded ? ` (attached to ${job.videoId})` : ' (transcribe-only)'}`);
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
@@ -219,6 +218,7 @@ export class YoutubeCaptionsService {
         where: { id: jobId },
         data:  { status: 'failed', errorMessage: msg.slice(0, 500), completedAt: new Date() },
       });
+      await this.ledger.close('caption', jobId, { status: 'failed', errorMessage: msg.slice(0, 500) });
     }
   }
 
