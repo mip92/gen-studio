@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { spawn } from 'child_process';
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { shotHoldUs } from './shot-timing';
@@ -935,16 +935,29 @@ export class ExportsService {
     //    goes to a log file; the running flag clears on exit.
     this.buildingComic.add(project.slug);
     const logPath = path.join(outDir, 'comic_build.log');
-    const log = createWriteStream(logPath, { flags: 'w' });
+    // A real file descriptor, not a WriteStream: createWriteStream opens the file
+    // asynchronously, so its `fd` is still null in this tick and spawn rejects it
+    // outright ("The argument 'stdio' is invalid"). openSync gives the child
+    // something it can inherit immediately.
+    const logFd = openSync(logPath, 'w');
     this.logger.log(`Comic export: spawning detached draft build for ${project.slug} (${draftName})`);
-    const proc = spawn(PYTHON_BIN, ['-X', 'utf8', COMIC_EXPORT_SCRIPT, '--manifest', manifestPath], {
-      stdio: ['ignore', log, log],
+    // -u (unbuffered): writing to a file rather than a terminal, python would
+    // otherwise hold its output in a buffer for the whole build, leaving this log
+    // empty exactly while it is being polled for progress.
+    const proc = spawn(PYTHON_BIN, ['-u', '-X', 'utf8', COMIC_EXPORT_SCRIPT, '--manifest', manifestPath], {
+      stdio: ['ignore', logFd, logFd],
       env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      // Genuinely detached: its own process group, so a backend restart during a
+      // build (which can take many minutes) doesn't take the build down with it.
+      // Without this the process was only `unref()`-ed, which merely stops it from
+      // holding the event loop open — it does not survive the parent.
+      detached: true,
     });
     const clear = (code: number | null) => {
       this.buildingComic.delete(project.slug);
       this.logger.log(`Comic build for ${project.slug} finished (exit ${code ?? 'err'})`);
-      try { log.end(); } catch { /* already closed */ }
+      // The child holds its own duplicate of the descriptor; release ours.
+      try { closeSync(logFd); } catch { /* already closed */ }
     };
     proc.on('exit', clear);
     proc.on('error', () => clear(1));
