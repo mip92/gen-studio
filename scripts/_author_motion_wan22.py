@@ -785,6 +785,22 @@ CLAUSES = {
    'A9_SH28': 'wet asphalt spreads through the last grey snow below and the fourth-floor window holds its light',
   },
  },
+ # seller was seeded in the correct shape already — except its five act-opening
+ # shots, which kept an establishing scene description in front of the motion
+ # clause ("the woman scrolls a long chat list on her phone at the kitchen table,
+ # the screen crowded with message rows, THE MESSAGE ROWS SLIDE PAST UNDER HER
+ # THUMB"). The motion was already written; only the re-description is dropped.
+ # Found by the §2 proxy check: the first 45 chars appeared verbatim inside
+ # promptFields.positive.
+ 'seller': {
+  'openers': {
+   'A4_SH01':  'the held sheet tilts beside the screen and her eyes move between it and the laptop',
+   'A7_SH01':  'the mug turns slowly in her hand and the screen light holds steady on the chart',
+   'A9_SH01':  'her eyes travel down the message while her flat hands stay on the table and the screen light holds on them',
+   'A10_SH01': 'the message rows slide past under her thumb and her eyes track down the list',
+   'A11_SH01': 'the fabric feeds under the needle and the finished stack settles beside her',
+  },
+ },
 }
 
 
