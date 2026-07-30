@@ -99,8 +99,9 @@ def main():
     dst=os.path.join(ROOT,"data","trucker","comfy"); c=0
     # style-agnostic video/upscale/bgm workflows from the newest cell-shaded project
     src=os.path.join(ROOT,"data","coffee","comfy")
-    for fn in ("video_wan22_i2v_api.json","video_wan22_i2v_cfg_api.json","video_wan22_i2v_distill_api.json",
-               "video_upscale_interp_api.json","video_fps_interp_api.json","bgm_acestep_api.json"):
+    # distill / fps_interp dropped 2026-07-30 — see _seed_car_flipper_foundation.py.
+    for fn in ("video_wan22_i2v_api.json","video_wan22_i2v_cfg_api.json",
+               "video_upscale_interp_api.json","bgm_acestep_api.json"):
         p=os.path.join(src,fn)
         if os.path.exists(p): shutil.copyfile(p,os.path.join(dst,fn)); c+=1
     # the Qwen scene + anchor graphs from the shared master templates

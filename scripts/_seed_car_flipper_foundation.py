@@ -242,8 +242,11 @@ def main():
     dst = os.path.join(ROOT, "data", SLUG, "comfy")
     c = 0
     src = os.path.join(ROOT, "data", "trucker", "comfy")
-    for fn in ("video_wan22_i2v_api.json", "video_wan22_i2v_cfg_api.json", "video_wan22_i2v_distill_api.json",
-               "video_upscale_interp_api.json", "video_fps_interp_api.json", "bgm_acestep_api.json"):
+    # distill / fps_interp dropped 2026-07-30: the first was byte-identical to
+    # the fast default and never loaded, the second was superseded by the
+    # one-pass video_upscale_interp_api.json.
+    for fn in ("video_wan22_i2v_api.json", "video_wan22_i2v_cfg_api.json",
+               "video_upscale_interp_api.json", "bgm_acestep_api.json"):
         p = os.path.join(src, fn)
         if os.path.exists(p):
             shutil.copyfile(p, os.path.join(dst, fn)); c += 1

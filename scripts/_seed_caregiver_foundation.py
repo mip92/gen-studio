@@ -214,8 +214,9 @@ def main():
     dst = os.path.join(ROOT, "data", SLUG, "comfy")
     c = 0
     src = os.path.join(ROOT, "data", "car_flipper", "comfy")
-    for fn in ("video_wan22_i2v_api.json", "video_wan22_i2v_cfg_api.json", "video_wan22_i2v_distill_api.json",
-               "video_upscale_interp_api.json", "video_fps_interp_api.json", "bgm_acestep_api.json",
+    # distill / fps_interp dropped 2026-07-30 — see _seed_car_flipper_foundation.py.
+    for fn in ("video_wan22_i2v_api.json", "video_wan22_i2v_cfg_api.json",
+               "video_upscale_interp_api.json", "bgm_acestep_api.json",
                "scene_realcomic_qwen_api.json", "gen_anchor_portrait_flux_comic_api.json"):
         p = os.path.join(src, fn)
         if os.path.exists(p):

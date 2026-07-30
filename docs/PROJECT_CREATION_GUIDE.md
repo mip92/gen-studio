@@ -267,8 +267,8 @@ data/<slug>/
 │   ├── scene_single_character_hires_api.json
 │   ├── scene_single_character_ipadapter_api.json  (создать на основе)
 │   ├── video_wan22_i2v_api.json
+│   ├── video_wan22_i2v_cfg_api.json    (mode='cfg', негатив работает)
 │   ├── video_upscale_interp_api.json   (one-pass upscale→RIFE, обязателен)
-│   ├── video_fps_interp_api.json       (standalone re-smooth)
 │   └── bgm_acestep_api.json
 ├── datasets/               ← LoRA training images
 │   ├── CONDUCTOR_BASE/

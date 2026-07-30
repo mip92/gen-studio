@@ -17,7 +17,7 @@ import {
 import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService } from '../../comfy/comfy.service';
-import { StartVideoInput, VideoRenderParams } from './video-job.types';
+import { StartVideoInput } from './video-job.types';
 import { stripPromptWeights } from '../scenes/scene-render.service';
 import { QueueLedgerService } from '../../pipeline/queue-ledger.service';
 
@@ -27,18 +27,28 @@ const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 const POLL_MS      = 4000;
 const WORKFLOW_FILENAME = 'video_wan22_i2v_api.json';
 // Alternative "quality" i2v workflow: full Wan2.2 dual-expert, no lightx2v
-// speed LoRA, 20 steps @ cfg=4.0 → the negative prompt actually fires. ~5×
-// slower than the fast 4-step default. Selected via StartVideoInput.mode='cfg'.
+// speed LoRA, 20 steps @ cfg=4.0 → the negative prompt actually fires.
+// MEASURED on 6 208 completed renders (2026-07-30): median 980 s against the
+// fast path's 150 s, i.e. **6.5× slower**, not the ~5× this comment used to
+// claim. Selected via StartVideoInput.mode='cfg'.
 const CFG_WORKFLOW_FILENAME = 'video_wan22_i2v_cfg_api.json';
-// Legacy: the old mode='distill' pointed here. The mode was removed 2026-07-30
-// (this JSON was byte-identical to the fast default, it was never exposed in the
-// UI, and no render ever used it — the fast default already loads the
-// full-distill fp8 checkpoints). The filename stays in the allowlist below ONLY
-// so any historical row that carries it can still be reloaded.
-const DISTILL_WORKFLOW_FILENAME = 'video_wan22_i2v_distill_api.json';
+// «страж» — the fast graph with cfg raised on the HIGH-NOISE sampler only
+// (node 14, steps 0→2 @ cfg 2.5); node 15 stays at cfg 1.0. In an A14B MoE the
+// high-noise expert decides composition — what exists in the frame and where —
+// so this is the one pass on which a negative prompt can stop a figure walking
+// into an empty shot, and it is the cheapest place to pay for it: 6 model
+// passes instead of 4 (~196 s vs 150 s) against the cfg path's 40 (980 s).
+// Byte-identical to the fast default apart from node 14's cfg and node 10's
+// fallback negative, so an A/B isolates cfg as the only variable.
+const GUARD_WORKFLOW_FILENAME = 'video_wan22_i2v_guard_api.json';
 // Allowlist of i2v workflow files the service is permitted to load — guards
 // loadTemplate against a row carrying an unexpected workflowFilename value.
-const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME, DISTILL_WORKFLOW_FILENAME]);
+// `video_wan22_i2v_distill_api.json` was dropped from this set (and deleted from
+// every project) 2026-07-30: it was byte-identical to the fast default, its
+// mode was already gone from the API, and 0 of 6 945 render rows ever carried
+// the filename. A row with an unknown name falls back to the fast default in
+// loadTemplate anyway, so nothing can break by removing it.
+const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME, GUARD_WORKFLOW_FILENAME]);
 // One-pass upscale→RIFE graph: a single ComfyUI prompt saves BOTH the FHD clip
 // and the FPS-interpolated (smooth) clip — one queue job, models load once,
 // nothing to reorder between the two steps, no intermediate mp4 decode. This is
@@ -439,20 +449,33 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   // ── Workflow loading + patching ────────────────────────────────────────────
 
   /**
-   * Resolve the i2v workflow file — a BINARY, explicit per-shot choice:
-   *   'cfg'        → cfg workflow (20 steps, cfg=4, negative fires) = «качество».
-   *   else / fast  → fast workflow (4-step lightx2v full-distill fp8, cfg=1,
-   *                  negative ignored) = «быстро», the DEFAULT.
-   * cfg is ~5× slower, so it is ONLY ever used when the user explicitly picks it
-   * per shot. There is NO 'auto' — the old auto silently routed comic/static or
-   * motionNegative shots to cfg and quietly 5×'d render time (every shot here
-   * has a baked motionNegative). The former 'distill' mode was removed
-   * 2026-07-30 (see StartVideoInput.mode). Engine family (Wan/Flux/SDXL) is
-   * decided once per project via project.visualStyle, not here.
+   * Resolve the i2v workflow file — an explicit per-shot choice, never inferred:
+   *   'cfg'          → 20 steps @ cfg 4 on both experts, 40 passes = «качество».
+   *   'fast'         → 4-step lightx2v full-distill fp8, cfg=1 on both, 4
+   *                    passes, the negative is never evaluated = «быстро».
+   *   'guard' / none → cfg 2.5 on the high-noise expert only, 6 passes = «страж»,
+   *                    the DEFAULT since 2026-07-30.
+   *
+   * The default moved off 'fast' on the user's call: at cfg=1 ComfyUI does not
+   * evaluate the uncond branch at all, so `motionNegative` — baked on every shot
+   * in the corpus — was dead weight, and figures kept walking into frames that
+   * were supposed to stay empty. 'guard' turns the negative on for exactly the
+   * two steps where an A14B MoE decides composition, for +31 % (~196 s vs the
+   * measured 150 s) rather than the 6.5× that 'cfg' costs.
+   *
+   * The fallback matters as much as the select: `POST shots/:id/videos` is the
+   * ONLY way a video is ever queued, and every scripted bulk enqueue omits
+   * `mode`. Leaving the fallback on 'fast' would have meant the UI said «страж»
+   * while a mass re-render quietly ran without it.
+   *
+   * There is still NO 'auto' — the old auto INFERRED the slow path from shot
+   * properties and silently multiplied render time. This is a fixed default the
+   * user chose, overridable per render, not an inference.
    */
-  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | undefined): string {
-    if (mode === 'cfg') return CFG_WORKFLOW_FILENAME;
-    return WORKFLOW_FILENAME;
+  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | 'guard' | undefined): string {
+    if (mode === 'cfg')  return CFG_WORKFLOW_FILENAME;
+    if (mode === 'fast') return WORKFLOW_FILENAME;
+    return GUARD_WORKFLOW_FILENAME;
   }
 
   private loadTemplate(projectSlug: string, workflowFilename?: string | null): Record<string, any> {
