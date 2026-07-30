@@ -60,7 +60,7 @@ import time
 import uuid
 import wave
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import pyJianYingDraft as draft
 
@@ -150,6 +150,13 @@ _SRT_MAX_CHARS = 84   # ≈ two 42-char lines; longer cues get split by words
 # parked at transform_y ≈ -0.737 (half-canvas units, negative = lower third).
 _SUB_FONT_SIZE      = 5.0     # CapCut's own recognised-caption default size
 _SUB_TRANSFORM_Y    = -0.7368493150684934
+# VERTICAL (9:16) exports park the captions HIGHER. On a Shorts player the bottom
+# strip is covered by YouTube's own chrome — title, channel, description, the
+# like/comment/share rail — so a caption in the usual lower third is partly hidden
+# (user 2026-07-26). Measured off the short the user re-positioned by hand
+# (kept_woman_short_hook): y = -0.404 puts the line at ~70% of frame height,
+# 572 px above the bottom of a 1080×1920 frame, clear of the UI.
+_SUB_TRANSFORM_Y_VERTICAL = -0.40443173265091104
 _SUB_STROKE_WIDTH   = 0.06
 _SUB_MAX_LINE_WIDTH = 0.82
 
@@ -335,11 +342,13 @@ def _build_subtitle_material(mat_id: str, text: str, dur_us: int,
 
 
 def _build_subtitle_segment(seg_id: str, mat_id: str, anim_id: str,
-                            start_us: int, dur_us: int, render_index: int) -> Dict[str, Any]:
+                            start_us: int, dur_us: int, render_index: int,
+                            transform_y: float = _SUB_TRANSFORM_Y) -> Dict[str, Any]:
     """One subtitle segment: links its text material + its sticker_animation
-    placeholder (`extra_material_refs`), positions the caption in the lower
-    third (`clip.transform.y`), and carries the render-layer bookkeeping CapCut
-    expects. Mirrors a real recognised-subtitle segment."""
+    placeholder (`extra_material_refs`), positions the caption vertically
+    (`clip.transform.y` — see the two _SUB_TRANSFORM_Y* constants; vertical
+    exports sit higher to clear the Shorts UI), and carries the render-layer
+    bookkeeping CapCut expects. Mirrors a real recognised-subtitle segment."""
     return {
         "id":               seg_id,
         "material_id":      mat_id,
@@ -353,7 +362,7 @@ def _build_subtitle_segment(seg_id: str, mat_id: str, anim_id: str,
         "clip": {
             "scale":     {"x": 1.0, "y": 1.0},
             "rotation":  0.0,
-            "transform": {"x": 0.0, "y": _SUB_TRANSFORM_Y},
+            "transform": {"x": 0.0, "y": float(transform_y)},
             "flip":      {"vertical": False, "horizontal": False},
             "alpha":     1.0,
         },
@@ -402,6 +411,13 @@ def _inject_subtitles(data: Dict[str, Any], cues: List[tuple],
     tracks    = data.setdefault("tracks", [])
     font_path = _resolve_capcut_font(drafts_root)
 
+    # Portrait canvas → this is a Short, so lift the captions clear of YouTube's
+    # bottom chrome. Keyed off the canvas rather than a flag, so every 9:16 export
+    # (shorts today, anything vertical later) gets it without a caller opting in.
+    cc = data.get("canvas_config") or {}
+    vertical = int(cc.get("height") or 0) > int(cc.get("width") or 0)
+    sub_y = _SUB_TRANSFORM_Y_VERTICAL if vertical else _SUB_TRANSFORM_Y
+
     # render_index must be unique + high; continue above the max already used
     # by video/text segments so we never collide with an existing layer.
     max_ri = 0
@@ -419,7 +435,7 @@ def _inject_subtitles(data: Dict[str, Any], cues: List[tuple],
         texts.append(_build_subtitle_material(mat_id, text, dur, group_id, font_path))
         anims.append({"id": anim_id, "type": "sticker_animation",
                       "animations": [], "multi_language_current": "none"})
-        segments.append(_build_subtitle_segment(seg_id, mat_id, anim_id, start_us, dur, ri))
+        segments.append(_build_subtitle_segment(seg_id, mat_id, anim_id, start_us, dur, ri, sub_y))
         ri += 1
 
     tracks.append({
@@ -444,6 +460,51 @@ def _inject_subtitles(data: Dict[str, Any], cues: List[tuple],
 # export_shorts.py; absent on full-film exports → no-op). The pink text effect
 # must sit in CapCut's local effect cache (it does — the user applied it by
 # hand); if the cache entry ever disappears we inject plain white text and log.
+# ── channel-badge look pool ───────────────────────────────────────────────────
+# The badge used to wear one style for the whole short. It now changes PER SCENE,
+# in place, so the corner does not read as a static sticker (user 2026-07-26).
+#
+# Every id below is verified against this machine: the styles were picked by
+# parsing the pink/magenta/violet fills out of `effectStyle.json` in CapCut's
+# effect cache, and the animations were harvested from drafts the user actually
+# built — that is the only place CapCut records an animation's DIRECTION, and an
+# exit animation used as an entrance looks broken. All nine here are `in`.
+# Anything missing from the cache is skipped at export time (`_capcut_effect_path`
+# returns None), so a stale id degrades to the next combo, never to a broken draft.
+_A_BUTTERFLY = ('7546305306863734032', 'Двойник из бабочек',      500_000)
+_A_CANDY     = ('7545198366834134288', 'Конфетные пузырьки',      500_000)
+_A_ATOM_UNI  = ('7576926250011364625', 'Атомная Вселенная',       500_000)
+_A_ATOM_FIRE = ('7566796892605123856', 'Атомное пламя',           500_000)
+_A_HEAT      = ('7648860835493727508', 'Бесконечный жар',         500_000)
+_A_SPLASH    = ('7563868550243355921', 'Всплеск воды',            266_666)
+_A_TYPING    = ('7586920364429593857', 'Диссонансное печатание',  500_000)
+_A_SMOKE     = ('7648860705390611720', 'Дымовой рывок',           500_000)
+_A_SPARKLE   = ('7648858257955507476', 'Сверкающий поток',        500_000)
+
+# (style_resource_id, style_name, animation)
+_OVERLAY_COMBOS: List[Tuple[str, str, Tuple[str, str, int]]] = [
+    ('7592575945140309253', '粉色爱心巧克力',                        _A_BUTTERFLY),
+    ('7573273105431317813', 'ART Neon EN Pink',                      _A_CANDY),
+    ('7592604085279264053', 'розовый #f35592',                       _A_SPARKLE),
+    ('7336837895367462150', '紫粉渐变上现蓝光',                       _A_ATOM_UNI),
+    ('7516719077642079549', 'пудровый #febbe7',                      _A_SPLASH),
+    ('7583659592408747269', 'Pixel Art Text NEON POP',                _A_TYPING),
+    ('7660466147334130958', 'розовый #ff66a9',                       _A_CANDY),
+    ('7586190165199047954', 'WHITE AND PURPLE',                      _A_SMOKE),
+    ('7572048134856019253', 'лиловый #e1a7dc',                       _A_BUTTERFLY),
+    ('7545175215735590197', 'ART EN GRAFFITI M9 Purple Text',        _A_ATOM_FIRE),
+    ('7594846805288848693', 'магента #ba417b',                       _A_HEAT),
+    ('7631934577736453377', 'Dynamic red flower hand-drawn',         _A_SPARKLE),
+    ('231309949',           'фиолет #8218fe',                        _A_TYPING),
+    ('7651169872193359112', 'Animated Hand-Drawn Texture M6 Love',   _A_SPLASH),
+    ('7610225528531930384', 'фиолет #663399',                        _A_SMOKE),
+    ('7576180793379228942', 'розовый',                               _A_ATOM_UNI),
+    ('7631868553481719053', 'малиновый #ef2a4e',                     _A_CANDY),
+    ('7592604085279264053', 'розовый #f35592',                       _A_ATOM_FIRE),
+    ('7573273105431317813', 'ART Neon EN Pink',                      _A_HEAT),
+    ('7592575945140309253', '粉色爱心巧克力',                        _A_TYPING),
+]
+
 _OVERLAY_EFFECT_ID   = '7592575945140309253'   # CapCut text effect «粉色爱心巧克力»
 _OVERLAY_EFFECT_NAME = '粉色爱心巧克力'
 _OVERLAY_CATEGORY_ID = '2037703895'            # its panel category ("hot")
@@ -526,43 +587,119 @@ def _build_overlay_material(mat_id: str, text: str, font_path: str,
     }
 
 
-def _inject_text_overlay(data: Dict[str, Any], text: str, dur_us: int,
-                         drafts_root: Path) -> None:
-    """Mutate a loaded draft_content.json dict: add the channel badge as its
-    own text track — one material + one full-length segment parked tilted in
-    the upper-right corner, exactly where the user placed it by hand."""
+def _pick_overlay_combos(drafts_root: Path, n: int, seed: str
+                         ) -> List[Tuple[str, str, Tuple[str, str, int]]]:
+    """`n` badge looks, each (style_id, style_name, animation), all verified to be
+    in the local effect cache. Deterministic: the same project always draws the
+    same sequence, so re-exporting a short does not reshuffle a look the user has
+    already approved. Consecutive scenes never repeat a style — the pool is walked
+    in a shuffled order and only wraps once exhausted."""
+    usable = [c for c in _OVERLAY_COMBOS
+              if _capcut_effect_path(str(drafts_root), c[0]) is not None]
+    if not usable:
+        _log('no badge styles found in the CapCut effect cache — plain white text')
+        return []
+    missing = len(_OVERLAY_COMBOS) - len(usable)
+    if missing:
+        _log(f'badge pool: {len(usable)} of {len(_OVERLAY_COMBOS)} looks available '
+             f'({missing} not in the effect cache — apply them once in CapCut to enable)')
+    rnd = random.Random(f'badge:{seed}')
+    out: List[Tuple[str, str, Tuple[str, str, int]]] = []
+    while len(out) < n:
+        cycle = usable[:]
+        rnd.shuffle(cycle)
+        if out and len(cycle) > 1 and cycle[0][0] == out[-1][0]:
+            cycle.append(cycle.pop(0))          # don't repeat across the wrap
+        out.extend(cycle)
+    return out[:n]
+
+
+def _inject_text_overlay(data: Dict[str, Any], text: str,
+                         spans: List[Tuple[int, int, str]],
+                         drafts_root: Path, seed: str = '') -> None:
+    """Mutate a loaded draft_content.json dict: add the channel badge as its own
+    text track, parked tilted in the upper-right corner exactly where the user
+    placed it by hand.
+
+    `spans` is one (start_us, duration_us, key) per SCENE: the badge is re-emitted
+    for each, in the same spot but with a different style + entrance animation from
+    `_OVERLAY_COMBOS`, so the corner keeps re-announcing itself instead of sitting
+    there as one static sticker. A single span reproduces the old full-length badge.
+    """
+    spans = [(int(s), int(d), k) for s, d, k in spans if int(d) > 0]
+    if not spans:
+        return
     materials = data.setdefault("materials", {})
     texts     = materials.setdefault("texts", [])
     anims     = materials.setdefault("material_animations", [])
     effects   = materials.setdefault("effects", [])
     tracks    = data.setdefault("tracks", [])
 
-    font_path   = _resolve_capcut_font(drafts_root)
-    effect_path = _capcut_effect_path(str(drafts_root), _OVERLAY_EFFECT_ID)
-    if effect_path is None:
-        _log(f'overlay text effect {_OVERLAY_EFFECT_ID} not in CapCut effect '
-             f'cache — injecting plain white text')
+    font_path = _resolve_capcut_font(drafts_root)
+    combos    = _pick_overlay_combos(drafts_root, len(spans), seed or text)
 
     max_ri = 0
     for tr in tracks:
         for s in tr.get("segments", []):
             max_ri = max(max_ri, int(s.get("render_index") or 0))
 
+    segments: List[Dict[str, Any]] = []
+    for i, (start_us, dur_us, _key) in enumerate(spans):
+        style_id, style_name, anim = (combos[i] if i < len(combos)
+                                      else (None, '', None))
+        effect_path = (_capcut_effect_path(str(drafts_root), style_id)
+                       if style_id else None)
+        if effect_path is None and i == 0:
+            _log('badge: no cached style for the first scene — plain white text')
+        segments.append(_build_overlay_segment(
+            drafts_root, texts, anims, effects, text, font_path,
+            style_id, style_name, effect_path, anim,
+            start_us, dur_us, max_ri + 1 + i))
+
+    if combos:
+        _log('badge looks: ' + ', '.join(
+            f'{i + 1}:{c[1]}+{c[2][1]}' for i, c in enumerate(combos[:len(spans)])))
+    _append_overlay_track(tracks, segments)
+
+
+def _build_overlay_segment(drafts_root: Path, texts, anims, effects, text, font_path,
+                           style_id, style_name, effect_path, anim,
+                           start_us: int, dur_us: int, render_index: int
+                           ) -> Dict[str, Any]:
+    """One badge segment + the materials it owns (text, animation, text effect)."""
     mat_id  = uuid.uuid4().hex
     anim_id = uuid.uuid4().hex
     texts.append(_build_overlay_material(mat_id, text, font_path, effect_path))
+
+    # entrance animation, clipped so it never outruns a short scene
+    animations: List[Dict[str, Any]] = []
+    if anim:
+        a_id, a_name, a_dur = anim
+        a_path = _capcut_effect_path(str(drafts_root), a_id)
+        if a_path:
+            animations.append({
+                "id": a_id, "type": "in", "start": 0,
+                "duration": int(min(a_dur, max(1, dur_us))),
+                "path": a_path, "platform": "all",
+                "resource_id": a_id, "third_resource_id": "0",
+                "source_platform": 1, "name": a_name,
+                "category_id": "ruchang", "category_name": "Ввод",
+                "panel": "", "material_type": "sticker",
+                "anim_adjust_params": None, "request_id": "",
+            })
     anims.append({"id": anim_id, "type": "sticker_animation",
-                  "animations": [], "multi_language_current": "none"})
+                  "animations": animations, "multi_language_current": "none"})
+
     extra_refs = [anim_id]
     if effect_path:
         eff_id = uuid.uuid4().hex
         effects.append({
             "id":                eff_id,
             "type":              "text_effect",
-            "effect_id":         _OVERLAY_EFFECT_ID,
-            "resource_id":       _OVERLAY_EFFECT_ID,
+            "effect_id":         style_id,
+            "resource_id":       style_id,
             "third_resource_id": "0",
-            "name":              _OVERLAY_EFFECT_NAME,
+            "name":              style_name or _OVERLAY_EFFECT_NAME,
             "path":              effect_path,
             "source_platform":   1,
             "platform":          "all",
@@ -586,10 +723,10 @@ def _inject_text_overlay(data: Dict[str, Any], text: str, dur_us: int,
         "id":               uuid.uuid4().hex,
         "material_id":      mat_id,
         "extra_material_refs": extra_refs,
-        "target_timerange": {"start": 0, "duration": int(dur_us)},
+        "target_timerange": {"start": int(start_us), "duration": int(dur_us)},
         "source_timerange": None,
         "render_timerange": {"start": 0, "duration": 0},
-        "render_index":     max_ri + 1,
+        "render_index":     int(render_index),
         "track_render_index": 0,
         "track_attribute":  0,
         "clip": {
@@ -624,6 +761,13 @@ def _inject_text_overlay(data: Dict[str, Any], text: str, dur_us: int,
         "responsive_layout": {"enable": False, "target_follow": "",
             "size_layout": 0, "horizontal_pos_layout": 0, "vertical_pos_layout": 0},
     }
+    return segment
+
+
+def _append_overlay_track(tracks: List[Dict[str, Any]],
+                          segments: List[Dict[str, Any]]) -> None:
+    """All badge segments share ONE text track — they never overlap (one per
+    scene, back to back), and a single track keeps CapCut's layer list tidy."""
     tracks.append({
         "id":              uuid.uuid4().hex,
         "type":            "text",
@@ -631,7 +775,7 @@ def _inject_text_overlay(data: Dict[str, Any], text: str, dur_us: int,
         "attribute":       0,
         "name":            "",
         "is_default_name": True,
-        "segments":        [segment],
+        "segments":        segments,
     })
 
 
@@ -812,6 +956,8 @@ def build_draft(manifest: dict) -> Path:
     script.add_track(draft.TrackType.audio, "narration")
 
     cursor_video_us = 0
+    # (start, duration, sceneKey) per scene — drives the per-scene channel badge.
+    scene_spans: List[Tuple[int, int, str]] = []
     # Independent audio cursor — tracks the earliest microsecond at which the
     # next per-shot narration may start without overlapping the previous one
     # on the shared "narration" lane. Per user spec: «вставляй по очереди,
@@ -1017,6 +1163,12 @@ def build_draft(manifest: dict) -> Path:
                         subtitle_cues.append((scene_start_us, scene_start_us + tts_dur, narr_text))
                 else:
                     _log(f'skipping narration for {scene["sceneKey"]}: zero duration')
+
+        # Scene span on the timeline — the channel badge re-styles itself on each
+        # of these (see `_inject_text_overlay`).
+        if cursor_video_us > scene_start_us:
+            scene_spans.append((scene_start_us, cursor_video_us - scene_start_us,
+                                str(scene.get("sceneKey") or "")))
 
     # ── Shot-boundary transitions ──────────────────────────────────────
     # Two presets, chosen by manifest["transition_preset"]:
@@ -1232,6 +1384,8 @@ def build_draft(manifest: dict) -> Path:
         drafts_root,
         overlay_text=str(manifest.get("overlay_text") or ""),
         overlay_dur_us=cursor_video_us,
+        overlay_spans=scene_spans,
+        overlay_seed=str(manifest.get("project_name") or manifest.get("draft_name") or ""),
     )
 
     # ── Subtitles sidecar (.srt) ──────────────────────────────────────────
@@ -1265,7 +1419,9 @@ def rewrite_for_capcut_international(draft_content_path: Path,
                                     subtitle_cues: "List[tuple] | None" = None,
                                     drafts_root: "Path | None" = None,
                                     overlay_text: str = "",
-                                    overlay_dur_us: int = 0) -> int:
+                                    overlay_dur_us: int = 0,
+                                    overlay_spans: "List[Tuple[int, int, str]] | None" = None,
+                                    overlay_seed: str = "") -> int:
     """Post-process pyJianYingDraft's draft_content.json so CapCut International
     will open it. Patches:
 
@@ -1323,9 +1479,13 @@ def rewrite_for_capcut_international(draft_content_path: Path,
     # Every path the injector writes is already forward-slash.
     if overlay_text and overlay_dur_us > 0:
         try:
-            _inject_text_overlay(data, overlay_text, overlay_dur_us,
-                                 drafts_root or draft_content_path.parent)
-            _log(f'injected channel overlay: {overlay_text!r}')
+            # One badge per scene when spans are known, otherwise the legacy
+            # single full-length badge.
+            spans = list(overlay_spans or []) or [(0, int(overlay_dur_us), '')]
+            _inject_text_overlay(data, overlay_text, spans,
+                                 drafts_root or draft_content_path.parent,
+                                 overlay_seed)
+            _log(f'injected channel overlay: {overlay_text!r} × {len(spans)} scene(s)')
         except Exception as e:  # noqa: BLE001
             _log(f'overlay injection failed ({e!r}) — draft is fine, no overlay')
 

@@ -308,6 +308,13 @@ def _resolve_shot_entry(shot: dict, data_root: str) -> dict:
 
 
 def _capcut_drafts_root(output_root: str) -> str:
+    # CAPCUT_DRAFTS_ROOT (see gen-studio/.env) wins, %LOCALAPPDATA% is the fallback
+    # for a stock install / standalone runs without the env loaded. The override must
+    # spell the path the way CapCut does: it matches projects by path string, so the
+    # real location behind a junction registers as a SECOND copy of the same draft.
+    root = os.environ.get("CAPCUT_DRAFTS_ROOT")
+    if root:
+        return root
     lad = os.environ.get("LOCALAPPDATA")
     if lad:
         return os.path.join(lad, "CapCut", "User Data", "Projects", "com.lveditor.draft")

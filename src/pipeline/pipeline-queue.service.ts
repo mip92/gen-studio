@@ -9,6 +9,7 @@ import { TrainingService } from '../training/training.service';
 import { TTSService } from '../tts/tts.service';
 import { BgmRenderService } from '../bgm/bgm-render.service';
 import { AnchorRenderService } from '../characters/anchor-render.service';
+import { ThumbnailRenderService } from '../thumbnails/thumbnail-render.service';
 import { ImageValidationService } from '../validation/image-validation.service';
 import { AnchorValidationService } from '../validation/anchor-validation.service';
 import { YoutubeCaptionsService } from '../youtube/youtube-captions.service';
@@ -35,11 +36,11 @@ const TRAINING_LOG_STALL_MS = 20 * 60 * 1000;          // 20 min
  * entry is next, claims the slot atomically, arbitrates the engine, and hands
  * the work to the owning service.
  *
- * Batching: alternating job types makes ComfyUI unload and reload checkpoints on
- * every single job (~2.5 min instead of ~30 s), so the ledger prefers an entry
- * sharing the currently-loaded workflow. That preference is bounded by a run cap
- * and a starvation clock, so a job the user just pulled to the front is delayed
- * a little, never indefinitely.
+ * Order is taken literally: whatever sits at the head of the queue runs next.
+ * Checkpoint batching (alternating workflows costs ComfyUI a model reload,
+ * ~2.5 min instead of ~30 s) is arranged when work is ENQUEUED — new entries are
+ * filed behind their own workflow group — so nothing has to be reordered here,
+ * and the queue on screen is the queue that runs.
  *
  * Failure isolation: a failed job is closed as failed and the queue moves on.
  * Hang detection force-fails jobs whose subprocesses died silently, and the
@@ -52,14 +53,6 @@ export class PipelineQueueService {
   private worker?: NodeJS.Timeout;
   private ticking = false;
 
-  /**
-   * Same-workflow batching state: which group the last dispatch belonged to and
-   * how many of them have run back-to-back. Purely an optimisation hint — the
-   * authoritative "how long has the head been waiting" clock is persisted on the
-   * entry itself, so a restart cannot grant a group a fresh grace window.
-   */
-  private batch: { lastGroupKey: string | null; runLength: number } = { lastGroupKey: null, runLength: 0 };
-
   constructor(
     private readonly prisma:   PrismaService,
     private readonly datasets: DatasetQueueService,
@@ -69,6 +62,7 @@ export class PipelineQueueService {
     private readonly tts:      TTSService,
     private readonly bgm:      BgmRenderService,
     private readonly anchors:  AnchorRenderService,
+    private readonly thumbnails: ThumbnailRenderService,
     private readonly validation: ImageValidationService,
     private readonly anchorValidation: AnchorValidationService,
     private readonly captions: YoutubeCaptionsService,
@@ -102,6 +96,7 @@ export class PipelineQueueService {
     await this.datasets.pollRunning();
     await this.scenes.pollRunning();
     await this.anchors.pollRunning();
+    await this.thumbnails.pollRunning();
     await this.detectHungJobs();
     // Bring the ledger back in line with the job tables before reading the slot:
     // closes entries whose work already finished, releases dead claims, adopts
@@ -114,7 +109,7 @@ export class PipelineQueueService {
     if (await this.ledger.running()) return;
 
     // ── 3. Who's next? ────────────────────────────────────────────────────
-    const winner = await this.ledger.selectNext(this.batch);
+    const winner = await this.ledger.selectNext();
     if (!winner) return;
 
     // Reserve the slot BEFORE arbitrating engines: starting or stopping ComfyUI
@@ -123,17 +118,9 @@ export class PipelineQueueService {
       this.logger.warn(`claim lost for ${winner.jobType}/${winner.jobId} — retrying next tick`);
       return;
     }
-    this.noteBatch(winner.groupKey);
 
     if (!await this.prepareEngine(winner)) return;
     await this.dispatch(winner);
-  }
-
-  /** Track consecutive same-group dispatches so batching can cap its own run. */
-  private noteBatch(groupKey: string): void {
-    this.batch = groupKey === this.batch.lastGroupKey
-      ? { lastGroupKey: groupKey, runLength: this.batch.runLength + 1 }
-      : { lastGroupKey: groupKey, runLength: 1 };
   }
 
   /**
@@ -202,6 +189,12 @@ export class PipelineQueueService {
         case 'video_post': await this.videos.dispatchPendingUpscale(e.jobId); return;
         case 'bgm':        await this.bgm.dispatchPending(e.jobId);      return;
         case 'anchor':     await this.anchors.dispatchPending(e.jobId);  return;
+        case 'thumbnail':  await this.thumbnails.dispatchPending(e.jobId); return;
+        case 'thumbnail_ideas':
+          await this.markSourceRunning('thumbnailIdeaJob', e.jobId);
+          void this.thumbnails.runIdeaJob(e.jobId).catch((err) =>
+            this.logger.error(`thumbnail ideas ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
         case 'tts':
           void this.tts.dispatchPending(e.jobId).catch((err) =>
             this.logger.error(`tts dispatchPending ${e.jobId} threw: ${err?.message ?? err}`));

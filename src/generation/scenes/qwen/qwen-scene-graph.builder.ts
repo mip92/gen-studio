@@ -72,6 +72,21 @@ export interface QwenGraphSpec {
   /** Style LoRA to splice into the model chain; omit for the dual-character
    *  overlay (style is carried by the reference images there). */
   styleLora?: { name: string; strengthModel?: number };
+  /** Classifier-free guidance. Template default is 1.0, which is what the
+   *  Lightning LoRA requires — and at 1.0 the negative branch is INERT. Raise
+   *  it only together with `lightning: false`. */
+  cfg?: number;
+  /**
+   * Keep the Lightning 4-step speed LoRA (node 14) in the model chain.
+   *
+   * true (default) — what every scene render wants: 4 steps at cfg 1.0, the
+   * only way 346 shots per film are affordable.
+   * false — drop it and run real steps at real cfg. Costs minutes per image,
+   * so it is reserved for one-off hero images (the YouTube thumbnail), where
+   * quality is scrutinised up close AND the live negative prompt matters —
+   * at cfg 1.0 a negative like "no text, no letters" does literally nothing.
+   */
+  lightning?: boolean;
 }
 
 export class QwenSceneGraphBuilder {
@@ -84,12 +99,31 @@ export class QwenSceneGraphBuilder {
     this.set(wf, '5', 'batch_size', spec.batchSize);
     this.set(wf, '6', 'seed', spec.seed);
     if (spec.steps !== undefined) this.set(wf, '6', 'steps', spec.steps);
+    if (spec.cfg !== undefined) this.set(wf, '6', 'cfg', spec.cfg);
     if (spec.scheduler) this.set(wf, '6', 'scheduler', spec.scheduler);
     this.set(wf, '8', 'filename_prefix', spec.filenamePrefix);
     this.injectAnchors(wf, spec.anchors);
     this.injectStyleLora(wf, spec.styleLora);
+    this.applyLightning(wf, spec.lightning ?? true);
     this.applyReferenceLatents(wf, spec.referenceLatents ?? true);
     return wf;
+  }
+
+  /** Remove the Lightning speed LoRA (node 14) from the model chain.
+   *
+   *  Runs AFTER injectStyleLora, so whatever now consumes node 14 — CFGNorm
+   *  (15) on its own, or the style LoRA (20) spliced in front of it — is
+   *  repointed at ModelSamplingAuraFlow (13), node 14's own upstream. Found by
+   *  scanning inputs rather than by hardcoding the consumer, so the two splice
+   *  orders cannot drift apart. */
+  private applyLightning(wf: WorkflowTemplate, enabled: boolean): void {
+    if (enabled) return;
+    for (const node of Object.values(wf as Record<string, any>)) {
+      for (const [key, value] of Object.entries(node?.inputs ?? {})) {
+        if (Array.isArray(value) && value[0] === '14') node.inputs[key] = ['13', value[1]];
+      }
+    }
+    delete (wf as Record<string, any>)['14'];
   }
 
   /** Drop the `vae` input from both encode nodes when the appearance channel is

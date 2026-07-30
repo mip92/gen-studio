@@ -27,6 +27,15 @@ DATA = ROOT + "/data"
 # right page — so the camera reads one page down, then pans once across the binding
 # to the next page, instead of hopping the spine on every row.
 SPREAD_SIZES = [12]
+# Supersample of the baked sheet — the raster the camera zooms into. Sized from the
+# camera, not from "more is better": max zoom measured on a full film is 3.376×, so
+# a pixel-for-pixel sheet needs 1920×3.376 ≈ 6482 px of width — ss4 (7680) clears
+# that with 18% to spare, at which point extra pixels CANNOT reach the screen.
+# ss8 (15360×8640 = 132 MPix, 85 MB/spread) was 2.37× past that ceiling and made
+# the blur WORSE, not better: CapCut has to resample that monster itself, and its
+# minification mushes the thin ink lines that ss8 existed to protect. Overridable
+# with --supersample for A/B tests (user 2026-07-26).
+DEFAULT_SUPERSAMPLE = 4
 MARGIN   = 0.015      # outer margin around the whole spread (trimmed — bigger panels)
 MARGIN_Y = 0.040      # top margin
 FOOT     = 0.090      # bottom band reserved for the book's fore-edge (page stack)
@@ -126,7 +135,7 @@ def resolve_video(slug, code, interp, upsc, base):
     return None
 
 
-def build(slug, max_spreads, panel_frac, out, pack=False):
+def build(slug, max_spreads, panel_frac, out, pack=False, supersample=DEFAULT_SUPERSAMPLE):
     conn = psycopg2.connect(**DB); cur = conn.cursor()
     cur.execute('SELECT id,"exportTiming" FROM projects WHERE slug=%s', (slug,))
     row = cur.fetchone()
@@ -231,8 +240,13 @@ def build(slug, max_spreads, panel_frac, out, pack=False):
 
     # ── BGM (anchored on the comic timeline) ──
     music = []
-    cur.execute('SELECT id, slug, "shotIds" FROM narrative_blocks WHERE "projectId"=%s ORDER BY "sortOrder"', (pid,))
-    for bid, bslug, shot_ids in cur.fetchall():
+    # `title` carries the block's REAL name — "Акт 1 — …", "Cold open — …",
+    # "Финал — …". It must travel into the manifest: the exporter labels the BGM
+    # tracks from it, and a number invented from track order is wrong (the cold open
+    # is not an act, so every act would be off by one — user caught this 2026-07-26).
+    cur.execute('SELECT id, slug, title, "sortOrder", "shotIds" FROM narrative_blocks '
+                'WHERE "projectId"=%s ORDER BY "sortOrder"', (pid,))
+    for bid, bslug, btitle, bsort, shot_ids in cur.fetchall():
         cur.execute('SELECT id,"approvedJobId",spare,"durationSec" FROM music_segments '
                     'WHERE "blockId"=%s ORDER BY spare, "sortOrder"', (bid,))
         segs = cur.fetchall()
@@ -259,6 +273,7 @@ def build(slug, max_spreads, panel_frac, out, pack=False):
                 continue
             rsec = (j[2] or {}).get("renderSec") or dsec or 60
             music.append({"blockSlug": bslug, "act": bslug, "lane": "a" if placed % 2 == 0 else "b",
+                          "blockTitle": btitle or "", "blockOrder": int(bsort or 0),
                           "order": placed, "spare": bool(spare), "segmentId": seg_id, "jobId": appr,
                           "path": fp, "block_start_us": int(block_start), "render_duration_us": int(rsec) * 1_000_000})
             placed += 1
@@ -272,17 +287,20 @@ def build(slug, max_spreads, panel_frac, out, pack=False):
     ts = time.strftime("%Y%m%d_%H%M")
     draft_name = f"{slug}_comic_{ts}"
     out_root = f"{DATA}/{slug}/exports/comic"
-    localapp = os.environ.get("LOCALAPPDATA")
-    capcut_root = (localapp.replace("\\", "/") + "/CapCut/User Data/Projects/com.lveditor.draft") if localapp else out_root
+    # CAPCUT_DRAFTS_ROOT (see gen-studio/.env) wins, %LOCALAPPDATA% is the fallback
+    # for a stock install / standalone runs without the env loaded. The override must
+    # spell the path the way CapCut does: it matches projects by path string, so the
+    # real location behind a junction registers as a SECOND copy of the same draft.
+    capcut_root = (os.environ.get("CAPCUT_DRAFTS_ROOT") or "").replace("\\", "/")
+    if not capcut_root:
+        localapp = os.environ.get("LOCALAPPDATA")
+        capcut_root = (localapp.replace("\\", "/") + "/CapCut/User Data/Projects/com.lveditor.draft") if localapp else out_root
     manifest = {
         "project_name": slug, "draft_name": draft_name,
         "output_root": out_root, "capcut_drafts_root": capcut_root,
         "pages_dir": f"{out_root}/{draft_name}/pages",
         "width": 1920, "height": 1080, "fps": 30,
-        # supersample 8: the sheet is the raster the camera zooms into (~4x at a
-        # panel). At ss6 its baked page-block lines read softer than the ss8 panel
-        # borders; matching ss8 keeps the page contours as crisp as the borders.
-        "page_style": "old_comic", "texture_path": None, "supersample": 8,
+        "page_style": "old_comic", "texture_path": None, "supersample": supersample,
         # "turn3d" = our OWN pseudo-3D page turn (export_comic._add_page_turns):
         # a leaf with baked content flips across the spine on scale_x keyframes,
         # revealing the next spread. Renders without any CapCut effect cache.
@@ -310,6 +328,9 @@ if __name__ == "__main__":
     ap.add_argument("--panel-frac", type=float, default=DEFAULT_PANEL_FRAC)
     ap.add_argument("--pack", action="store_true",
                     help="chunk across scene borders into full 12-panel spreads")
+    ap.add_argument("--supersample", type=int, default=DEFAULT_SUPERSAMPLE,
+                    help=f"sheet raster multiple of 1920x1080 (default {DEFAULT_SUPERSAMPLE}; "
+                         "the camera tops out at 3.376x zoom, so 4 is already 1:1 with headroom)")
     ap.add_argument("--out", default="E:/tmp/claude/W--Programs-ComfyUI/6d2ae475-ecda-43bb-a65a-be5f86911a92/scratchpad/comic_manifest.json")
     a = ap.parse_args()
-    build(a.slug, a.max_spreads, a.panel_frac, a.out, a.pack)
+    build(a.slug, a.max_spreads, a.panel_frac, a.out, a.pack, a.supersample)

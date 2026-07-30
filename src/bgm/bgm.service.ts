@@ -4,9 +4,12 @@ import {
   CreateBlockInput,
   UpdateBlockInput,
   CreateSegmentInput,
+  UpdateSegmentInput,
+  MusicMetas,
   DEFAULT_RENDER_PARAMS,
   TILE_SECONDS,
   SPARE_TRACK_COUNT,
+  normaliseMusicMetas,
 } from './bgm.types';
 import { shotHoldUs, narrationUsFromTts } from '../exports/shot-timing';
 
@@ -26,6 +29,20 @@ export class BgmService {
   private readonly logger = new Logger(BgmService.name);
 
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * Validate ACE-Step metas at the API boundary and surface the failure as a
+   * 400 instead of letting an invalid `keyscale` reach ComfyUI — there it is a
+   * prompt-validation error that only shows up once the job reaches the head of
+   * a single-slot queue, with a message nobody connects back to this edit.
+   */
+  private metas(input: MusicMetas): MusicMetas {
+    try {
+      return normaliseMusicMetas(input);
+    } catch (e: any) {
+      throw new BadRequestException(e?.message ?? String(e));
+    }
+  }
 
   // ── Blocks ────────────────────────────────────────────────────────────────
 
@@ -53,6 +70,7 @@ export class BgmService {
         shotIds:    input.shotIds as any,
         targetSeconds,
         status:     'filling',
+        ...this.metas(input),
       },
     });
   }
@@ -98,7 +116,7 @@ export class BgmService {
     const block = await this.prisma.narrativeBlock.findUnique({ where: { id: blockId } });
     if (!block) throw new NotFoundException(`Block ${blockId} not found`);
 
-    const data: Record<string, unknown> = {};
+    const data: Record<string, unknown> = { ...this.metas(body) };
     if (body.title      !== undefined) data.title      = body.title;
     if (body.sortOrder  !== undefined) data.sortOrder  = body.sortOrder;
     if (body.moodPrompt !== undefined) data.moodPrompt = body.moodPrompt;
@@ -156,8 +174,43 @@ export class BgmService {
         prompt:      input.prompt ?? null,
         durationSec,
         sortOrder,
+        ...this.metas(input),
       },
     });
+  }
+
+  /**
+   * Partial update of one tile — the per-tile prompt override and its metas.
+   * There was no such endpoint before, so the UI's segment "сохранить" button
+   * could only raise an alert and a per-tile override could not be authored at
+   * all (only inline per-render, which vanished with the take).
+   *
+   * A prompt or meta change makes every already-rendered take under this segment
+   * stale; per `feedback-rework-invalidate-stale-renders` the caller should
+   * delete those takes. This method does NOT delete them silently — dropping a
+   * user-approved flac as a side effect of a text edit is not ours to decide —
+   * but it does clear the approval when the prompt changed, so a stale take
+   * cannot keep flowing into a CapCut export unnoticed.
+   */
+  async updateSegment(segmentId: string, body: UpdateSegmentInput) {
+    const seg = await this.prisma.musicSegment.findUnique({ where: { id: segmentId } });
+    if (!seg) throw new NotFoundException(`Segment ${segmentId} not found`);
+
+    const data: Record<string, unknown> = { ...this.metas(body) };
+    if (body.prompt    !== undefined) data.prompt    = body.prompt;
+    if (body.sortOrder !== undefined) data.sortOrder = body.sortOrder;
+    if (body.spare     !== undefined) data.spare     = body.spare;
+    if (body.durationSec !== undefined) {
+      if (body.durationSec < 10 || body.durationSec > 240) {
+        throw new BadRequestException(`durationSec must be in [10, 240] (got: ${body.durationSec})`);
+      }
+      data.durationSec = body.durationSec;
+    }
+
+    const promptChanged = body.prompt !== undefined && (body.prompt ?? null) !== seg.prompt;
+    if (promptChanged && seg.approvedJobId) data.approvedJobId = null;
+
+    return this.prisma.musicSegment.update({ where: { id: segmentId }, data });
   }
 
   async deleteSegment(segmentId: string) {
@@ -229,14 +282,14 @@ export class BgmService {
     // ceil(actLength / 150), at least one main tile even for a tiny act.
     const wantMain  = Math.max(1, Math.ceil(target / TILE_SECONDS));
     const wantSpare = SPARE_TRACK_COUNT;
-    const haveMain  = block.segments.filter((s) => !(s as { spare?: boolean }).spare).length;
-    const haveSpare = block.segments.filter((s) =>  (s as { spare?: boolean }).spare).length;
+    const haveMain  = block.segments.filter((s) => !s.spare).length;
+    const haveSpare = block.segments.filter((s) =>  s.spare).length;
 
     let nextOrder = await this.nextSegmentSortOrder(blockId);
     let created = 0;
     const makeTile = async (spare: boolean) => {
       await this.prisma.musicSegment.create({
-        data: { blockId, durationSec: TILE_SECONDS, sortOrder: nextOrder, prompt: null, spare } as any,
+        data: { blockId, durationSec: TILE_SECONDS, sortOrder: nextOrder, prompt: null, spare },
       });
       nextOrder++;
       created++;

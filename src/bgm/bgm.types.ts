@@ -4,20 +4,179 @@
  * constraint — see [[feedback_db_english_only]].
  */
 
-export interface CreateBlockInput {
+// ── ACE-Step 1.5 metadata conditioning ──────────────────────────────────────
+//
+// `TextEncodeAceStepAudio1.5` does NOT send the tag string alone. The tokenizer
+// (comfy/text_encoders/ace15.py, `_metas_to_cap` / `_metas_to_cot`) renders bpm,
+// timesignature, keyscale and duration into the model prompt as a labelled text
+// block, and again as a pre-filled `<think>` YAML for the audio-code LM:
+//
+//   # Caption
+//   <tags>
+//
+//   # Metas
+//   - bpm: 120
+//   - timesignature: 4
+//   - keyscale: A minor
+//   - duration: 150 seconds
+//
+// So a caption reading "very slow 44 bpm" while these say 120 is a literal
+// contradiction stated twice with authority to a 0.6B planner — it commits to
+// neither and the pulse lands between them. That was the cause of the reported
+// «битый ритм»: patch() used to leave all three at the template defaults while
+// 369 of 385 seeded captions named a different tempo.
+//
+// Rule: the metas are the authority, the caption carries no numbers.
+// Prompt-writing rules live in Skill(gen-studio-acestep).
+//
+// ComfyUI exposes no `thinking` / `use_cot_metas` toggle, so the upstream advice
+// "let the model infer bpm and key from the caption" is unavailable here — the
+// node always passes explicit metas. Getting them right is on us.
+
+/** `bpm` node input bounds (IO.Int min/max in comfy_extras/nodes_ace.py). */
+export const ACE_BPM_MIN = 10;
+export const ACE_BPM_MAX = 300;
+
+/**
+ * `timesignature` combo options — **bare digits**. Guides say "4/4"; the node
+ * has no such option and an unknown combo value fails ComfyUI validation, which
+ * fails the whole prompt on a single-slot queue.
+ */
+export const ACE_TIMESIGNATURES = ['2', '3', '4', '6'] as const;
+export type AceTimesignature = (typeof ACE_TIMESIGNATURES)[number];
+
+/**
+ * `keyscale` combo options, generated exactly as the node does:
+ * `[f"{root} {quality}" for quality in [major, minor] for root in [...]]`.
+ * Quality is lowercase. "Am" and "A Minor" are NOT valid; "Eb major" is.
+ */
+export const ACE_KEY_ROOTS = [
+  'C', 'C#', 'Db', 'D', 'D#', 'Eb', 'E', 'F', 'F#', 'Gb', 'G', 'G#', 'Ab', 'A', 'A#', 'Bb', 'B',
+] as const;
+export const ACE_KEYSCALES: readonly string[] = ['major', 'minor'].flatMap(
+  (quality) => ACE_KEY_ROOTS.map((root) => `${root} ${quality}`),
+);
+
+/**
+ * Tempo / key / metre for one act or one tile. Every field is independently
+ * nullable: null means "inherit" (segment → block → workflow template default).
+ * Nothing is defaulted eagerly, so an act nobody has tuned keeps rendering
+ * exactly as before this feature landed.
+ */
+export interface MusicMetas {
+  bpm?:           number | null;
+  keyscale?:      string | null;
+  timesignature?: string | null;
+}
+
+/**
+ * Validate + canonicalise caller-supplied metas. Returns only the keys the
+ * caller actually sent, so it composes with Prisma's partial-update semantics.
+ *
+ * Rejects loudly rather than coercing: a wrong `keyscale` reaching ComfyUI is a
+ * prompt-level validation error whose message surfaces much later, on a queue
+ * that processes one job at a time. Common near-misses are repaired instead of
+ * rejected, since they are what a human actually types:
+ *   "Am" → "A minor" · "A Minor" → "A minor" · "E flat major" → "Eb major"
+ *   "4/4" → "4"
+ */
+export function normaliseMusicMetas(input: MusicMetas): MusicMetas {
+  const out: MusicMetas = {};
+
+  if (input.bpm !== undefined) {
+    if (input.bpm === null) out.bpm = null;
+    else {
+      const n = Math.round(Number(input.bpm));
+      if (!Number.isFinite(n) || n < ACE_BPM_MIN || n > ACE_BPM_MAX) {
+        throw new Error(`bpm must be an integer in [${ACE_BPM_MIN}, ${ACE_BPM_MAX}] (got: ${JSON.stringify(input.bpm)})`);
+      }
+      out.bpm = n;
+    }
+  }
+
+  if (input.timesignature !== undefined) {
+    const raw = input.timesignature;
+    if (raw === null || raw === '') out.timesignature = null;
+    else {
+      // "4/4" → "4", "6/8" → "6": the numerator is what the node's combo lists.
+      const ts = String(raw).trim().split('/')[0];
+      if (!(ACE_TIMESIGNATURES as readonly string[]).includes(ts)) {
+        throw new Error(
+          `timesignature must be one of ${ACE_TIMESIGNATURES.join(', ')} (got: ${JSON.stringify(raw)})`,
+        );
+      }
+      out.timesignature = ts;
+    }
+  }
+
+  if (input.keyscale !== undefined) {
+    const raw = input.keyscale;
+    if (raw === null || raw === '') out.keyscale = null;
+    else {
+      const canon = canonicaliseKeyscale(String(raw));
+      if (!canon) {
+        throw new Error(
+          `keyscale must be "<root> major|minor" with root in ${ACE_KEY_ROOTS.join(' ')} (got: ${JSON.stringify(raw)})`,
+        );
+      }
+      out.keyscale = canon;
+    }
+  }
+
+  return out;
+}
+
+/** Best-effort repair of a human-typed key into a node-valid combo value. */
+function canonicaliseKeyscale(raw: string): string | null {
+  let s = raw.trim().replace(/\s+/g, ' ');
+  // "E flat major" → "Eb major", "F sharp minor" → "F# minor"
+  s = s.replace(/^([A-Ga-g])\s*(flat|b)\b/i,  (_m, r: string) => `${r.toUpperCase()}b`);
+  s = s.replace(/^([A-Ga-g])\s*(sharp|#)\b/i, (_m, r: string) => `${r.toUpperCase()}#`);
+
+  const m = /^([A-Ga-g][#b]?)\s*(major|minor|maj|min|m)?$/i.exec(s);
+  if (!m) return null;
+  // "eb" → "Eb", "c#" → "C#": root letter upper, accidental lower.
+  const root    = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+  const rawQual = (m[2] ?? 'major').toLowerCase();
+  // Bare "Am" is minor; bare "A" is major.
+  const quality = rawQual === 'min' || rawQual === 'm' || rawQual === 'minor' ? 'minor' : 'major';
+  const candidate = `${root} ${quality}`;
+  return ACE_KEYSCALES.includes(candidate) ? candidate : null;
+}
+
+/**
+ * Caption hygiene check for the UI and for authoring scripts: does this prompt
+ * still state a tempo, key or metre in its text, where it will fight the metas?
+ * Advisory only — never blocks a save, because a caption is hand-written prose
+ * and the author may have a reason. See Skill(gen-studio-acestep) §3.
+ */
+export function captionMetaConflicts(prompt: string | null | undefined): string[] {
+  if (!prompt) return [];
+  const found: string[] = [];
+  const bpm = prompt.match(/\b\d{2,3}\s?bpm\b/i);
+  if (bpm) found.push(`tempo in caption ("${bpm[0]}") — move it to the bpm field`);
+  const key = prompt.match(/\b[A-G](?:\s?(?:#|b|sharp|flat))?\s+(?:major|minor)\b/);
+  if (key) found.push(`key in caption ("${key[0]}") — move it to the keyscale field`);
+  const ts = prompt.match(/\b[2-9]\s?\/\s?[248]\b/);
+  if (ts) found.push(`time signature in caption ("${ts[0]}") — move it to the timesignature field`);
+  return found;
+}
+
+export interface CreateBlockInput extends MusicMetas {
   projectId:   string;
   /** Stable English slug, e.g. "start", "growth", "burnout". Unique per project. */
   slug:        string;
   /** Human title for UI; Russian is fine here (not sent to ACE). */
   title?:      string;
   sortOrder?:  number;
-  /** Default ACE-Step tags inherited by every segment. English, comma-separated. */
+  /** Default ACE-Step tags inherited by every segment. English, comma-separated.
+   *  Carries NO tempo/key/metre — those go in the fields below. */
   moodPrompt?: string;
   /** Ordered Shot.id array this block covers. Drives targetSeconds. */
   shotIds:     string[];
 }
 
-export interface UpdateBlockInput {
+export interface UpdateBlockInput extends MusicMetas {
   title?:      string | null;
   sortOrder?:  number;
   moodPrompt?: string | null;
@@ -25,7 +184,7 @@ export interface UpdateBlockInput {
   status?:     'filling' | 'filled' | 'manual';
 }
 
-export interface CreateSegmentInput {
+export interface CreateSegmentInput extends MusicMetas {
   blockId:      string;
   /** Override ACE-Step tags for this segment; null falls back to block.moodPrompt. */
   prompt?:      string | null;
@@ -34,7 +193,15 @@ export interface CreateSegmentInput {
   sortOrder?:   number;
 }
 
-export interface StartRenderInput {
+/** Partial update of one tile. Each meta: value = set, null = inherit block. */
+export interface UpdateSegmentInput extends MusicMetas {
+  prompt?:      string | null;
+  durationSec?: number;
+  sortOrder?:   number;
+  spare?:       boolean;
+}
+
+export interface StartRenderInput extends MusicMetas {
   segmentId:    string;
   /** Override the segment's prompt for this one render (A/B tag variants). */
   prompt?:      string;
@@ -53,6 +220,14 @@ export interface StartRenderInput {
 
 export interface AudioRenderParams {
   prompt:      string;
+  /** Resolved ACE-Step metas, snapshotted at enqueue (render override → segment
+   *  → block). Absent/null = the workflow template's own value is left in place,
+   *  which is how every job rendered before this feature behaved (120 / A minor
+   *  / 4). Kept in params so an old take stays explainable after the block is
+   *  retuned. */
+  bpm?:           number | null;
+  keyscale?:      string | null;
+  timesignature?: string | null;
   /** Nominal tile length in seconds (TILE_SECONDS). The whole flac plays on
    *  the CapCut timeline now — tiles are laid checkerboard on two lanes per
    *  act and overlap by CROSSFADE_SECONDS, so there is no crop-to-slot. */

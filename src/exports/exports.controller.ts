@@ -65,8 +65,51 @@ export class ExportsController {
       'Returns { done, building, rendered, total } for the given draft name — '
       + 'done flips true once the draft is written into CapCut\'s folder.',
   })
-  comicStatus(@Param('idOrSlug') idOrSlug: string, @Query('name') name: string) {
-    return this.exports.comicStatus(idOrSlug, name ?? '');
+  comicStatus(@Param('idOrSlug') idOrSlug: string, @Query('name') name?: string) {
+    // No name -> the current build from the manifest, so any page can poll it.
+    return this.exports.comicStatus(idOrSlug, name);
+  }
+
+  @Post('comic/chunks')
+  @ApiOperation({
+    summary: 'Start the CHUNKED comic build (async)',
+    description:
+      'Slices the film into several small drafts (~4 spreads each) and renders them '
+      + 'all detached. The user exports each to mp4 from CapCut, then POSTs the paths '
+      + 'to comic/assemble to get one light final draft with live audio and subtitles. '
+      + 'Build with CapCut CLOSED. Returns the chunk plan immediately.',
+  })
+  exportComicChunks(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() body?: { perChunk?: number },
+  ) {
+    return this.exports.exportComicChunks(idOrSlug, body?.perChunk);
+  }
+
+  @Get('comic/chunks/status')
+  @ApiOperation({
+    summary: 'Poll the chunked comic build',
+    description:
+      'Returns the plan plus, per chunk, whether its draft is written — which is '
+      + 'what tells the UI a chunk is ready to be exported to mp4.',
+  })
+  comicChunksStatus(@Param('idOrSlug') idOrSlug: string) {
+    return this.exports.comicChunksStatus(idOrSlug);
+  }
+
+  @Post('comic/assemble')
+  @ApiOperation({
+    summary: 'Assemble the final draft from the rendered chunk mp4s',
+    description:
+      'Body: { files: [{ part, path }] }. Measures each mp4, lays them back to back '
+      + 'and puts narration, music and subtitles on top at corrected times, so the '
+      + 'audio follows the REAL video rather than the manifest arithmetic.',
+  })
+  assembleComicChunks(
+    @Param('idOrSlug') idOrSlug: string,
+    @Body() body: { files: { part: number; path: string }[] },
+  ) {
+    return this.exports.assembleComicChunks(idOrSlug, body?.files ?? []);
   }
 
   @Get('shorts/plan')

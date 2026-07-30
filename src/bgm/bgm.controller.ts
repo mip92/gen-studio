@@ -20,7 +20,12 @@ import {
   CreateBlockInput,
   UpdateBlockInput,
   CreateSegmentInput,
+  UpdateSegmentInput,
   StartRenderInput,
+  ACE_BPM_MIN,
+  ACE_BPM_MAX,
+  ACE_KEYSCALES,
+  ACE_TIMESIGNATURES,
 } from './bgm.types';
 
 @ApiTags('BGM')
@@ -30,6 +35,24 @@ export class BgmController {
     private readonly bgm:    BgmService,
     private readonly render: BgmRenderService,
   ) {}
+
+  // ── Reference data ────────────────────────────────────────────────────────
+
+  @Get('meta-options')
+  @ApiOperation({
+    summary: 'Valid ACE-Step metadata values (bpm bounds, keyscale + timesignature combos)',
+    description:
+      'Mirrors the combo options of the TextEncodeAceStepAudio1.5 node. Served so the '
+      + 'UI selects cannot drift from the node — an unknown combo value fails ComfyUI '
+      + 'prompt validation, and the queue is single-slot.',
+  })
+  metaOptions() {
+    return {
+      bpm:            { min: ACE_BPM_MIN, max: ACE_BPM_MAX },
+      keyscales:      ACE_KEYSCALES,
+      timesignatures: ACE_TIMESIGNATURES,
+    };
+  }
 
   // ── Blocks ────────────────────────────────────────────────────────────────
 
@@ -52,7 +75,7 @@ export class BgmController {
   }
 
   @Patch('blocks/:blockId')
-  @ApiOperation({ summary: 'Update block fields (title, sortOrder, moodPrompt, shotIds, status)' })
+  @ApiOperation({ summary: 'Update block fields (title, sortOrder, moodPrompt, bpm, keyscale, timesignature, shotIds, status)' })
   updateBlock(@Param('blockId') blockId: string, @Body() body: UpdateBlockInput) {
     return this.bgm.updateBlock(blockId, body);
   }
@@ -101,6 +124,18 @@ export class BgmController {
   @ApiOperation({ summary: 'Create a single MusicSegment manually under a block' })
   createSegment(@Body() body: CreateSegmentInput) {
     return this.bgm.createSegment(body);
+  }
+
+  @Patch('segments/:segmentId')
+  @ApiOperation({
+    summary: 'Update one tile (prompt override, bpm, keyscale, timesignature, durationSec, spare)',
+    description:
+      'Each meta is nullable: a value overrides the block, null inherits it. Changing '
+      + 'the prompt clears the segment approval, since the approved flac no longer '
+      + 'matches what the prompt asks for — delete the stale takes too.',
+  })
+  updateSegment(@Param('segmentId') segmentId: string, @Body() body: UpdateSegmentInput) {
+    return this.bgm.updateSegment(segmentId, body);
   }
 
   @Delete('segments/:segmentId')

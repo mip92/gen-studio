@@ -20,6 +20,7 @@ import { ActionsModule } from './actions/actions.module';
 import { LocationsModule } from './locations/locations.module';
 import { PropsModule } from './props/props.module';
 import { YoutubeModule } from './youtube/youtube.module';
+import { ThumbnailsModule } from './thumbnails/thumbnails.module';
 import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
 
 @Module({
@@ -48,6 +49,7 @@ import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
     LocationsModule,
     PropsModule,
     YoutubeModule,
+    ThumbnailsModule,
     TelegramBotModule,
   ],
 })

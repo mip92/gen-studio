@@ -541,6 +541,31 @@ export class SceneRenderService {
     });
   }
 
+  /**
+   * Stage a prop's installed anchor PNG into ComfyUI's input dir, same as a
+   * character anchor. `Prop.anchorPath` is free-form: an absolute path is used as
+   * given, anything else is read relative to APP_ROOT (that is how the install
+   * endpoint writes it — `data/<slug>/reference/OBJ_<code>_anchor.png`).
+   * Returns undefined when the file is missing, so a prop whose anchor was
+   * deleted degrades to text-only instead of failing the render.
+   */
+  private stagePropAnchor(shotCode: string, anchorPath: string): string | undefined {
+    const abs = path.isAbsolute(anchorPath) ? anchorPath : path.join(APP_ROOT, anchorPath);
+    if (!existsSync(abs)) {
+      this.logger.warn(`[${shotCode}] prop anchor not found on disk: ${abs} — rendering the object from text only`);
+      return undefined;
+    }
+    const staged = `scene_ref_${shotCode}_obj.png`;
+    try {
+      mkdirSync(COMFY_INPUT, { recursive: true });
+      copyFileSync(abs, path.join(COMFY_INPUT, staged));
+    } catch (e: any) {
+      this.logger.warn(`[${shotCode}] prop anchor staging failed: ${e?.message ?? e}`);
+      return undefined;
+    }
+    return staged;
+  }
+
   // ── Direct render (called by queue worker after engine arbitration) ─────────
 
   async renderShot(input: RenderShotInput): Promise<RenderResult> {
@@ -577,8 +602,18 @@ export class SceneRenderService {
     // OBJECT the subject. Object anchors live separately from characters (user
     // 2026-06-21 «предметы программа не рисует» — a macro of an object + a
     // 400-700char location description renders "just a room", losing the prop).
-    const ctxRows = await this.prisma.$queryRaw<Array<{ description: string | null; propDescription: string | null }>>`
-      SELECT l.description AS description, p.description AS "propDescription"
+    const ctxRows = await this.prisma.$queryRaw<Array<{
+      description: string | null;
+      propDescription: string | null;
+      propName: string | null;
+      propCode: string | null;
+      propAnchorPath: string | null;
+    }>>`
+      SELECT l.description AS description,
+             p.description AS "propDescription",
+             p.name        AS "propName",
+             p.code        AS "propCode",
+             p."anchorPath" AS "propAnchorPath"
       FROM shots sh
       LEFT JOIN locations l ON sh."locationId" = l.id
       LEFT JOIN props p ON sh."propId" = p.id
@@ -586,6 +621,9 @@ export class SceneRenderService {
     `;
     const locationDescription = ctxRows[0]?.description ?? null;
     const propDescription = ctxRows[0]?.propDescription ?? null;
+    const propName        = ctxRows[0]?.propName ?? null;
+    const propCode        = ctxRows[0]?.propCode ?? null;
+    const propAnchorPath  = ctxRows[0]?.propAnchorPath ?? null;
 
     // ── 2. Resolve participant → CharacterProfile ────────────────────────────
     // Photoreal path (Project.visualStyle = 'photoreal_cinematic'): requires
@@ -668,6 +706,7 @@ export class SceneRenderService {
     // factory's (style, count) auto-picker never resolves them.
     let strategy: SceneStrategy;
     let anchorImagePaths: string[] | undefined;
+    let objectReferenceLabel: string | undefined;
     let qwenStyleLora: { name: string; strengthModel?: number } | undefined;
 
     if (visualStyle === QWEN_VISUAL_STYLE) {
@@ -696,6 +735,27 @@ export class SceneRenderService {
           );
         }
         anchorImagePaths = staged as string[];
+      }
+      // Object reference: a prop with an INSTALLED anchor PNG rides along as the
+      // last picture, so "the same car" is the same pixels in every shot instead
+      // of a fresh invention each render. Capped by the graph's 3-image limit —
+      // people always win, and a 3-participant shot simply doesn't get the object
+      // (logged, never silently dropped).
+      if (propAnchorPath) {
+        const already = anchorImagePaths?.length ?? 0;
+        if (already >= 3) {
+          this.logger.warn(
+            `[${shot.shotCode}] prop ${propCode} has an anchor but the shot already carries ${already} ` +
+            `character references — Qwen takes 3 images max, object reference skipped`,
+          );
+        } else {
+          const stagedProp = this.stagePropAnchor(shot.shotCode, propAnchorPath);
+          if (stagedProp) {
+            anchorImagePaths = [...(anchorImagePaths ?? []), stagedProp];
+            objectReferenceLabel = (propName ?? propCode ?? 'the object').trim();
+            this.logger.log(`[${shot.shotCode}] object reference attached as Picture ${already + 1}: ${objectReferenceLabel}`);
+          }
+        }
       }
       strategy = this.scenes.pickByStyleAndParticipantCount(visualStyle, participants.length);
     } else if (
@@ -751,12 +811,19 @@ export class SceneRenderService {
       if (!positive.startsWith(propClause)) {
         positive = positive.trim().length > 0 ? `${propClause}, ${positive}` : propClause;
       }
-    } else if (locationDescription && locationDescription.trim().length > 0) {
+    } else if (locationDescription && locationDescription.trim().length > 0 && !usingQwenGraph) {
       const desc = locationDescription.trim();
       if (!positive.endsWith(desc)) {
         positive = positive.trim().length > 0 ? `${positive}, ${desc}` : desc;
       }
     }
+    // On the Qwen path the location travels as its OWN param instead (below):
+    // appended here it landed at the tail of the positive, i.e. first in line to
+    // be dropped by the scene word budget. Locations are a shared entity — they
+    // get their own budget, composed after the action.
+    const qwenLocationPrompt = (usingQwenGraph && !propDescription)
+      ? (locationDescription ?? undefined)
+      : undefined;
 
     // Strip any weight syntax from the final positive — project rule: no
     // per-token emphasis anywhere (positive OR negative). Logs each strip so
@@ -786,12 +853,13 @@ export class SceneRenderService {
     const params: SceneJobParams = {
       participants,
       scenePrompt:    input.scenePrompt   ?? positive ?? '',
+      locationPrompt: qwenLocationPrompt,
       negativeExtra:  input.negativeExtra ?? negative ?? undefined,
       // SDXL native landscape bucket — 1 megapixel, ~16:9, clean output.
       width:          input.width  ?? 1344,
       height:         input.height ?? 768,
       seed:           input.seed   ?? Math.floor(Math.random() * 2 ** 32),
-      steps:          input.steps,
+      steps:          input.steps  ?? normalizeSceneSteps((shot.project as any).settings),
       cfg:            input.cfg,
       guidance:       input.guidance,
       batchSize:      input.batchSize ?? 5,
@@ -800,6 +868,7 @@ export class SceneRenderService {
       reduxStyleModel: REDUX_STYLE_MODEL_NAME,
       reduxClipVision: REDUX_CLIP_VISION_NAME,
       anchorImagePaths,
+      objectReferenceLabel,
       qwenStyleLora,
       qwenReferenceLatents: normalizeQwenReferenceLatents((shot.project as any).settings),
     };
@@ -919,6 +988,25 @@ export function normalizeStyleLora(
 export function normalizeQwenReferenceLatents(settings: unknown): boolean | undefined {
   const v = (settings as { qwenReferenceLatents?: unknown } | null | undefined)?.qwenReferenceLatents;
   return typeof v === 'boolean' ? v : undefined;
+}
+
+/**
+ * Read `project.settings.sceneSteps` — the project's default sampler step count
+ * for scene renders. Undefined → the workflow JSON's own value (4 on the Qwen
+ * graph, tuned for the Lightning 4-step LoRA). A per-render `input.steps` still
+ * wins over it.
+ *
+ * Why a project setting: more steps give the sampler room to REDRAW instead of
+ * returning the reference, which matters on the anchored Qwen path — and 8 steps
+ * simply looked better than 4 on `caregiver` (user, 2026-07-27). Bounded to
+ * 1..60: Lightning degrades into burnt colour well before that, and the guard is
+ * against a typo'd 800, not against experimentation.
+ */
+export function normalizeSceneSteps(settings: unknown): number | undefined {
+  const v = (settings as { sceneSteps?: unknown } | null | undefined)?.sceneSteps;
+  if (typeof v !== 'number' || !Number.isFinite(v)) return undefined;
+  const n = Math.round(v);
+  return n >= 1 && n <= 60 ? n : undefined;
 }
 
 /**

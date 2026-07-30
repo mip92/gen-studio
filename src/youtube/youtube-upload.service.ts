@@ -55,6 +55,9 @@ export interface UploadResult {
   publishAt: string | null;
   containsSyntheticMedia: boolean;
   thumbnailSet: boolean;
+  /** Why the thumbnail didn't stick (null when it did / none was given). Surfaced
+   *  in the UI — a silently missing cover used to only show up in Studio. */
+  thumbnailError: string | null;
   /** null = no playlist requested; true/false = add outcome. */
   playlistAdded: boolean | null;
   /** True if a pre-made SRT (next to the mp4) was attached during upload. */
@@ -83,8 +86,23 @@ export interface UploadJob {
 
 /** Content language for this channel (RU cautionary tales). */
 const CONTENT_LANGUAGE = 'ru';
-// YouTube raised the custom-thumbnail limit from 2MB to 50MB (March 2026).
-const MAX_THUMB_BYTES = 50 * 1024 * 1024;
+/**
+ * The Data API's custom-thumbnail limit is 2MB of FILE SIZE (docs: thumbnails/set
+ * → "Maximum file size: 2MB"). Studio's web uploader allows 50MB, which is why the
+ * same cover goes up fine by hand and silently fails here — the old 50MB constant
+ * was the Studio limit applied to the wrong surface.
+ *
+ * Worse, going over it comes back as `400 invalidImage`, NOT `mediaBodyTooLarge`
+ * (the docs list no size-specific error at all), so it reads like a corrupt image.
+ * Verified live on one cover: 2.43MB PNG → rejected; the same picture at its
+ * original 1672x941 re-encoded to 0.43MB → accepted, so pixel dimensions are not
+ * the constraint. Lossless PNG recompression only reached 2.36MB — not enough.
+ *
+ * Nano-Banana covers land at ~2.2-2.5MB, i.e. ALWAYS over. We do NOT re-encode
+ * them (that would be a second lossy pass on the artwork); oversized covers are
+ * set by hand in Studio instead.
+ */
+const MAX_THUMB_BYTES = 2 * 1024 * 1024;
 
 // YouTube hard limits — exceeding any of these makes videos.insert 400.
 const TITLE_MAX = 100;
@@ -402,11 +420,10 @@ export class YoutubeUploadService {
     if (requireThumb && !opts.thumbnailPath?.trim()) {
       throw new BadRequestException('thumbnailPath is required (обложка обязательна для основного видео)');
     }
-    if (opts.thumbnailPath?.trim()) {
-      if (!existsSync(opts.thumbnailPath)) throw new BadRequestException(`Thumbnail not found: ${opts.thumbnailPath}`);
-      if (statSync(opts.thumbnailPath).size > MAX_THUMB_BYTES) {
-        throw new BadRequestException('Thumbnail exceeds YouTube 50MB limit');
-      }
+    // Size isn't checked here: an oversized cover is shrunk at upload time
+    // (fitThumbnail), so the operator never has to pre-compress by hand.
+    if (opts.thumbnailPath?.trim() && !existsSync(opts.thumbnailPath)) {
+      throw new BadRequestException(`Thumbnail not found: ${opts.thumbnailPath}`);
     }
     const client = this.auth.getClient();
     if (!client) {
@@ -488,25 +505,18 @@ export class YoutubeUploadService {
     this.logger.log(`Uploaded ${videoId} — actual privacy: ${actualPrivacy}`);
 
     // Thumbnail — set only if provided (required for main, optional for shorts).
-    // Right after insert the video is still processing and thumbnails.set often
-    // doesn't stick, so retry with a growing delay. A failure never loses the
-    // upload (best-effort), but the real error is logged loudly.
-    // Two tries max (quota-friendly): once immediately, once after the video has
-    // had time to process (that's why it often doesn't stick right after insert).
+    // A failure never loses the upload (the video is the expensive part), but the
+    // reason is both logged AND returned so the UI can shout about it instead of
+    // reporting a clean "✓ залито" with no cover on the channel.
     let thumbnailSet = false;
+    let thumbnailError: string | null = null;
     if (opts.thumbnailPath?.trim()) {
-      for (let attempt = 1; attempt <= 2 && !thumbnailSet; attempt++) {
-        if (attempt === 2) await new Promise((r) => setTimeout(r, 12000));
-        try {
-          await youtube.thumbnails.set({ videoId, media: { body: createReadStream(opts.thumbnailPath) } });
-          thumbnailSet = true;
-          this.logger.log(`Thumbnail set for ${videoId} (attempt ${attempt})`);
-        } catch (e) {
-          const msg = googleErrMessage(e);
-          if (attempt === 1) this.logger.warn(`thumbnails.set will retry once for ${videoId}: ${msg}`);
-          else this.logger.error(`Thumbnail NOT set for ${videoId}: ${msg} — set it manually in Studio`);
-        }
+      try {
+        thumbnailSet = await this.applyThumbnail(youtube, videoId, opts.thumbnailPath);
+      } catch (e) {
+        thumbnailError = e instanceof Error ? e.message : String(e);
       }
+      if (!thumbnailSet && !thumbnailError) thumbnailError = 'thumbnails.set не сработал — см. лог';
     }
 
     // Playlist (best-effort).
@@ -538,9 +548,52 @@ export class YoutubeUploadService {
       videoId, url, requestedPrivacy, actualPrivacy,
       publishAt: opts.publishAt ?? null,
       containsSyntheticMedia: synthetic,
-      thumbnailSet, playlistAdded, captionsAttached,
+      thumbnailSet, thumbnailError, playlistAdded, captionsAttached,
       markedPublished: actualPrivacy === 'public',
     };
+  }
+
+  // ── thumbnail ───────────────────────────────────────────────────────────────
+
+  /**
+   * Upload a cover for `videoId` — BYTE-FOR-BYTE, never re-encoded. Over the API's
+   * 2MB limit we don't send at all: the operator sets that cover by hand in Studio
+   * (50MB there), which keeps the original picture untouched. Retries once after a
+   * pause because right after insert the video is still processing and the set
+   * occasionally doesn't take.
+   */
+  private async applyThumbnail(youtube: ReturnType<typeof google.youtube>, videoId: string, thumbnailPath: string): Promise<boolean> {
+    const size = statSync(thumbnailPath).size;
+    if (size > MAX_THUMB_BYTES) {
+      throw new BadRequestException(
+        `Обложка ${(size / 1048576).toFixed(2)}МБ — API принимает только до 2МБ. Поставь её руками в Studio (там лимит 50МБ), картинка уйдёт как есть.`);
+    }
+    const mimeType = /\.png$/i.test(thumbnailPath) ? 'image/png' : 'image/jpeg';
+    let lastMsg = '';
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (attempt === 2) await new Promise((r) => setTimeout(r, 12000));
+      try {
+        await youtube.thumbnails.set({ videoId, media: { mimeType, body: createReadStream(thumbnailPath) } });
+        this.logger.log(`Thumbnail set for ${videoId} (attempt ${attempt}) from ${thumbnailPath}`);
+        return true;
+      } catch (e) {
+        lastMsg = googleErrMessage(e);
+        if (attempt === 1) this.logger.warn(`thumbnails.set will retry once for ${videoId}: ${lastMsg}`);
+      }
+    }
+    this.logger.error(`Thumbnail NOT set for ${videoId}: ${lastMsg} — set it in Studio`);
+    throw new BadRequestException(`YouTube не принял обложку: ${lastMsg}`);
+  }
+
+  /** Set/replace the cover of an ALREADY-uploaded video — re-uploading gigabytes
+   *  just to fix a cover would be absurd. Used by the stepper's retry button. */
+  async setThumbnailFor(videoId: string, thumbnailPath: string): Promise<{ videoId: string; thumbnailSet: boolean }> {
+    if (!thumbnailPath?.trim()) throw new BadRequestException('Не указан путь к обложке');
+    if (!existsSync(thumbnailPath)) throw new BadRequestException(`Обложка не найдена: ${thumbnailPath}`);
+    const client = this.auth.getClient();
+    if (!client) throw new BadRequestException('YouTube is not connected.');
+    const youtube = google.youtube({ version: 'v3', auth: client as never });
+    return { videoId, thumbnailSet: await this.applyThumbnail(youtube, videoId, thumbnailPath) };
   }
 
   /**

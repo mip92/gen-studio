@@ -17,6 +17,16 @@ export interface SceneJobParams {
   participants:    SceneParticipant[];
   /** Description of what's happening in the scene. */
   scenePrompt:     string;
+  /** Location.description, kept OUT of scenePrompt on the Qwen path so it can
+   *  carry its own word budget (see QWEN_WORD_BUDGET in qwen/qwen-prompt.ts).
+   *  The CLIP strategies still receive the location appended into scenePrompt by
+   *  the service, exactly as before — nothing about them changes. */
+  locationPrompt?: string;
+  /** Short label for the object reference staged as the LAST entry of
+   *  `anchorImagePaths` (a prop with an installed anchor PNG). Present only when
+   *  that image was actually attached, so the strategy can bind it to its own
+   *  `Picture N` line. See Prop.anchorPath / props.controller. */
+  objectReferenceLabel?: string;
   /** Negative prompt — appended to the strategy's defaults. */
   negativeExtra?:  string;
   width:           number;

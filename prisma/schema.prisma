@@ -115,6 +115,8 @@ model Project {
   referenceAssets   ReferenceAsset[]
   narrativeBlocks   NarrativeBlock[]
   ttsEmotionRefs    ProjectTTSEmotionRef[]
+  thumbnailJobs     ThumbnailJob[]
+  thumbnailIdeaJobs ThumbnailIdeaJob[]
   ttsVoiceover      Voiceover?            @relation(fields: [ttsVoiceoverId], references: [id], onDelete: SetNull)
 
   @@index([ttsVoiceoverId])
@@ -897,6 +899,19 @@ model NarrativeBlock {
   /// Default ACE-Step tag prompt inherited by every segment unless overridden.
   /// English comma-separated tags (e.g. "cinematic, warm, hopeful, piano").
   moodPrompt String?
+  /// ACE-Step 1.5 metadata conditioning for this act. These are NOT decoration:
+  /// `TextEncodeAceStepAudio1.5` renders them into the model prompt as a labelled
+  /// `# Metas` block (see comfy/text_encoders/ace15.py `_metas_to_cap`), so a
+  /// caption that states its own tempo/key CONTRADICTS them and the beat comes
+  /// out belonging to neither. Tempo and key live here; moodPrompt stays prose.
+  /// Null = leave the workflow template's own value (120 / A minor / 4) alone.
+  /// Valid ranges are enforced in bgm.types.ts — an invalid keyscale is a hard
+  /// ComfyUI validation error, not a soft fallback. See Skill(gen-studio-acestep).
+  bpm           Int?
+  /// "<Root> <quality>", quality lowercase: "A minor", "Eb major". NOT "Am".
+  keyscale      String?
+  /// Bare digit, one of '2' '3' '4' '6'. NOT "4/4".
+  timesignature String?
   /// Ordered array of Shot.id strings this block covers. Source of truth for
   /// `targetSeconds` — kept as JSON instead of a join table because order matters
   /// and the block's "shape" is rarely edited (set once during script breakdown).
@@ -925,6 +940,12 @@ model MusicSegment {
   /// Override of block.moodPrompt for this segment. English ACE-Step tags. Null
   /// = use block default. Lets an arc inside one block ("warm → tense → release").
   prompt      String?
+  /// Per-tile override of the block's ACE-Step metas. Null = inherit the block's
+  /// value (which in turn may be null = keep the template default). Same
+  /// validation rules as NarrativeBlock — see Skill(gen-studio-acestep) §2.
+  bpm           Int?
+  keyscale      String?
+  timesignature String?
   /// Target seconds for this segment. Final flac length is decided by ACE-Step
   /// (driven by node `EmptyAceStep1.5LatentAudio.seconds`); this is the request.
   durationSec Int      @default(60)
@@ -995,6 +1016,107 @@ model AnchorRenderJob {
   @@index([profileId])
   @@index([status, queuedAt])
   @@map("anchor_render_jobs")
+}
+
+/// YouTube thumbnail jobs — render the cover ART for a project, with NO text in
+/// it, then draw the clickbait caption on top from a font file.
+///
+/// The split is deliberate (user decision 2026-07-27). A diffusion model has no
+/// channel for typography: no coordinates, no font size, no per-word colour, so
+/// asking it to write the caption made placement and the red accent word a
+/// lottery — proven over eight Qwen-Image-Edit test renders. `captionSpec` is
+/// consumed by `scripts/render_caption.py`, which is deterministic, needs no
+/// GPU, and can therefore be re-run over the same art as many times as the
+/// operator wants to reword the hook.
+///
+/// Stage 2 of the thumbnail pipeline: the local text model reads the screenplay
+/// and invents cover concepts. Queued like every other GPU job — Ollama needs
+/// the whole card, so the dispatcher stops ComfyUI before running it (engine
+/// class `ollama`), instead of the job fighting a render for VRAM.
+///
+/// The result is a REVIEW LIST, not work: the operator reads the concepts and
+/// queues only the ones worth rendering, as ThumbnailJob rows.
+model ThumbnailIdeaJob {
+  id           String    @id @default(uuid())
+  projectId    String
+  /// How many distinct concepts to ask for.
+  count        Int       @default(6)
+  status       String    @default("pending")
+  /// The proposed concepts once generated: [{ idea, prompt, refProfileCode,
+  /// captionSpec }]. Kept even after they are queued, as a record of what the
+  /// model actually suggested.
+  result       Json?
+  errorMessage String?
+  queuedAt     DateTime  @default(now())
+  startedAt    DateTime?
+  completedAt  DateTime?
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([status, queuedAt])
+  @@map("thumbnail_idea_jobs")
+}
+
+/// Only the ART half is queued work; the caption pass runs outside the queue.
+///
+/// ONE ROW = ONE IDEA, rendered as a batch of candidates. A project accumulates
+/// many rows: the operator asks for a fresh set of concepts, queues them, tops
+/// the pool up later ("догенерировать"), and finally picks a single winning
+/// frame out of everything on the table — so the pool is deliberately additive
+/// and nothing is overwritten by the next round.
+model ThumbnailJob {
+  id            String    @id @default(uuid())
+  projectId     String
+  status        String    @default("pending")
+  /// Short human label of the concept ("птица в золотой клетке"), so a wall of
+  /// candidates stays readable in the picker.
+  idea          String?
+  /// Natural-language art prompt. NEVER asks for lettering (see the skill §5.6).
+  prompt        String
+  negative      String?
+  /// Candidates to render for THIS idea. Several ideas × several candidates is
+  /// how the pool reaches double digits.
+  batchSize     Int       @default(2)
+  /// Filenames of the rendered candidates, relative to `artPath`.
+  candidates    Json?
+  /// Set on the ONE job across the whole project whose candidate the operator
+  /// chose; holds that candidate's filename. Picking a new winner clears it
+  /// everywhere else, so "the chosen cover" is always a single row.
+  chosenFilename String?
+  /// Keep the anchor's PIXEL channel (`reference_latents`) as well as the VL
+  /// one. On = likeness holds; off = only "who this person is" semantics travel
+  /// and the composition is free. Null = the service default. Per-idea because
+  /// it is the single biggest lever on a cover and worth A/B-ing.
+  referenceLatents Boolean?
+  /// Whose anchors are attached as identity references, in Picture-N order —
+  /// `image1..image3` on the encode nodes, which is the graph's hard limit.
+  ///
+  /// The local model chooses these per concept: which age profile the moment
+  /// calls for (VIKA_YOUNG for the arrival, VIKA_OLD for the reckoning), and
+  /// whether a second person belongs in frame. Codes only, always from THIS
+  /// project's cast — anchors from other films are deliberately out of scope,
+  /// since on non-Qwen projects the first reference also carries the style.
+  refProfileCodes String[]
+  /// Caption parameters for the overlay pass: lines, accent_word, accent_color,
+  /// position, align, width_pct, font. Shape documented in render_caption.py.
+  captionSpec   Json?
+  /// ComfyUI prompt_id once dispatched. Null until pending → running.
+  comfyPromptId String?
+  /// Directory of the rendered text-free art candidates.
+  artPath       String?
+  /// The finished cover (art + caption) once the overlay pass has run.
+  outputPath    String?
+  errorMessage  String?
+  queuedAt      DateTime  @default(now())
+  startedAt     DateTime?
+  completedAt   DateTime?
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([status, queuedAt])
+  @@map("thumbnail_jobs")
 }
 
 /// Subtitle/caption jobs — transcribe a project's FINAL exported mp4 with
@@ -1139,9 +1261,11 @@ model QueueEntry {
   classifiedAt  DateTime?
 
   queuedAt      DateTime  @default(now())
-  /// When this entry FIRST became the head of the queue but lost the slot to
-  /// same-groupKey batching. Persisted (not in-memory) so the anti-starvation
-  /// clock survives a backend restart. Cleared once it actually dispatches.
+  /// LEGACY, always null. Held the anti-starvation clock for the head of the
+  /// queue back when the dispatcher could let a same-groupKey job cut ahead of
+  /// it. Batching moved to enqueue time (nothing overtakes the head any more),
+  /// so nothing reads or writes this; kept only to avoid a rewrite of 33k rows
+  /// of history for a dropped column.
   firstEligibleAt DateTime?
   startedAt     DateTime?
   completedAt   DateTime?

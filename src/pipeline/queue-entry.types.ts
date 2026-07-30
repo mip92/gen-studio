@@ -28,11 +28,14 @@ export type JobType =
   | 'anchor'
   | 'validation'
   | 'anchor_validation'
-  | 'caption';
+  | 'caption'
+  | 'thumbnail'
+  | 'thumbnail_ideas';
 
 export const JOB_TYPES: readonly JobType[] = [
   'training', 'dataset', 'scene', 'video', 'video_post', 'tts',
   'bgm', 'anchor', 'validation', 'anchor_validation', 'caption',
+  'thumbnail', 'thumbnail_ideas',
 ] as const;
 
 export function isJobType(t: string): t is JobType {
@@ -68,9 +71,11 @@ export const ENGINE_CLASS: Record<JobType, EngineClass> = {
   video_post:        'comfy',
   bgm:               'comfy',
   anchor:            'comfy',
+  thumbnail:         'comfy',
   dataset:           'comfy',
   validation:        'ollama',
   anchor_validation: 'ollama',
+  thumbnail_ideas:   'ollama',
   caption:           'whisper',
   training:          'kohya',
   tts:               'standalone',
@@ -116,6 +121,9 @@ export const USEFUL_REASONS: readonly OutcomeReason[] = ['chosen', 'infra'] as c
  */
 export const INFRA_JOB_TYPES: readonly JobType[] = [
   'validation', 'anchor_validation', 'caption', 'dataset', 'training',
+  // Writing cover concepts produces no rival artifact — it is overhead the
+  // finished film paid for, like a QC pass.
+  'thumbnail_ideas',
 ] as const;
 
 export function isInfraJobType(t: JobType): boolean {
@@ -133,7 +141,8 @@ export const SHOT_STAGES: readonly JobType[] = ['scene', 'video', 'video_post', 
  * Batching group for a unit of work: the WORKFLOW/MODEL identity, not the job
  * type. Two entries sharing a group can run back-to-back without ComfyUI
  * unloading and reloading checkpoints (~30 s instead of ~2.5 min), which is why
- * the dispatcher prefers to drain a group before switching.
+ * a new entry is filed behind its group's last pending sibling when it is
+ * enqueued (`QueueLedgerService.groupedRank`). Nothing reorders at dispatch.
  *
  * Scene and anchor renders resolve their exact graph per shot deep inside the
  * render strategies — far too expensive to recompute every tick — so the
@@ -152,11 +161,18 @@ export function groupKeyFor(
     case 'video_post': return 'video_post';
     case 'scene':      return `scene:${opts.visualStyle ?? 'default'}`;
     case 'anchor':     return `anchor:${opts.visualStyle ?? 'default'}`;
+    // Its own group, never batched with scenes: the thumbnail graph deliberately
+    // drops the Lightning speed LoRA and raises steps/cfg, so it reloads the
+    // model chain anyway — and there is at most one of these per project.
+    case 'thumbnail':  return 'thumbnail:qwen';
     case 'dataset':    return `dataset:${opts.visualStyle ?? 'default'}`;
     case 'tts':        return `tts:${opts.ttsEngine ?? 'silero'}`;
     case 'bgm':        return 'bgm:acestep';
     case 'validation':
     case 'anchor_validation': return 'ollama:vision';
+    // Own group: this one loads the 30B, the validators load the 8B, and
+    // interleaving them would swap models on every entry.
+    case 'thumbnail_ideas':   return 'ollama:ideas';
     case 'caption':    return 'whisper';
     case 'training':   return 'kohya';
   }
@@ -171,12 +187,3 @@ export const RANK_GAP = 65_536;
  */
 export const RANK_MIN_GAP = 1e-6;
 
-/** Ceiling on consecutive same-groupKey dispatches, so batching cannot run forever. */
-export const MAX_BATCH_RUN = 20;
-
-/**
- * How long the true head of the queue may be held back by same-groupKey
- * batching before it is forced through regardless. Bounds the cost of the
- * model-reload optimisation for a job the user just moved to the front.
- */
-export const BATCH_STARVATION_MS = 15 * 60 * 1000;

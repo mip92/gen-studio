@@ -49,6 +49,7 @@ export class QwenDualCharacterOverlayStrategy implements SceneStrategy {
     const instruction = composeQwenInstruction({
       participants:   params.participants ?? [],
       scenePrompt:    stripBakedStyleBlock(params.scenePrompt ?? ''),
+      locationPrompt: params.locationPrompt,
       styleDirective: KEEP_REFERENCE_STYLE,
       withReferences: true,
     });

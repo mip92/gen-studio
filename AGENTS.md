@@ -335,6 +335,13 @@ Consequences worth knowing before you touch anything nearby:
   "when the work was requested". Reordering rewrites `rank`; whole-project
   priority is `Project.queuePriorityTier`, which is sticky — future jobs of that
   project inherit it.
+- **The dispatcher never reorders. Batching happens at enqueue.** `selectNext()`
+  takes the head of `pendingOrdered()` and nothing else, so the list on screen is
+  the order things run in. Keeping ComfyUI from reloading a checkpoint on every
+  job is `groupedRank`'s job: a new entry is filed directly behind the last
+  pending entry sharing its `groupKey`, within its own (tier, prioritisedAt)
+  bucket. Do not reintroduce run-time reordering — it made a job dragged to the
+  top wait up to 15 minutes.
 - **The ledger has no foreign keys, on purpose.** Deleting a shot, scene or
   project must NOT erase the record of time spent on it. Delete paths call
   `ledger.cancelAndSealUnder(scope, reason)` first, which stops in-flight ComfyUI

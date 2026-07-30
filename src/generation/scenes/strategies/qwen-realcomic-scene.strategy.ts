@@ -5,6 +5,7 @@ import { QwenSceneGraphBuilder } from '../qwen/qwen-scene-graph.builder';
 import {
   composeQwenInstruction,
   hasBakedRealcomicStyle,
+  stripBakedRealcomicStyle,
   REALCOMIC_TRIGGER,
   REALCOMIC_T2I_STYLE,
 } from '../qwen/qwen-prompt';
@@ -51,11 +52,22 @@ export class QwenRealcomicSceneStrategy implements SceneStrategy {
     // the positive, don't stack REALCOMIC_T2I_STYLE on top. The short EDIT
     // trigger sentence is exempt — it's the LoRA's trained instruction.
     const t2iStyle = hasBakedRealcomicStyle(params.scenePrompt) ? '' : REALCOMIC_T2I_STYLE;
+    // With anchors attached the style is carried by the RealComic LoRA plus the
+    // trigger sentence at the tail, so the seeded style block is CUT off the head
+    // of the positive: repeating it in text only pushed the shot's action further
+    // from the front (it sat at word ~95 of a 190-word instruction) and dragged
+    // in the block's trailing negations, which rule 2 forbids. Text-only renders
+    // (environment shots) keep it — there the text IS the only style carrier.
+    const scenePrompt = anchors.length > 0
+      ? stripBakedRealcomicStyle(params.scenePrompt ?? '')
+      : (params.scenePrompt ?? '');
     const instruction = composeQwenInstruction({
       participants:   params.participants ?? [],
-      scenePrompt:    params.scenePrompt ?? '',
+      scenePrompt,
+      locationPrompt: params.locationPrompt,
       styleDirective: anchors.length > 0 ? REALCOMIC_TRIGGER : t2iStyle,
       withReferences: anchors.length > 0,
+      objectReference:  params.objectReferenceLabel ? { label: params.objectReferenceLabel } : undefined,
     });
 
     return this.builder.build(template, {

@@ -1,10 +1,18 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { existsSync } from 'fs';
+import { existsSync, statSync } from 'fs';
 import { PrismaService } from '../prisma/prisma.service';
 import { YoutubeCaptionsService } from './youtube-captions.service';
 import { YoutubeUploadService } from './youtube-upload.service';
 
 const LANG = 'ru';
+/** Data API cap for thumbnails.set. Studio's uploader allows 50MB — anything in
+ *  between goes up by hand there rather than being re-encoded here. */
+const API_THUMB_LIMIT = 2 * 1024 * 1024;
+/** Size of a cover file, 0 when it's gone (a moved/deleted file must not throw
+ *  from a plain read of the launch state). */
+function thumbBytes(p?: string): number {
+  try { return p && existsSync(p) ? statSync(p).size : 0; } catch { return 0; }
+}
 
 /** One video in a launch bundle (the main film or one short). */
 export interface LaunchItem {
@@ -16,6 +24,11 @@ export interface LaunchItem {
   videoId?:     string;               // set after upload
   uploadJobId?: string;               // background upload job (in-memory, lost on restart)
   uploadError?: string | null;        // persisted last upload error (survives restart)
+  thumbnailSet?: boolean;             // did the cover actually land on YouTube?
+  thumbnailError?: string | null;     // why it didn't (YouTube's own message)
+  /** Operator set the cover by hand in Studio (covers over the API's 2MB limit go
+   *  that way — we refuse to re-encode the artwork). On trust, like linkedConfirmed. */
+  thumbnailManual?: boolean;
 }
 
 interface LaunchState {
@@ -32,6 +45,11 @@ export interface LaunchItemView extends LaunchItem {
   transcribeStatus: string | null;    // pending|running|completed|failed|null
   uploaded:         boolean;
   uploadError:      string | null;
+  /** Uploaded, a cover was given, but it isn't on YouTube yet → set it before publishing. */
+  thumbnailMissing: boolean;
+  thumbnailError:   string | null;
+  /** Cover is too big for the API (2MB) — Studio (50MB) is the only path for it. */
+  thumbnailTooBig:  boolean;
 }
 
 export interface LaunchView {
@@ -111,6 +129,8 @@ export class YoutubeLaunchService {
         const job = this.upload.getJob(it.uploadJobId);
         if (job?.status === 'done' && job.result?.videoId) {
           it.videoId = job.result.videoId; it.uploadJobId = undefined; it.uploadError = undefined; uploadError = null; dirty = true;
+          it.thumbnailSet = job.result.thumbnailSet;
+          it.thumbnailError = job.result.thumbnailError ?? null;
         } else if (job?.status === 'error') {
           it.uploadError = job.error ?? 'upload failed'; it.uploadJobId = undefined; uploadError = it.uploadError; dirty = true;
         } else if (!job) {
@@ -120,7 +140,18 @@ export class YoutubeLaunchService {
         // else: still running → keep uploadJobId, uploadError stays null
       }
       const cap = await this.captions.latestForVideoPath(it.videoPath);
-      items.push({ ...it, transcribeStatus: cap?.status ?? null, uploaded: Boolean(it.videoId), uploadError });
+      items.push({
+        ...it,
+        transcribeStatus: cap?.status ?? null,
+        uploaded: Boolean(it.videoId),
+        uploadError,
+        // Only meaningful once uploaded and only when a cover was actually given
+        // (shorts often have none — YouTube picks a frame and that's fine).
+        thumbnailMissing: Boolean(it.videoId) && Boolean(it.thumbPath?.trim())
+                          && it.thumbnailSet !== true && it.thumbnailManual !== true,
+        thumbnailError: it.thumbnailError ?? null,
+        thumbnailTooBig: Boolean(it.thumbPath?.trim()) && thumbBytes(it.thumbPath) > API_THUMB_LIMIT,
+      });
     }
     if (dirty) await this.writeState(project.id, state);
 
@@ -185,6 +216,7 @@ export class YoutubeLaunchService {
     if (existing) {
       existing.videoPath = videoPath; existing.thumbPath = thumbPath ?? '';
       existing.videoId = undefined; existing.uploadJobId = undefined; existing.uploadError = undefined;
+      existing.thumbnailSet = undefined; existing.thumbnailError = undefined; existing.thumbnailManual = undefined;
     } else {
       state.items.push({ key: item.key, kind: item.kind, slug: item.slug, videoPath, thumbPath: thumbPath ?? '' });
     }
@@ -208,6 +240,46 @@ export class YoutubeLaunchService {
       });
       it.uploadJobId = jobId; it.uploadError = undefined;
       await this.writeState(project.id, state);
+    }
+    return this.get(idOrSlug);
+  }
+
+  /** Operator says the cover is up in Studio. Covers over the API's 2MB limit can
+   *  only go that way (we won't re-encode the artwork), so — like linkedConfirmed —
+   *  this is on trust: the API won't tell us whether a thumbnail is custom. */
+  async confirmThumbnailManual(idOrSlug: string, key: string): Promise<LaunchView> {
+    const project = await this.project(idOrSlug);
+    const state   = this.readState(project);
+    const it = state.items.find((i) => i.key === key);
+    if (!it) throw new NotFoundException(`Launch item "${key}" not found`);
+    if (!it.videoId) throw new BadRequestException('Видео ещё не залито — обложку ставить некуда');
+    it.thumbnailManual = true; it.thumbnailError = null;
+    await this.writeState(project.id, state);
+    this.logger.log(`launch ${idOrSlug}: ${key} (${it.videoId}) — обложка поставлена вручную в Studio`);
+    return this.get(idOrSlug);
+  }
+
+  /** Send the cover of an ALREADY-uploaded item through the API. Only works for a
+   *  file under 2MB — the video itself (gigabytes) stays where it is. Optionally
+   *  point at a different image. */
+  async retryThumbnail(idOrSlug: string, key: string, thumbPath?: string): Promise<LaunchView> {
+    const project = await this.project(idOrSlug);
+    const state   = this.readState(project);
+    const it = state.items.find((i) => i.key === key);
+    if (!it) throw new NotFoundException(`Launch item "${key}" not found`);
+    if (!it.videoId) throw new BadRequestException('Видео ещё не залито — обложка уйдёт вместе с заливкой');
+    const src = (thumbPath ?? it.thumbPath ?? '').trim();
+    if (!src) throw new BadRequestException('Для этого ассета не указана обложка');
+    try {
+      const r = await this.upload.setThumbnailFor(it.videoId, src);
+      it.thumbPath = src; it.thumbnailSet = r.thumbnailSet; it.thumbnailError = null;
+      await this.writeState(project.id, state);
+      this.logger.log(`launch ${idOrSlug}: thumbnail re-sent for ${key} (${it.videoId})`);
+    } catch (e) {
+      it.thumbnailSet = false;
+      it.thumbnailError = e instanceof Error ? e.message : String(e);
+      await this.writeState(project.id, state);
+      throw e;
     }
     return this.get(idOrSlug);
   }

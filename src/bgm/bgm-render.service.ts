@@ -25,6 +25,7 @@ import {
   DEFAULT_RENDER_PARAMS,
   OVERGEN_SECONDS,
   RENDER_MAX_SECONDS,
+  normaliseMusicMetas,
 } from './bgm.types';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
@@ -109,6 +110,23 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException(`durationSec must be in [10, 240] (got: ${durationSec})`);
     }
 
+    // ACE-Step metadata conditioning, resolved render-override → segment → block.
+    // Left as null when nobody set it anywhere: patch() then leaves the workflow
+    // template's own value alone, which is exactly how every take before this
+    // feature rendered. The caption must not restate these — see
+    // Skill(gen-studio-acestep) §1.
+    let overrideMetas: ReturnType<typeof normaliseMusicMetas>;
+    try {
+      overrideMetas = normaliseMusicMetas(input);
+    } catch (e: any) {
+      throw new BadRequestException(e?.message ?? String(e));
+    }
+    const pick = <T>(a: T | null | undefined, b: T | null | undefined, c: T | null | undefined): T | null =>
+      a ?? b ?? c ?? null;
+    const bpm           = pick(overrideMetas.bpm,           segment.bpm,           segment.block.bpm);
+    const keyscale      = pick(overrideMetas.keyscale,      segment.keyscale,      segment.block.keyscale);
+    const timesignature = pick(overrideMetas.timesignature, segment.timesignature, segment.block.timesignature);
+
     const count = Math.max(1, Math.min(4, input.count ?? 1));
     // Overgenerate by OVERGEN_SECONDS so CapCut export has tail material to
     // fade out into; the rendered flac is longer than the timeline slot.
@@ -120,6 +138,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         : Math.floor(Math.random() * 2 ** 32);
       const params: AudioRenderParams = {
         prompt:      promptResolved,
+        bpm,
+        keyscale,
+        timesignature,
         durationSec,
         renderSec,
         seed,
@@ -163,6 +184,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
       const template = this.loadTemplate(project.slug, job.workflowFilename);
       const workflow = this.patch(template, {
         prompt:         params.prompt,
+        bpm:            params.bpm ?? null,
+        keyscale:       params.keyscale ?? null,
+        timesignature:  params.timesignature ?? null,
         // ACE-Step renders renderSec; CapCut trims to durationSec on export.
         // Older job rows without renderSec fall back to durationSec.
         renderSec:      params.renderSec ?? params.durationSec,
@@ -276,6 +300,18 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
    *                                     .seed     ← same seed as KSampler so
    *                                                 the LLM that generates
    *                                                 audio codes is deterministic
+   *                                     .bpm / .keyscale / .timesignature
+   *                                               ← resolved metas, ONLY when
+   *                                                 non-null. The tokenizer
+   *                                                 renders these into the model
+   *                                                 prompt as a "# Metas" block,
+   *                                                 so leaving them contradicting
+   *                                                 the caption is what produced
+   *                                                 the broken rhythm. A null
+   *                                                 keeps the template value —
+   *                                                 do NOT substitute a default
+   *                                                 here, or an untuned act would
+   *                                                 silently change sound.
    *   4 — ConditioningZeroOut           (no inputs to patch; reads from node 3)
    *   5 — KSampler.{seed, steps, cfg, sampler_name, scheduler}
    *   7 — SaveAudio.filename_prefix     ← "bgm/<blockSlug>/<jobId>"
@@ -285,6 +321,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
    */
   private patch(template: Record<string, any>, p: {
     prompt:         string;
+    bpm:            number | null;
+    keyscale:       string | null;
+    timesignature:  string | null;
     /** Seconds passed to ACE-Step (renderSec — already includes overgen tail). */
     renderSec:      number;
     seed:           number;
@@ -302,6 +341,9 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     set('3', 'tags',             p.prompt);
     set('3', 'duration',         p.renderSec);
     set('3', 'seed',             p.seed);
+    if (p.bpm           !== null) set('3', 'bpm',           p.bpm);
+    if (p.keyscale      !== null) set('3', 'keyscale',      p.keyscale);
+    if (p.timesignature !== null) set('3', 'timesignature', p.timesignature);
     set('5', 'seed',             p.seed);
     set('5', 'steps',            p.steps);
     set('5', 'cfg',              p.cfg);

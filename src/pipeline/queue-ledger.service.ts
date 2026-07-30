@@ -3,8 +3,6 @@ import { PrismaService } from '../prisma/prisma.service';
 import {
   ENGINE_CLASS,
   JobType,
-  MAX_BATCH_RUN,
-  BATCH_STARVATION_MS,
   Outcome,
   OutcomeReason,
   QueueStatus,
@@ -106,8 +104,8 @@ interface SnapshotContext {
  *   - enqueue: one entry per attempt, with a denormalized snapshot so the record
  *     outlives the shot/scene/project it belonged to
  *   - order: `rank` (+ the project's priority tier), never a mutated timestamp
- *   - dispatch selection: priority order, with same-workflow batching bounded by
- *     a run cap and a starvation clock
+ *   - dispatch selection: strictly the head of that order — batching is decided
+ *     when work is enqueued, never by reordering at dispatch time
  *   - close: the terminal write, after which a row is history and is not touched
  *   - finalize: turn still-open entries into permanent records BEFORE their
  *     container is cascade-deleted out of existence
@@ -119,9 +117,6 @@ interface SnapshotContext {
 @Injectable()
 export class QueueLedgerService {
   private readonly logger = new Logger(QueueLedgerService.name);
-
-  /** How far ahead of the head the dispatcher looks for a batchable sibling. */
-  private static readonly LOOKAHEAD = 40;
 
   /**
    * A claimed entry whose job row has not started moving within this window is
@@ -222,7 +217,6 @@ export class QueueLedgerService {
         outcome:       'wasted',
         outcomeReason: 'orphaned',
         classifiedAt:  now,
-        firstEligibleAt: null,
       },
     });
   }
@@ -236,13 +230,21 @@ export class QueueLedgerService {
    * (jobType, jobId) WHERE status IN ('pending','running'), so a double enqueue
    * of the same stage returns the existing live entry instead of creating a
    * competing one.
+   *
+   * Placement is where batching now happens: the entry lands directly behind the
+   * last pending sibling sharing its `groupKey`, so the queue physically comes
+   * out grouped by workflow and the dispatcher can stay a dumb "take the head".
+   * See `groupedRank`.
    */
   async enqueue(jobType: JobType, jobId: string, opts: EnqueueOptions = {}): Promise<QueueEntryRow> {
     const existing = await this.findLive(jobType, jobId);
     if (existing) return existing;
 
-    const ctx  = await this.resolveContext(jobType, jobId);
-    const rank = opts.front ? await this.frontRank() : await this.tailRank();
+    const ctx      = await this.resolveContext(jobType, jobId);
+    const groupKey = opts.groupKey ?? this.groupKeyFor(jobType, ctx, opts.workflowFilename);
+    const rank     = opts.front
+      ? await this.frontRank()
+      : await this.groupedRank(groupKey, ctx.projectId ?? null);
     const attemptNumber = 1 + await this.entries.count({ where: { jobType, jobId } });
 
     const created = await this.entries.create({
@@ -252,7 +254,7 @@ export class QueueLedgerService {
         attemptNumber,
         status:      'pending' as QueueStatus,
         engineClass: ENGINE_CLASS[jobType],
-        groupKey:    opts.groupKey ?? this.groupKeyFor(jobType, ctx, opts.workflowFilename),
+        groupKey,
         rank,
         projectId:     ctx.projectId     ?? null,
         projectSlug:   ctx.projectSlug   ?? null,
@@ -292,6 +294,65 @@ export class QueueLedgerService {
     });
     const max = agg?._max?.rank;
     return (typeof max === 'number' ? max : 0) + RANK_GAP;
+  }
+
+  /**
+   * Rank that files a new entry behind the last pending sibling of its own
+   * `groupKey` — this is where checkpoint batching is decided now.
+   *
+   * The dispatcher used to reorder at run time to keep ComfyUI from reloading a
+   * model on every job (~2.5 min vs ~30 s), which meant the list on screen was
+   * not the order things actually ran in. Doing it here instead keeps that
+   * saving while making the queue honest: what you see is what runs, and a job
+   * you drag to the top really is next.
+   *
+   * Scope is the entry's own ordering bucket — the (priority tier,
+   * prioritisedAt) pair from `pendingOrdered`'s ORDER BY. Ranks are only
+   * comparable inside a bucket, so a prioritised film batches among its own
+   * jobs and can never be interleaved with a lower tier by this.
+   *
+   * Falls back to the very back of the queue when the group has no pending
+   * sibling to join.
+   */
+  private async groupedRank(groupKey: string, projectId: string | null, retried = false): Promise<number> {
+    const [slot] = await this.prisma.$queryRawUnsafe<Array<{ prev: number | null; next: number | null }>>(
+      `WITH me AS (
+         SELECT COALESCE(p."queuePriorityTier", 0)                        AS tier,
+                COALESCE(p."queuePrioritizedAt", TIMESTAMP '-infinity')   AS at
+           FROM (SELECT 1) one
+           LEFT JOIN projects p ON p.id = $1::text
+       ),
+       bucket AS (
+         SELECT e."rank", e."groupKey"
+           FROM queue_entries e
+           LEFT JOIN projects p2 ON p2.id = e."projectId"
+           CROSS JOIN me
+          WHERE e.status = 'pending'
+            AND COALESCE(p2."queuePriorityTier", 0)                      = me.tier
+            AND COALESCE(p2."queuePrioritizedAt", TIMESTAMP '-infinity') = me.at
+       ),
+       tail_of_group AS (
+         SELECT max("rank") AS prev FROM bucket WHERE "groupKey" = $2::text
+       )
+       SELECT g.prev,
+              (SELECT min(b."rank") FROM bucket b WHERE b."rank" > g.prev) AS next
+         FROM tail_of_group g`,
+      projectId,
+      groupKey,
+    );
+
+    const prev = slot?.prev === null || slot?.prev === undefined ? null : Number(slot.prev);
+    const next = slot?.next === null || slot?.next === undefined ? null : Number(slot.next);
+
+    if (prev === null) return this.tailRank();          // no sibling to join
+    if (next === null) return prev + RANK_GAP;          // the group ends the bucket
+    if (next - prev > RANK_MIN_GAP) return (prev + next) / 2;
+
+    // The gap between the group and what follows it has been bisected down to
+    // nothing. Re-space the pending set and place the entry once more.
+    if (retried) throw new BadRequestException('Could not find a free queue slot even after renumbering');
+    await this.renumberPending();
+    return this.groupedRank(groupKey, projectId, true);
   }
 
   /**
@@ -393,44 +454,18 @@ export class QueueLedgerService {
   // ── Dispatch selection ────────────────────────────────────────────────────
 
   /**
-   * Pick the entry to dispatch next: strict priority order, except that a job
-   * sharing the currently-loaded workflow may cut ahead to avoid a ComfyUI
-   * model swap (~2.5 min vs ~30 s).
+   * The entry to dispatch next: the head of the queue, full stop.
    *
-   * Batching is bounded twice over, so it optimises throughput without ever
-   * becoming unfair:
-   *   - `MAX_BATCH_RUN` consecutive same-group dispatches, then the true head goes;
-   *   - `BATCH_STARVATION_MS` on the wall clock, tracked in `firstEligibleAt`
-   *     (a column, so the clock survives a backend restart — the old in-memory
-   *     sticky flag forgot everything on boot).
+   * There is deliberately no cleverness left here. Batching by workflow used to
+   * live at this point and let a sibling of the currently-loaded model cut ahead
+   * of the head, bounded by a run cap and a starvation clock — which made the
+   * displayed order a lie and could hold a just-prioritised job for 15 minutes.
+   * Grouping is now done when work is enqueued (`groupedRank`), so the order in
+   * the list IS the order of execution.
    */
-  async selectNext(state: { lastGroupKey: string | null; runLength: number }): Promise<QueueEntryRow | null> {
-    const pool = await this.pendingOrdered(QueueLedgerService.LOOKAHEAD);
-    if (pool.length === 0) return null;
-
-    const head = pool[0];
-    const sticky = state.lastGroupKey && head.groupKey !== state.lastGroupKey
-      ? pool.find((e) => e.groupKey === state.lastGroupKey) ?? null
-      : null;
-
-    if (!sticky) return head;
-
-    if (state.runLength >= MAX_BATCH_RUN) {
-      this.logger.log(`batching: ran ${state.runLength} × "${state.lastGroupKey}" — yielding to ${head.label}`);
-      return head;
-    }
-
-    // Start (or read) the head's starvation clock. Persisted so a restart in the
-    // middle of a long batch doesn't hand the group another full grace window.
-    const since = head.firstEligibleAt ?? new Date();
-    if (!head.firstEligibleAt) {
-      await this.entries.update({ where: { id: head.id }, data: { firstEligibleAt: since } });
-    }
-    if (Date.now() - since.getTime() > BATCH_STARVATION_MS) {
-      this.logger.log(`batching: ${head.label} waited too long — forcing it ahead of "${state.lastGroupKey}"`);
-      return head;
-    }
-    return sticky;
+  async selectNext(): Promise<QueueEntryRow | null> {
+    const [head] = await this.pendingOrdered(1);
+    return head ?? null;
   }
 
   /**
@@ -443,7 +478,7 @@ export class QueueLedgerService {
   async claim(entryId: string): Promise<boolean> {
     const res = await this.entries.updateMany({
       where: { id: entryId, status: 'pending' },
-      data:  { status: 'running', startedAt: new Date(), firstEligibleAt: null },
+      data:  { status: 'running', startedAt: new Date() },
     });
     return (res?.count ?? 0) > 0;
   }
@@ -531,7 +566,6 @@ export class QueueLedgerService {
         status:      opts.status,
         completedAt: now,
         durationMs,
-        firstEligibleAt: null,
         ...(opts.errorMessage   !== undefined ? { errorMessage:   opts.errorMessage   } : {}),
         ...(opts.outputFilename !== undefined ? { outputFilename: opts.outputFilename } : {}),
         ...(opts.comfyPromptId  !== undefined ? { comfyPromptId:  opts.comfyPromptId  } : {}),
@@ -733,7 +767,6 @@ export class QueueLedgerService {
           outcome:       'wasted',
           outcomeReason: 'orphaned',
           classifiedAt:  now,
-          firstEligibleAt: null,
         },
       });
     }
@@ -771,7 +804,6 @@ export class QueueLedgerService {
           outcome:       'wasted',
           outcomeReason: 'orphaned',
           classifiedAt:  now,
-          firstEligibleAt: null,
         },
       });
     }
@@ -900,6 +932,33 @@ export class QueueLedgerService {
           projectName: project?.name ?? null,
           visualStyle: (project as any)?.visualStyle ?? null,
           label:       '💬 субтитры',
+        };
+      }
+      // Project-scoped like 'caption'; the idea text is the only useful label.
+      case 'thumbnail': {
+        const j = await (this.prisma as any).thumbnailJob.findUnique({ where: { id: jobId } });
+        const project = j?.projectId
+          ? await this.prisma.project.findUnique({ where: { id: j.projectId } })
+          : null;
+        return {
+          projectId:   project?.id   ?? j?.projectId ?? null,
+          projectSlug: project?.slug ?? null,
+          projectName: project?.name ?? null,
+          visualStyle: (project as any)?.visualStyle ?? null,
+          label:       `🖼 ${j?.idea ?? 'обложка'}`,
+        };
+      }
+      case 'thumbnail_ideas': {
+        const j = await (this.prisma as any).thumbnailIdeaJob.findUnique({ where: { id: jobId } });
+        const project = j?.projectId
+          ? await this.prisma.project.findUnique({ where: { id: j.projectId } })
+          : null;
+        return {
+          projectId:   project?.id   ?? j?.projectId ?? null,
+          projectSlug: project?.slug ?? null,
+          projectName: project?.name ?? null,
+          visualStyle: (project as any)?.visualStyle ?? null,
+          label:       `💡 идеи обложки ×${j?.count ?? '?'}`,
         };
       }
     }

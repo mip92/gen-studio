@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { spawn } from 'child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { shotHoldUs } from './shot-timing';
@@ -29,6 +29,45 @@ const SHORTS_PYTHON = process.env.SHORTS_PYTHON ?? 'python';
 const COMIC_MANIFEST_SCRIPT = path.join(APP_ROOT, 'scripts', 'comic_manifest.py');
 const COMIC_EXPORT_SCRIPT   = path.join(APP_ROOT, 'scripts', 'export_comic.py');
 const COMIC_MANIFEST_PYTHON = process.env.COMIC_PYTHON ?? SHORTS_PYTHON;
+
+// ── Chunked comic export (`comic_chunks`) ────────────────────────────────────
+// A feature-length comic draft is ~200 MB of keyframes, which CapCut opens slowly
+// and often crashes on. This export renders the picture as several small drafts
+// (~35 MB each) that the user exports to mp4 one by one, then assembles ONE light
+// final draft: flat video + LIVE narration, music and subtitles, so all the hand
+// work happens once. Separate scripts throughout — the single-draft comic export
+// above is untouched.
+const COMIC_CHUNKS_SCRIPT       = path.join(APP_ROOT, 'scripts', 'comic_chunks.py');
+const COMIC_CHUNKS_BUILD_SCRIPT = path.join(APP_ROOT, 'scripts', 'comic_chunks_build.py');
+const COMIC_ASSEMBLE_SCRIPT     = path.join(APP_ROOT, 'scripts', 'comic_assemble.py');
+/** Spreads per chunk. 4 lands a draft at ~36 MB, next to the size CapCut is known
+ *  to open comfortably; the knob exists because spread weight varies by project. */
+const COMIC_SPREADS_PER_CHUNK   = 4;
+
+/** One chunk of the film, as planned by comic_chunks.py. */
+export interface ComicChunk {
+  part: number;
+  of: number;
+  draft_name: string;
+  manifest: string;
+  spread_from: number;
+  spread_to: number;
+  spreads: number;
+  /** Where this chunk starts on the FILM timeline (manifest µs) — the anchor the
+   *  assembler uses to re-place narration and music after measuring the mp4s. */
+  film_offset_us: number;
+  expected_us: number;
+  ends_on_turn: boolean;
+}
+
+export interface ComicChunkPlan {
+  project_name: string;
+  base_draft_name: string;
+  spreads_total: number;
+  per_chunk: number;
+  film_duration_us: number;
+  chunks: ComicChunk[];
+}
 /** Curated per-project shorts plan lives here (versioned in git). The endpoint
  *  reads it when no plan is POSTed in the request body. */
 const shortsPlanPath = (slug: string) =>
@@ -632,13 +671,20 @@ export class ExportsService {
     const outRoot   = path.join(APP_ROOT, 'data', projectSlug, 'exports', 'capcut');
     mkdirSync(outRoot, { recursive: true });
 
-    // CapCut on Windows keeps user drafts under %LOCALAPPDATA%. If we're not
-    // on Windows or the env var isn't set, fall back to writing into our own
-    // exports tree and the user copies the folder manually (the old behavior).
+    // Where CapCut keeps its drafts. CAPCUT_DRAFTS_ROOT wins, then %LOCALAPPDATA%
+    // (a stock Windows install), then our own exports tree on non-Windows hosts,
+    // where the user copies the folder manually (the old behavior).
+    //
+    // Whatever the override holds, it must be the SAME STRING CapCut uses. CapCut
+    // matches projects in root_meta_info.json by path, so pointing this at the real
+    // location behind a junction — even though it is byte-for-byte the same folder —
+    // makes the launcher list every draft twice (user 2026-07-26).
     const localAppData = process.env.LOCALAPPDATA;
-    const capcutDraftsRoot = localAppData
-      ? path.join(localAppData, 'CapCut', 'User Data', 'Projects', 'com.lveditor.draft')
-      : outRoot;
+    const capcutDraftsRoot =
+      process.env.CAPCUT_DRAFTS_ROOT
+      ?? (localAppData
+        ? path.join(localAppData, 'CapCut', 'User Data', 'Projects', 'com.lveditor.draft')
+        : outRoot);
 
     return {
       project_name:       projectSlug,
@@ -966,34 +1012,241 @@ export class ExportsService {
     return { draft_name: draftName, spreads, status: 'building' };
   }
 
+  // ── Chunked comic export ───────────────────────────────────────────────────
+
+  /**
+   * Start the CHUNKED comic build: slice the film into several small drafts and
+   * render them all, detached. Returns the plan immediately so the UI can show the
+   * chunk list (and, later, one file field per chunk).
+   *
+   * Deliberately does NOT reuse exportComic's body: the single-draft export is a
+   * finished path and this must not be able to change its behaviour.
+   */
+  async exportComicChunks(idOrSlug: string, perChunk = COMIC_SPREADS_PER_CHUNK): Promise<{
+    chunks: ComicChunk[]; status: 'building';
+  }> {
+    const project = await this.findProject(idOrSlug);
+    for (const s of [COMIC_MANIFEST_SCRIPT, COMIC_CHUNKS_SCRIPT, COMIC_CHUNKS_BUILD_SCRIPT]) {
+      if (!existsSync(s)) throw new BadRequestException(`script missing: ${s}`);
+    }
+    if (!existsSync(PYTHON_BIN)) {
+      throw new BadRequestException(`python bin missing: ${PYTHON_BIN} (set EXPORT_PYTHON env)`);
+    }
+    if (this.buildingComic.has(project.slug)) {
+      throw new BadRequestException(
+        `Комикс для «${project.slug}» уже собирается — дождитесь завершения.`);
+    }
+
+    const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
+    mkdirSync(outDir, { recursive: true });
+    const manifestPath = path.join(outDir, 'comic_manifest.json');
+
+    // 1) full manifest — system python (reads the DB via psycopg2). Fast.
+    this.logger.log(`Comic chunks: building manifest for ${project.slug}`);
+    const m = await runPython(COMIC_MANIFEST_PYTHON, [
+      '-X', 'utf8', COMIC_MANIFEST_SCRIPT, '--slug', project.slug, '--pack', '--out', manifestPath,
+    ]);
+    if (m.code !== 0) {
+      throw new BadRequestException(`comic_manifest.py exited ${m.code}: ${m.stderr.trim().slice(-800)}`);
+    }
+
+    // 2) slice it — pure data, also system python (no pyJianYingDraft needed).
+    const s = await runPython(COMIC_MANIFEST_PYTHON, [
+      '-X', 'utf8', COMIC_CHUNKS_SCRIPT, '--manifest', manifestPath,
+      '--out-dir', outDir, '--per-chunk', String(perChunk),
+    ]);
+    if (s.code !== 0) {
+      throw new BadRequestException(`comic_chunks.py exited ${s.code}: ${s.stderr.trim().slice(-800)}`);
+    }
+    const plan = this.readChunkPlan(project.slug);
+    if (!plan) throw new BadRequestException('comic_chunks.py wrote no plan');
+
+    // 3) render every chunk draft — kohya python, DETACHED (slow: hi-res sheets).
+    this.buildingComic.add(project.slug);
+    const logFd = openSync(path.join(outDir, 'comic_build.log'), 'w');
+    this.logger.log(`Comic chunks: spawning build of ${plan.chunks.length} draft(s) for ${project.slug}`);
+    const proc = spawn(PYTHON_BIN, [
+      '-u', '-X', 'utf8', COMIC_CHUNKS_BUILD_SCRIPT,
+      '--plan', path.join(outDir, 'comic_chunks_plan.json'),
+    ], {
+      stdio: ['ignore', logFd, logFd],
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
+      detached: true,
+    });
+    const clear = (code: number | null) => {
+      this.buildingComic.delete(project.slug);
+      this.logger.log(`Comic chunks build for ${project.slug} finished (exit ${code ?? 'err'})`);
+      try { closeSync(logFd); } catch { /* already closed */ }
+    };
+    proc.on('exit', clear);
+    proc.on('error', () => clear(1));
+    proc.unref();
+
+    return { chunks: plan.chunks, status: 'building' };
+  }
+
+  /** The chunk plan as written by comic_chunks.py, or null when none exists yet. */
+  private readChunkPlan(slug: string): ComicChunkPlan | null {
+    const p = path.join(APP_ROOT, 'data', slug, 'exports', 'comic', 'comic_chunks_plan.json');
+    if (!existsSync(p)) return null;
+    try {
+      return JSON.parse(readFileSync(p, 'utf-8')) as ComicChunkPlan;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Progress of the chunked build: the plan plus, per chunk, whether its draft has
+   * been written. That is what drives the file-path form — a chunk is only worth
+   * exporting once its draft exists.
+   */
+  async comicChunksStatus(idOrSlug: string): Promise<{
+    chunks: (ComicChunk & { drafted: boolean })[];
+    building: boolean; done: boolean; drafted: number; total: number;
+  }> {
+    const project = await this.findProject(idOrSlug);
+    const plan = this.readChunkPlan(project.slug);
+    if (!plan) {
+      return { chunks: [], building: false, done: false, drafted: 0, total: 0 };
+    }
+    const manifestPath = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic', 'comic_manifest.json');
+    let root = '';
+    if (existsSync(manifestPath)) {
+      const mf = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { capcut_drafts_root?: string };
+      root = mf.capcut_drafts_root ?? '';
+    }
+    const chunks = plan.chunks.map((c) => ({
+      ...c,
+      drafted: !!root && existsSync(path.join(root, c.draft_name, 'draft_content.json')),
+    }));
+    const drafted = chunks.filter((c) => c.drafted).length;
+    return {
+      chunks, drafted, total: chunks.length,
+      building: this.buildingComic.has(project.slug),
+      done: chunks.length > 0 && drafted === chunks.length,
+    };
+  }
+
+  /**
+   * Build the FINAL draft from the mp4s the user rendered out of each chunk.
+   * Synchronous — it only reads durations and writes JSON, no image rendering.
+   */
+  async assembleComicChunks(idOrSlug: string, files: { part: number; path: string }[]): Promise<{
+    draft_name: string; draft_path: string;
+  }> {
+    const project = await this.findProject(idOrSlug);
+    if (!existsSync(COMIC_ASSEMBLE_SCRIPT)) {
+      throw new BadRequestException(`script missing: ${COMIC_ASSEMBLE_SCRIPT}`);
+    }
+    const plan = this.readChunkPlan(project.slug);
+    if (!plan) throw new BadRequestException('нет плана чанков — сначала соберите чанки');
+
+    const byPart = new Map(files.map((f) => [Number(f.part), String(f.path ?? '').trim()]));
+    const missing = plan.chunks
+      .map((c) => c.part)
+      .filter((p) => !byPart.get(p));
+    if (missing.length) {
+      throw new BadRequestException(`не указан mp4 для части: ${missing.join(', ')}`);
+    }
+    for (const [part, p] of byPart) {
+      if (!existsSync(p)) throw new BadRequestException(`часть ${part}: файл не найден — ${p}`);
+    }
+
+    const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
+    const draftName = `${plan.base_draft_name}_final`;
+    const payload = JSON.stringify(Object.fromEntries(byPart));
+    this.logger.log(`Comic assemble: ${project.slug} → ${draftName} (${byPart.size} parts)`);
+    const r = await runPython(PYTHON_BIN, [
+      '-u', '-X', 'utf8', COMIC_ASSEMBLE_SCRIPT,
+      '--manifest', path.join(outDir, 'comic_manifest.json'),
+      '--plan', path.join(outDir, 'comic_chunks_plan.json'),
+      '--files', payload, '--draft-name', draftName,
+    ]);
+    if (r.code !== 0) {
+      throw new BadRequestException(`comic_assemble.py exited ${r.code}: ${r.stderr.trim().slice(-800)}`);
+    }
+    const manifestPath = path.join(outDir, 'comic_manifest.json');
+    const mf = JSON.parse(readFileSync(manifestPath, 'utf-8')) as { capcut_drafts_root?: string };
+    const draftPath = path.join(mf.capcut_drafts_root ?? outDir, draftName);
+    if (!existsSync(path.join(draftPath, 'draft_content.json'))) {
+      throw new BadRequestException(`assemble finished but no draft at ${draftPath}`);
+    }
+    return { draft_name: draftName, draft_path: draftPath };
+  }
+
   /**
    * Poll a comic build: is the draft written yet, and how many spreads are done.
    * `done` flips true once export_comic has written draft_content.json into
    * CapCut's folder. `rendered` counts the spread PNGs already produced.
+   *
+   * `draftName` is OPTIONAL: with none given, the current build is read from the
+   * manifest. That lets a page which did not start the build - a reload, another
+   * tab, another machine - still show its progress.
    */
-  async comicStatus(idOrSlug: string, draftName: string): Promise<{
-    done: boolean; building: boolean; rendered: number; total: number;
+  async comicStatus(idOrSlug: string, draftName?: string): Promise<{
+    done: boolean; building: boolean; rendered: number; total: number; draftName: string;
+    spreads: number; spreadsTotal: number; turns: number; turnsTotal: number;
+    phase: 'spreads' | 'turns' | 'draft' | 'done'; percent: number;
   }> {
     const project = await this.findProject(idOrSlug);
     const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
     const manifestPath = path.join(outDir, 'comic_manifest.json');
-    let root = ''; let total = 0; let outRoot = '';
+    let root = ''; let total = 0; let outRoot = ''; let manifestDraft = '';
     if (existsSync(manifestPath)) {
       const mf = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
-        capcut_drafts_root?: string; output_root?: string; pages?: unknown[];
+        capcut_drafts_root?: string; output_root?: string; draft_name?: string; pages?: unknown[];
       };
       root = mf.capcut_drafts_root ?? '';
       outRoot = mf.output_root ?? '';
+      manifestDraft = mf.draft_name ?? '';
       total = (mf.pages ?? []).length;
     }
-    const done = !!draftName && !!root
-      && existsSync(path.join(root, draftName, 'draft_content.json'));
-    let rendered = 0;
-    const pagesDir = outRoot && draftName ? path.join(outRoot, draftName, 'pages') : '';
+    const name = draftName?.trim() || manifestDraft;
+    const done = !!name && !!root
+      && existsSync(path.join(root, name, 'draft_content.json'));
+
+    // Two rendering phases, both visible on disk. A page turn is counted once its
+    // LAST image (turn_back) exists, so a boundary in progress is not counted early.
+    let spreads = 0;
+    let turns = 0;
+    let newestPageAt = 0;
+    const pagesDir = outRoot && name ? path.join(outRoot, name, 'pages') : '';
     if (pagesDir && existsSync(pagesDir)) {
-      rendered = readdirSync(pagesDir).filter((f) => /^spread_\d+\.png$/.test(f)).length;
+      for (const f of readdirSync(pagesDir)) {
+        const isSpread = /^spread_\d+\.png$/.test(f);
+        const isTurn   = /^turn_back_\d+\.png$/.test(f);
+        if (!isSpread && !isTurn && !/^turn_(bg|front)_\d+\.png$/.test(f)) continue;
+        if (isSpread) spreads++;
+        if (isTurn)   turns++;
+        const m = statSync(path.join(pagesDir, f)).mtimeMs;
+        if (m > newestPageAt) newestPageAt = m;
+      }
     }
-    return { done, building: this.buildingComic.has(project.slug), rendered, total };
+    // One boundary between consecutive spreads.
+    const turnsTotal = Math.max(0, total - 1);
+    const unitsDone  = spreads + turns;
+    const unitsTotal = total + turnsTotal;
+
+    // The in-memory flag is lost on a backend restart, so fall back to the files:
+    // a build that produced a spread in the last few minutes is still going.
+    // Without this the UI reports "not building" for a build that plainly is.
+    const recentlyActive = !done && unitsDone > 0 && Date.now() - newestPageAt < 5 * 60_000;
+    const building = this.buildingComic.has(project.slug) || recentlyActive;
+
+    const phase: 'spreads' | 'turns' | 'draft' | 'done' =
+      done                    ? 'done'
+      : spreads < total       ? 'spreads'
+      : turns   < turnsTotal  ? 'turns'
+      :                         'draft';
+    const percent = unitsTotal > 0 ? Math.round((unitsDone / unitsTotal) * 100) : 0;
+
+    return {
+      done, building, draftName: name,
+      // `rendered`/`total` stay spread-scoped for the caller that polls them.
+      rendered: spreads, total,
+      spreads, spreadsTotal: total, turns, turnsTotal, phase, percent,
+    };
   }
 
 }

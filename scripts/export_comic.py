@@ -49,6 +49,12 @@ BAKE_KF_PER_SEC = 60       # dense travel keyframes: CapCut lerps position linea
                            # stay glued if keyframes are close (else tiny arc-chord
                            # drift shows as residual parallax, user 2026-07-24)
 MIN_BAKE_STEPS  = 5
+# After the dense bake the grid is thinned by `_decimate`: samples CapCut would
+# reconstruct by its own linear interpolation are dropped. The budget is the largest
+# on-screen error a dropped sample may introduce, in pixels of the 1920×1080 frame.
+# 60/s × 4 properties × every layer made a 35-min film weigh 285 MB / 1.3M keyframes,
+# which CapCut needs minutes to open and often crashes on (user 2026-07-26).
+DECIMATE_TOL_PX = 4.6
 PANEL_INSET     = 0.0      # gap between the inked frame and the content (0 = tight)
 # Long-VO rule: never slow a clip below this speed. When the voiceover forces a
 # hold longer than native/SPEED_FLOOR, play the clip at exactly the floor speed
@@ -117,7 +123,73 @@ def _ease(p: float) -> float:
     return 1.0 - (q * q * q) / 2.0
 
 
-def _build_camera(states: List[dict]):
+def _probes(cam, t: int, width: int, height: int) -> List[Tuple[float, float]]:
+    """Screen position, in pixels from the frame centre, of the page's four corners
+    and its centre under the camera at `t`.
+
+    Every baked layer is the SAME camera composed with a fixed affine placer, so
+    bounding how far these probes move bounds the error of the whole page. That is
+    what lets the decimator below work in honest on-screen pixels instead of in
+    abstract camera units. Corners are the extremes — a zoom error displaces a point
+    in proportion to its distance from the centre — so they give the upper bound.
+    Mirrors the sheet mapping documented above (`2z(px-cx)`, `2z(cy-py)`, +y UP) and
+    the clockwise roll applied in `_bake_layer`."""
+    cx, cy, z, rot = cam(int(t))
+    hw, hh = width / 2.0, height / 2.0
+    rad = math.radians(rot); c, s = math.cos(rad), math.sin(rad)
+    out = []
+    for px, py in ((0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)):
+        X = 2.0 * z * (px - cx) * hw
+        Y = 2.0 * z * (cy - py) * hh
+        out.append((X * c + Y * s, -X * s + Y * c))
+    return out
+
+
+def _decimate(cam, grid: List[int], width: int, height: int,
+              tol_px: float = DECIMATE_TOL_PX) -> List[int]:
+    """Drop grid times that CapCut would reconstruct on its own anyway.
+
+    CapCut lerps LINEARLY between keyframes, so a sample already sitting on the
+    straight line between its neighbours carries no information — only weight. This
+    is Ramer–Douglas–Peucker over the camera path with the deviation measured as
+    on-screen probe displacement, so `tol_px` literally means "no point of the page
+    is ever more than this many pixels away from where the dense bake would put it".
+    Holds barely shrink (they are 2/s already and near-straight); the savings come
+    from the 60/s travels, where a cubic ease needs far fewer than 60 points/s to
+    stay inside a few pixels.
+
+    Decimating the SHARED grid — rather than each baked layer afterwards — is the
+    whole point. Every layer goes on sampling the same times, so the page stays
+    exactly as rigid as before. Per-layer decimation would hand the layers DIFFERENT
+    grids, CapCut would draw different lines between them, and the page would come
+    apart in flight: the very parallax the shared grid was introduced to kill."""
+    if len(grid) < 3:
+        return grid
+    P = [_probes(cam, t, width, height) for t in grid]
+    keep = {0, len(grid) - 1}
+    stack = [(0, len(grid) - 1)]
+    while stack:
+        a, b = stack.pop()
+        if b - a < 2:
+            continue
+        ta, tb = grid[a], grid[b]
+        span = float(tb - ta)
+        worst, wi = -1.0, None
+        for i in range(a + 1, b):
+            u = (grid[i] - ta) / span if span else 0.0
+            d = 0.0
+            for (xa, ya), (xb, yb), (xi, yi) in zip(P[a], P[b], P[i]):
+                d = max(d, math.hypot(xi - (xa + (xb - xa) * u),
+                                      yi - (ya + (yb - ya) * u)))
+            if d > worst:
+                worst, wi = d, i
+        if worst > tol_px:
+            keep.add(wi)
+            stack.append((a, wi)); stack.append((wi, b))
+    return [grid[i] for i in sorted(keep)]
+
+
+def _build_camera(states: List[dict], width: int = 1920, height: int = 1080):
     """Return (cam, grid): `cam(t_us)->(cx,cy,zoom)` is the continuous camera path
     (eased speed + sideways ARC + mid-travel ZOOM-OUT on travels, constant on
     holds); `grid` is the sorted list of keyframe times covering the spread (dense
@@ -186,7 +258,11 @@ def _build_camera(states: List[dict]):
                         * (1.0 - ZOOM_DIP * bow) * (1.0 + (sz - 1.0) * bow), rot)
         b = segs[-1][3]; return (b["cx"], b["cy"], b["zoom"], 0.0)
 
-    return cam, sorted(grid)
+    dense = sorted(grid)
+    thin = _decimate(cam, dense, width, height)
+    _log(f'camera grid: {len(dense)} samples -> {len(thin)} after decimation '
+         f'({len(thin)/max(1, len(dense)):.0%}, <={DECIMATE_TOL_PX}px)')
+    return cam, thin
 
 
 def _bake_layer(seg, cam, grid, placer, lo: int, hi: int, t0: int,
@@ -263,23 +339,61 @@ def _slice(states: List[dict], lo: int, hi: int) -> List[dict]:
 
 
 # ── pseudo-3D page turn ───────────────────────────────────────────────────────
+def _outgoing_panels(page: dict, frames_dir: Path) -> List[dict]:
+    """`page`'s panels with each animated one's still swapped for the LAST frame of
+    its clip — the frame that is actually on screen when the page starts to turn.
+
+    Without this the turn snapped every panel of the outgoing page back to its
+    FIRST frame: the live layer holds the last frame at the end of a spread (the
+    full-spread base underlay is built from `_last_frame_png`), while the baked turn
+    images used `still_path`, which is the first frame. The mismatch reads as every
+    panel jumping to a different shot the instant the page lifts (user 2026-07-26).
+    Extraction is cached by shotCode, so this re-uses the PNGs the main pass wrote.
+    """
+    out = []
+    for p in (page.get("panels") or []):
+        media = p.get("media") or {}
+        vpath = str(media.get("path") or '').replace("\\", "/")
+        if vpath:
+            last = _last_frame_png(vpath, frames_dir, str(p.get("shotCode") or ''))
+            if last:
+                p = {**p, "still_path": last}
+        out.append(p)
+    return out
+
+
 def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
-                    width, height, ss, style, texture) -> int:
+                    width, height, ss, style, texture, frames_dir: Path,
+                    tail_page=None) -> int:
     """At each spread boundary, overlay a wide book (opaque) + a leaf that flips
     across the spine. The leaf carries baked panel content (stills). The spine is
     the canvas centre, and scale_x scales about the centre, so animating scale_x
     from 1→0 (front, current right page) then 0→1 (back, next left page) reads as a
     page turning. Full-canvas images placed at scale 1 / transform 0 (= the wide
-    book), so no half-page scale math is needed."""
+    book), so no half-page scale math is needed.
+
+    `tail_page` exists for the CHUNKED export (`comic_chunks`), where the film is
+    generated as several drafts that are rendered separately and concatenated. Turns
+    live BETWEEN pages of one manifest, so a chunk would otherwise end with a hard
+    cut where the flip belongs. Passing the NEXT chunk's first page renders one extra
+    turn past the last spread — the chunk then ends with the flip and the next chunk
+    opens on the new spread, exactly as the uncut film reads. It is render-only: the
+    page never goes on this chunk's timeline. None (the full export) = unchanged."""
     from PIL import Image
     from comic_page_style import _page_boxes
     from comic_pagebuild import _rect_to_px
 
-    # Turn images are rendered at a REDUCED supersample: the leaf flips in ~0.7s, so
-    # any softness is hidden by the motion — no need for the full ss8 sheet quality.
-    # 21 boundaries × 3 full-canvas images at ss8 was the export's slowest stage;
-    # ss4 quarters the pixels per image (user 2026-07-23).
-    tss = max(2, min(ss, 4))
+    # Turn images sit at CANVAS SCALE: every one of them is keyframed to
+    # uniform_scale 1.0 / position 0,0 (the leaf only ever shrinks, scale_x 1→0), and
+    # the camera has already pulled back to the wide book during END_HOLD. So unlike
+    # the sheet — which the camera magnifies up to 3.376× — these are displayed 1:1
+    # with the 1920×1080 frame and need no zoom headroom at all. ss2 keeps a 2×
+    # cushion for the horizontal squeeze; the old ss4 was a straight 4× waste that
+    # also softened them, since surplus raster is averaged away in the downscale
+    # (measured on the ink overlay: sharpness fell monotonically as raster grew).
+    # 66 full-canvas images per film — this was the export's slowest stage and the
+    # bulk of its media weight, 1697 MB → ~425 MB (user 2026-07-26).
+    tss = max(2, min(ss, 2))
     Wp, Hp = width * tss, height * tss
 
     def _cx(p):
@@ -324,18 +438,30 @@ def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
     STEPS = 10
     half = TURN_US // 2
     n = 0
-    for i in range(len(pages) - 1):
-        A, B = pages[i], pages[i + 1]
+    # (index, ending page, opening page, boundary). The trailing entry only exists
+    # for a chunk that is followed by another one — see `tail_page` above.
+    flips = [(i, pages[i], pages[i + 1], int(spread_bounds[i]))
+             for i in range(len(pages) - 1)]
+    if tail_page is not None:
+        flips.append((len(pages) - 1, pages[-1], tail_page, int(spread_bounds[-1])))
+    for i, A, B, tb in flips:
         sA = int(A.get("pageIndex", i)) + 1
         sB = int(B.get("pageIndex", i + 1)) + 1
-        bg    = _bake_bg(_side(A, False) + _side(B, True), sA, pages_dir / f"turn_bg_{i:03d}.png")
-        front = _bake_leaf(A.get("panels") or [], sA, pages_dir / f"turn_front_{i:03d}.png", right=True)
-        back  = _bake_leaf(B.get("panels") or [], sB, pages_dir / f"turn_back_{i:03d}.png",  right=False)
+        # Asymmetric on purpose. A is the page being turned AWAY: it must show the
+        # LAST frame of each clip, matching what the live layer holds at that moment.
+        # B is the page coming IN: it opens on its first frames, exactly as the next
+        # spread will start. Mixing these up is what made the picture jump.
+        a_panels = _outgoing_panels(A, frames_dir)
+        b_panels = B.get("panels") or []
+        A_out = {**A, "panels": a_panels}
+        bg    = _bake_bg(_side(A_out, False) + _side(B, True), sA, pages_dir / f"turn_bg_{i:03d}.png")
+        front = _bake_leaf(a_panels, sA, pages_dir / f"turn_front_{i:03d}.png", right=True)
+        back  = _bake_leaf(b_panels, sB, pages_dir / f"turn_back_{i:03d}.png",  right=False)
 
         # Start the turn AT the boundary (not straddling it): the spread's END_HOLD
         # already pulled the camera back to the wide book, so the flip begins from
         # that wide view and plays into the next spread's opening (user 2026-07-24).
-        tb = int(spread_bounds[i]); t0 = tb
+        t0 = tb
 
         bg_seg = draft.VideoSegment(
             draft.VideoMaterial(bg, material_name=f"turn_bg_{i}"),
@@ -426,7 +552,7 @@ def build_comic_draft(manifest: dict) -> Path:
             continue
         # ONE shared camera curve + keyframe grid for the whole spread → every
         # layer below bakes on it, so the sheet, videos and frames stay glued.
-        cam, grid = _build_camera(states)
+        cam, grid = _build_camera(states, width, height)
 
         pidx = int(page.get("pageIndex", 0))
         # 1) SHEET background (desk + book + EMPTY holes; NO borders — those go on
@@ -449,10 +575,15 @@ def build_comic_draft(manifest: dict) -> Path:
         #     track, carrying the SAME camera path as the sheet → the borders ride
         #     on top of every panel and lap slightly onto the footage.
         fpng = pages_dir / f'frames_{pidx:03d}.png'
-        # render the frames overlay at HIGHER resolution than the paper sheet: it's
-        # thin geometry the camera zooms into, so extra pixels keep the borders
-        # crisp (not soapy) when magnified; the sheet paper can stay at `ss`.
-        frame_ss = min(8, ss + 2)
+        # Render the frames overlay at the SAME resolution as the paper sheet. The
+        # old rule (`min(8, ss + 2)`) assumed thin geometry wants extra pixels; a
+        # controlled A/B on this very overlay says the opposite — screen sharpness at
+        # max zoom fell monotonically as the raster grew (ss4 218.5 / ss6 192.5 /
+        # ss8 173.6, Laplacian variance of the 1920×1080 the camera actually sees).
+        # Past ~1920×max_zoom the surplus pixels cannot reach the frame; they only
+        # get averaged away by the downscale, which is what softened the ink lines
+        # the rule existed to protect (user 2026-07-26).
+        frame_ss = ss
         render_page(width=width, height=height, panels=panels, style_name=style,
                     texture_path=texture, supersample=frame_ss, seed=pidx + 1,
                     frames_only=True).save(fpng)
@@ -572,10 +703,17 @@ def build_comic_draft(manifest: dict) -> Path:
     #    is overlaid at the boundary, and a leaf carrying baked content flips across
     #    the spine (scale_x, which scales about the canvas centre = the spine).
     preset = str(manifest.get("page_transition") or "none").lower()
-    if preset in ("turn3d", "turn", "flip") and len(pages) > 1:
+    # `turn_tail_page` is set only by the chunked export: it renders one extra flip
+    # past the final spread so the chunk ends on the turn instead of a hard cut, and
+    # the timeline grows by exactly that flip.
+    tail_page = manifest.get("turn_tail_page")
+    if preset in ("turn3d", "turn", "flip") and (len(pages) > 1 or tail_page):
         total_kf += _add_page_turns(
             script, pages, spread_bounds, pages_dir,
-            width=width, height=height, ss=ss, style=style, texture=texture)
+            width=width, height=height, ss=ss, style=style, texture=texture,
+            frames_dir=frames_dir, tail_page=tail_page)
+        if tail_page:
+            timeline_end_us += TURN_US
 
     # 4) BGM
     total_bgm = _place_bgm(script, manifest)
@@ -594,6 +732,26 @@ def build_comic_draft(manifest: dict) -> Path:
     return draft_dir
 
 
+def _bgm_label(title: str, block: str, lane: str) -> str:
+    """Readable name for a BGM track/clip: WHICH ACT this music belongs to.
+
+    The raw names were `bgm_bgm_tighten_a` — the block slug already starts with
+    `bgm_`, so the prefix doubled and nothing said where in the film the act sits.
+
+    The act name is taken from the block's own title (`narrative_blocks.title`,
+    carried into the manifest as `blockTitle`) — its head before the dash is exactly
+    "Акт 4" / "Cold open" / "Финал". An earlier version numbered the blocks by their
+    order on the timeline instead, which was WRONG: the cold open is not an act, so
+    every act came out one too high and the opening and the finale were labelled as
+    acts at all (user caught it 2026-07-26). Never re-derive the act number here —
+    the database already knows it."""
+    head = (title or "").split("—")[0].split(" - ")[0].strip()
+    if not head:
+        head = block[4:] if block.startswith("bgm_") else block
+    role = {"a": "осн.", "b": "запас"}.get(lane, lane)
+    return f"{head} · {role}"
+
+
 def _place_bgm(script: "draft.ScriptFile", manifest: dict) -> int:
     """Checkerboard BGM placement (copied from export_capcut.build_draft)."""
     BGM_CROSSFADE_US = 3_000_000
@@ -607,6 +765,9 @@ def _place_bgm(script: "draft.ScriptFile", manifest: dict) -> int:
         if b not in by_block:
             by_block[b] = []; order.append(b)
         by_block[b].append(mt)
+    # The act name comes from the block itself, never from its position here.
+    titles = {b: str(next((t.get("blockTitle") for t in by_block[b] if t.get("blockTitle")), ""))
+              for b in order}
     placed_total = 0
     for b in order:
         tiles = sorted(by_block[b], key=lambda t: int(t.get("order") or 0))
@@ -614,7 +775,8 @@ def _place_bgm(script: "draft.ScriptFile", manifest: dict) -> int:
         for mt in tiles:
             lane = str(mt.get("lane") or "a")
             if lane not in seen:
-                script.add_track(draft.TrackType.audio, f"bgm_{b}_{lane}"); seen.append(lane)
+                script.add_track(draft.TrackType.audio, _bgm_label(titles[b], b, lane))
+                seen.append(lane)
         cursor = int(tiles[0].get("block_start_us") or 0)
         for mt in tiles:
             lane = str(mt.get("lane") or "a")
@@ -624,13 +786,16 @@ def _place_bgm(script: "draft.ScriptFile", manifest: dict) -> int:
                 continue
             start = cursor
             cursor += max(1_000_000, dur - BGM_CROSSFADE_US)
+            label = _bgm_label(titles[b], b, lane)
             seg = draft.AudioSegment(
-                draft.AudioMaterial(wav, material_name=f'bgm_{b}_{lane}'),
+                # material_name is what CapCut prints ON the clip in the timeline —
+                # label it too, not just the track, or the act stays invisible there.
+                draft.AudioMaterial(wav, material_name=label),
                 target_timerange=draft.Timerange(start=start, duration=dur),
                 source_timerange=draft.Timerange(start=0, duration=dur), volume=0.2)
             fade = min(BGM_CROSSFADE_US, dur // 2)
             seg.add_fade(in_duration=fade, out_duration=fade)
-            script.add_segment(seg, track_name=f"bgm_{b}_{lane}")
+            script.add_segment(seg, track_name=label)
             placed_total += 1
     return placed_total
 

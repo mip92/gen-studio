@@ -37,6 +37,22 @@ export class YoutubeLaunchController {
     return this.launch.uploadItem(idOrSlug, key);
   }
 
+  @Post('thumbnail-manual/:key')
+  @ApiOperation({ summary: 'Confirm the cover was set by hand in Studio (covers over the API 2MB cap)' })
+  confirmThumbnailManual(@Param('idOrSlug') idOrSlug: string, @Param('key') key: string) {
+    return this.launch.confirmThumbnailManual(idOrSlug, key);
+  }
+
+  @Post('thumbnail/:key')
+  @ApiOperation({ summary: 'Send the cover of an already-uploaded item via API (needs ≤2MB)' })
+  retryThumbnail(
+    @Param('idOrSlug') idOrSlug: string,
+    @Param('key') key: string,
+    @Body() body: { thumbPath?: string },
+  ) {
+    return this.launch.retryThumbnail(idOrSlug, key, body?.thumbPath);
+  }
+
   @Post('remove-item/:key')
   @ApiOperation({ summary: 'Remove ONE item from the bundle' })
   removeItem(@Param('idOrSlug') idOrSlug: string, @Param('key') key: string) {

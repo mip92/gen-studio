@@ -62,3 +62,8 @@ backend_stderr.log
 _capcut_draft_backups_*/
 # YouTube OAuth tokens/credentials — SECRETS, never commit
 data/youtube-auth.json
+# Thumbnail workshop artifacts (cover.png + candidates/, tens of MB per project)
+data/*/thumbnail/
+# stray dev logs
+backend.log
+serve_backend.log
