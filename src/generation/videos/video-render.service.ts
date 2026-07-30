@@ -30,10 +30,11 @@ const WORKFLOW_FILENAME = 'video_wan22_i2v_api.json';
 // speed LoRA, 20 steps @ cfg=4.0 → the negative prompt actually fires. ~5×
 // slower than the fast 4-step default. Selected via StartVideoInput.mode='cfg'.
 const CFG_WORKFLOW_FILENAME = 'video_wan22_i2v_cfg_api.json';
-// lightx2v full-distill fp8 checkpoints (Oct-2025 gen): distillation baked into
-// the model weights instead of applied as a rank-64 LoRA. Same 4 steps / cfg=1
-// / render time as the fast default, slightly higher quality ceiling.
-// Selected via StartVideoInput.mode='distill'.
+// Legacy: the old mode='distill' pointed here. The mode was removed 2026-07-30
+// (this JSON was byte-identical to the fast default, it was never exposed in the
+// UI, and no render ever used it — the fast default already loads the
+// full-distill fp8 checkpoints). The filename stays in the allowlist below ONLY
+// so any historical row that carries it can still be reloaded.
 const DISTILL_WORKFLOW_FILENAME = 'video_wan22_i2v_distill_api.json';
 // Allowlist of i2v workflow files the service is permitted to load — guards
 // loadTemplate against a row carrying an unexpected workflowFilename value.
@@ -50,6 +51,33 @@ const COMBINED_WORKFLOW_FILENAME = 'video_upscale_interp_api.json';
 // compatible — the native loader rejects them ("Unrecognized model format").
 const INTERP_MODEL_NAME        = process.env.INTERP_MODEL_NAME ?? 'rife_v4.26.safetensors';
 const DEFAULT_INTERP_MULTIPLIER = 2;
+
+// Wan-readable phrasing for our own `Shot.cameraMove` vocabulary.
+//
+// Alibaba's I2V prompt formula is `Motion + Camera movement`, and an i2v model
+// given no camera instruction does not hold still — it invents a drift, which at
+// 4 steps is where warping and «бред» live. Measured 2026-07-30: only 84 of
+// 5 671 animated shots (1.5 %) named a camera anywhere in their motion prompt,
+// while `Shot.cameraMove` was populated for 6 205 of 6 425 (96.6 %). So the
+// clause is DERIVED from that column at dispatch instead of being re-baked into
+// thousands of prompt strings. Authoring rules: Skill(gen-studio-wan22) §4.
+const CAMERA_CLAUSE: Record<string, string> = {
+  static:        'the camera stays fixed',
+  locked_off:    'the camera stays fixed',
+  push_in:       'the camera pushes in slowly',
+  pull_out:      'the camera pulls back slowly',
+  track:         'the camera tracks slowly alongside',
+  track_lateral: 'the camera tracks slowly sideways',
+  pan:           'the camera pans slowly',
+  pan_left:      'the camera pans slowly to the left',
+  pan_right:     'the camera pans slowly to the right',
+  tilt_up:       'the camera tilts up slowly',
+  tilt_down:     'the camera tilts down slowly',
+  handheld:      'a faint handheld drift',
+  window_pov:    'the camera holds a fixed point of view through the window',
+};
+/** Does this text already tell the camera what to do? */
+const MENTIONS_CAMERA = /camera|handheld|point of view/i;
 
 // Wan2.2 i2v defaults — 768×432 = exact 16:9, both dims divisible by 16.
 // Chosen over 832×480 because 832/480 = 1.733 ≠ 1920/1080 = 1.778, which would
@@ -223,6 +251,9 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         this.composeMotionPrompt(v.motionPrompt, v.shot, project),
         (tok, w) => this.logger.warn(`[${v.shot.shotCode}] stripped motionPrompt weight "(${tok}:${w})"`),
       );
+      // Warn-only: surfaces negations-in-the-positive and missing camera clauses
+      // in the log. Does not rewrite the prompt and does not block the render.
+      this.lintMotionPrompt(v.shot.shotCode, motionPrompt);
       const motionNegative = rawMotionNegative
         ? stripPromptWeights(
             rawMotionNegative,
@@ -410,19 +441,17 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   /**
    * Resolve the i2v workflow file — a BINARY, explicit per-shot choice:
    *   'cfg'        → cfg workflow (20 steps, cfg=4, negative fires) = «качество».
-   *   'distill'    → full-distill fp8 checkpoints, 4 steps / cfg=1 — same speed
-   *                  as fast, distill baked into weights (no LoRA approximation).
-   *   else / fast  → fast workflow (4-step lightx2v, cfg=1, negative ignored)
-   *                  = «быстро», the DEFAULT.
+   *   else / fast  → fast workflow (4-step lightx2v full-distill fp8, cfg=1,
+   *                  negative ignored) = «быстро», the DEFAULT.
    * cfg is ~5× slower, so it is ONLY ever used when the user explicitly picks it
    * per shot. There is NO 'auto' — the old auto silently routed comic/static or
    * motionNegative shots to cfg and quietly 5×'d render time (every shot here
-   * has a baked motionNegative). Engine family (Wan/Flux/SDXL) is decided once
-   * per project via project.visualStyle, not here.
+   * has a baked motionNegative). The former 'distill' mode was removed
+   * 2026-07-30 (see StartVideoInput.mode). Engine family (Wan/Flux/SDXL) is
+   * decided once per project via project.visualStyle, not here.
    */
-  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | 'distill' | undefined): string {
-    if (mode === 'cfg')     return CFG_WORKFLOW_FILENAME;
-    if (mode === 'distill') return DISTILL_WORKFLOW_FILENAME;
+  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | undefined): string {
+    if (mode === 'cfg') return CFG_WORKFLOW_FILENAME;
     return WORKFLOW_FILENAME;
   }
 
@@ -482,20 +511,30 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Build the Wan2.2 positive prompt by concatenating the motion description
-   * with the shot's scene prompt fields (so Wan has both "what's happening"
-   * and "how it should move"). Falls back to a generic motion line if the
-   * user left motionPrompt empty.
+   * Resolve the Wan2.2 positive prompt (node 9 of the i2v graph) for this render.
+   *
+   * The prompt is ONE string and it is the ONLY channel that reaches the model
+   * on the default fast path (cfg=1.0 → the negative is mathematically inert),
+   * so nothing is concatenated onto it beyond the motion line itself. Alibaba's
+   * own I2V formula is `Motion + Camera movement`: the start image already
+   * carries entity, scene, framing and style, and re-describing them asks a
+   * generative model to re-generate content it was meant to preserve — that is
+   * what morphing and identity drift are. Authoring rules: Skill(gen-studio-wan22).
+   *
+   * `promptFields.narrativeBeat` used to be appended here for every non-static
+   * shot. It was removed 2026-07-30: a narrative beat is an abstraction
+   * («расплата за жадность», "a wheel in a skid is an abstraction"), and Wan
+   * answers an abstraction by inventing motion to fill it. 408 animated shots
+   * carried a beat at the time of removal, all of them non-static, i.e. all of
+   * them were shipping their beat to the model as a movement instruction.
    *
    * Static-shot escape hatch: if `promptFields.camera.movement` begins with
    * `static` (e.g. `static_locked_off`), the empty-prompt fallback flips to an
-   * explicit no-motion line and `narrativeBeat` is NOT appended — abstract
-   * beats like "a wheel in a skid is an abstraction" leak motion verbs into
-   * Wan2.2 and force the model to add skidding/push-in even on a locked-off shot.
+   * explicit no-motion line.
    */
   private composeMotionPrompt(
     motion: string,
-    shot: { promptFields: any },
+    shot: { promptFields: any; cameraMove?: string | null; shotCode?: string },
     project?: { defaultMotionPrompt?: string | null; defaultStaticMotionPrompt?: string | null },
   ): string {
     const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
@@ -507,8 +546,14 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     // prompt AND the project's default are empty. Project owners should
     // override via `Project.defaultMotionPrompt` /
     // `Project.defaultStaticMotionPrompt` from the UI.
-    const HARDCODED_STATIC  = 'completely static shot, frozen frame, locked-off tripod camera, no camera motion, no parallax, no zoom, no pan, no dolly, no handheld shake. Every object in frame remains completely stationary. No people walking, no figures moving, no environmental motion, no wind, no leaves moving, no flickering lights. The entire scene is a still photograph come to life with zero motion, freeze frame.';
-    const HARDCODED_DEFAULT = 'subtle camera push-in, gentle breathing motion, natural micro-movements';
+    //
+    // Both were rewritten 2026-07-30 into POSITIVE locks. The old static literal
+    // was 60 words of negation ("no camera motion, no parallax, no zoom, ... No
+    // people walking, no figures moving ...") which, at cfg=1 where the positive
+    // is the only live channel, is a list of the things we do not want handed
+    // straight to the model — Skill(gen-studio-wan22) §3.
+    const HARDCODED_STATIC  = 'the camera stays locked and fixed for the whole shot, every surface and object holding its exact position, the air still and the light steady, a photograph holding its breath';
+    const HARDCODED_DEFAULT = 'the camera pushes in slowly, quiet breathing and small natural micro-movements, the rest of the frame holding still';
 
     const userMotion = motion?.trim() ?? '';
     // Per-shot baked motion-direction override. Wins over project-level
@@ -522,11 +567,56 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       : (project?.defaultMotionPrompt?.trim()       || HARDCODED_DEFAULT);
     const motionLine = userMotion || shotMotion || projectFallback;
 
-    const beat = typeof pf.narrativeBeat === 'string' ? pf.narrativeBeat : '';
-    const parts = isStatic
-      ? [motionLine]
-      : [motionLine, beat].filter((s) => s && s.trim().length > 0);
-    return parts.join(', ');
+    // Derive the camera clause from `Shot.cameraMove` when the prompt itself
+    // says nothing about the camera. Additive only: a prompt that already names
+    // a camera behaviour is left exactly as written, so a hand-authored prompt
+    // can never be contradicted by the enum, and a shot with no cameraMove is
+    // left alone rather than given an invented default.
+    const move  = (shot.cameraMove ?? '').trim();
+    const clause = CAMERA_CLAUSE[move];
+    if (clause && !MENTIONS_CAMERA.test(motionLine)) {
+      return `${motionLine.replace(/[\s,]+$/, '')}, ${clause}`;
+    }
+    return motionLine;
+  }
+
+  /**
+   * Warn-only lint on the resolved Wan positive prompt. Never rewrites and never
+   * blocks a render — it exists so the two defects that actually produce «бред»
+   * are visible in the log instead of only in the output video:
+   *
+   *  1. a negation in the positive. At cfg=1 the positive is the only live
+   *     channel, and diffusion has no operator for "not": `no people` hands the
+   *     model the token *people*. Positive locks instead — Skill(gen-studio-wan22) §3.
+   *  2. no camera clause at all. An i2v model given no camera instruction does
+   *     not hold still, it invents a drift, and at 4 steps that drift is where
+   *     warping lives — §4. "the camera stays fixed" counts as an instruction.
+   *
+   * Also flags prompts long enough to approach the umt5 quality cliff (~320–350
+   * tokens; the 512-token cap truncates silently from the tail).
+   */
+  private lintMotionPrompt(shotCode: string, prompt: string): void {
+    const low = prompt.toLowerCase();
+    const negations = (low.match(/\bno\s+\w+|\bwithout\s+\w+/g) ?? []).slice(0, 4);
+    if (negations.length > 0) {
+      this.logger.warn(
+        `[${shotCode}] motionPrompt carries negations in the POSITIVE at cfg=1 `
+        + `(${negations.join(', ')}) — use positive locks (Skill: gen-studio-wan22 §3)`,
+      );
+    }
+    if (!/camera|handheld|point of view/i.test(prompt)) {
+      this.logger.warn(
+        `[${shotCode}] motionPrompt names no camera behaviour — Wan will invent one `
+        + `(Skill: gen-studio-wan22 §4)`,
+      );
+    }
+    const words = prompt.trim().split(/\s+/).length;
+    if (words > 100) {
+      this.logger.warn(
+        `[${shotCode}] motionPrompt is ${words} words — past the 30–60 word budget and `
+        + `approaching the umt5 quality cliff (Skill: gen-studio-wan22 §2)`,
+      );
+    }
   }
 
   // ── Upscale on demand ──────────────────────────────────────────────────────

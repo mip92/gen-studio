@@ -67,3 +67,6 @@ data/*/thumbnail/
 # stray dev logs
 backend.log
 serve_backend.log
+# audit / migration scratch output (scripts/audit_motion_prompts.sql, _migrate_motion_wan22.py)
+tmp_motion_*.txt
+tmp_motion_*.out

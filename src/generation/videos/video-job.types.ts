@@ -19,18 +19,26 @@ export interface StartVideoInput {
   count?:        number;
   /**
    * Which i2v workflow to use — explicit per-shot, no 'auto':
-   *  - 'fast' (DEFAULT) — lightx2v 4-step distilled LoRA, cfg=1.0. Fast (~2-3min).
-   *    At cfg=1 the negative prompt has ZERO effect (CFG collapses to positive);
-   *    motion is steered by the positive prompt alone. = «быстро».
-   *  - 'cfg' — full Wan2.2 dual-expert, no speed LoRA, 20 steps, cfg=4.0. ~5×
+   *  - 'fast' (DEFAULT) — lightx2v 4-step full-distill fp8 checkpoints (the
+   *    distillation is baked into the weights, not applied as a rank-64 LoRA),
+   *    cfg=1.0. Fast (~2-3min). At cfg=1 the negative prompt has ZERO effect
+   *    (CFG collapses to the positive); motion is steered by the positive
+   *    prompt alone — Skill(gen-studio-wan22). = «быстро».
+   *  - 'cfg' — full Wan2.2 dual-expert, no distillation, 20 steps, cfg=4.0. ~5×
    *    slower, but the negative prompt actually fires — pick per shot when
    *    suppressing unwanted motion matters. = «качество».
-   *  - 'distill' — lightx2v full-distill fp8 checkpoints (Oct-2025 gen, distill
-   *    baked into the weights instead of a rank-64 LoRA). Same 4 steps / cfg=1
-   *    / speed as 'fast', slightly higher quality ceiling. Negative still dead.
+   *
+   * There used to be a third mode, 'distill', described as "full-distill fp8 vs
+   * the LoRA approximation". It was removed 2026-07-30: no such distinct
+   * checkpoint exists on disk, `video_wan22_i2v_distill_api.json` was
+   * byte-identical to the fast default in every project, it was never exposed
+   * in the UI, and 0 of 6 577 historical renders used it — 'fast' already IS
+   * the full-distill path. Rows carrying the old filename still load, because
+   * loadTemplate keeps it in ALLOWED_WORKFLOWS.
+   *
    * (Engine family Wan/Flux/SDXL is a per-PROJECT decision via project.visualStyle.)
    */
-  mode?:         'fast' | 'cfg' | 'distill';
+  mode?:         'fast' | 'cfg';
 }
 
 export interface VideoRenderParams {
