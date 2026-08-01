@@ -9,6 +9,7 @@ import { TrainingService } from '../training/training.service';
 import { TTSService } from '../tts/tts.service';
 import { BgmRenderService } from '../bgm/bgm-render.service';
 import { AnchorRenderService } from '../characters/anchor-render.service';
+import { PropAnchorService } from '../props/prop-anchor.service';
 import { ThumbnailRenderService } from '../thumbnails/thumbnail-render.service';
 import { ImageValidationService } from '../validation/image-validation.service';
 import { AnchorValidationService } from '../validation/anchor-validation.service';
@@ -62,6 +63,7 @@ export class PipelineQueueService {
     private readonly tts:      TTSService,
     private readonly bgm:      BgmRenderService,
     private readonly anchors:  AnchorRenderService,
+    private readonly propAnchors: PropAnchorService,
     private readonly thumbnails: ThumbnailRenderService,
     private readonly validation: ImageValidationService,
     private readonly anchorValidation: AnchorValidationService,
@@ -96,6 +98,7 @@ export class PipelineQueueService {
     await this.datasets.pollRunning();
     await this.scenes.pollRunning();
     await this.anchors.pollRunning();
+    await this.propAnchors.pollRunning();
     await this.thumbnails.pollRunning();
     await this.detectHungJobs();
     // Bring the ledger back in line with the job tables before reading the slot:
@@ -189,6 +192,8 @@ export class PipelineQueueService {
         case 'video_post': await this.videos.dispatchPendingUpscale(e.jobId); return;
         case 'bgm':        await this.bgm.dispatchPending(e.jobId);      return;
         case 'anchor':     await this.anchors.dispatchPending(e.jobId);  return;
+        // Props are their own entity — own service, own job table (2026-08-01).
+        case 'prop_anchor': await this.propAnchors.dispatchPending(e.jobId); return;
         case 'thumbnail':  await this.thumbnails.dispatchPending(e.jobId); return;
         case 'thumbnail_ideas':
           await this.markSourceRunning('thumbnailIdeaJob', e.jobId);

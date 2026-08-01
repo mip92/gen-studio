@@ -30,12 +30,15 @@ export type JobType =
   | 'anchor_validation'
   | 'caption'
   | 'thumbnail'
-  | 'thumbnail_ideas';
+  | 'thumbnail_ideas'
+  // Object anchor for a PROP. Separate from 'anchor', which is keyed by
+  // CharacterProfile — props are their own entity (user 2026-08-01).
+  | 'prop_anchor';
 
 export const JOB_TYPES: readonly JobType[] = [
   'training', 'dataset', 'scene', 'video', 'video_post', 'tts',
   'bgm', 'anchor', 'validation', 'anchor_validation', 'caption',
-  'thumbnail', 'thumbnail_ideas',
+  'thumbnail', 'thumbnail_ideas', 'prop_anchor',
 ] as const;
 
 export function isJobType(t: string): t is JobType {
@@ -71,6 +74,7 @@ export const ENGINE_CLASS: Record<JobType, EngineClass> = {
   video_post:        'comfy',
   bgm:               'comfy',
   anchor:            'comfy',
+  prop_anchor:       'comfy',
   thumbnail:         'comfy',
   dataset:           'comfy',
   validation:        'ollama',
@@ -161,6 +165,8 @@ export function groupKeyFor(
     case 'video_post': return 'video_post';
     case 'scene':      return `scene:${opts.visualStyle ?? 'default'}`;
     case 'anchor':     return `anchor:${opts.visualStyle ?? 'default'}`;
+    // Same graph as a character anchor, so the same model stays resident.
+    case 'prop_anchor': return `anchor:${opts.visualStyle ?? 'default'}`;
     // Its own group, never batched with scenes: the thumbnail graph deliberately
     // drops the Lightning speed LoRA and raises steps/cfg, so it reloads the
     // model chain anyway — and there is at most one of these per project.

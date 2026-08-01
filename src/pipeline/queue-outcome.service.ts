@@ -103,6 +103,7 @@ export class QueueOutcomeService {
       case 'tts':        return this.ttsVerdict(e, ctx);
       case 'bgm':        return this.bgmVerdict(e, ctx);
       case 'anchor':     return this.anchorVerdict(e, ctx);
+      case 'prop_anchor': return this.anchorVerdict(e, ctx);
       default:           return null;
     }
   }

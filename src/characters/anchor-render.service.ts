@@ -39,7 +39,7 @@ const ANCHOR_CANDIDATES = Math.max(1, Number(process.env.ANCHOR_CANDIDATES ?? 4)
  *   data/<projectSlug>/reference/<profileCode>_anchor.png
  */
 
-const STYLE_PREFIX =
+export const STYLE_PREFIX =
   'cinematic graphic novel illustration, illustrated comic book panel, ' +
   'cell-shaded coloring, hard black ink outline with variable line weight, ' +
   'flat color blocks with subtle hatching for shadow, 16:9 cinematic composition, ' +
@@ -50,7 +50,7 @@ const STYLE_PREFIX =
 // with the comic LoRA at full strength. The load-bearing tokens are
 // "muted desaturated cinematic palette" + "semi-realistic ADULT proportions" +
 // "western/american comic" — proven to hold western-comic on the flux1-dev base.
-const FLUX_COMIC_STYLE =
+export const FLUX_COMIC_STYLE =
   'printed western graphic novel panel, american comic book illustration, ' +
   'bold confident heavy black ink outlines with clean variable line weight, ' +
   'flat cell-shaded color blocks with cross-hatching in the shadows, ' +
@@ -73,7 +73,7 @@ const QWEN_ANCHOR_NEGATIVE =
   'photograph, photorealistic, 3D render, plastic skin, anime, manga, chibi, ' +
   'deformed hands, extra fingers, two heads, multiple people, watermark, text overlay, blurry, low quality';
 
-const ANCHOR_NEGATIVE =
+export const ANCHOR_NEGATIVE =
   'photograph, photorealistic, 3D render, CGI, plastic skin, smooth gradient shading, ' +
   'hyperrealistic, real human face, raytraced, deformed hands, extra fingers, ' +
   'two heads, watermark, text overlay, blurry, low quality, anime, manga, ' +

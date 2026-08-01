@@ -103,6 +103,7 @@ export class PipelineBootService implements OnModuleInit {
       ['tts',               'tTSJob',              { status: 'running' }],
       ['bgm',               'audioRenderJob',      { status: 'running' }],
       ['anchor',            'anchorRenderJob',     { status: 'running' }],
+      ['prop_anchor',       'propAnchorJob',       { status: 'running' }],
       ['validation',        'imageValidationJob',  { status: 'running' }],
       ['anchor_validation', 'anchorValidationJob', { status: 'running' }],
       ['caption',           'captionJob',          { status: 'running' }],

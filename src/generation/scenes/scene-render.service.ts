@@ -800,18 +800,49 @@ export class SceneRenderService {
     // first and the location prose comes last. Single source of truth for
     // the train_kupe / corridor / vestibule prose; editing the Location row
     // updates every shot tagged with it. Idempotent.
-    if (propDescription && propDescription.trim().length > 0) {
-      // Prop-hero shot: the OBJECT is the subject. PREPEND the prop anchor + a
-      // shallow-DOF directive so the object dominates (front tokens carry the
-      // strongest CLIP-G weight), and SKIP the location — a rich room
-      // description would pull the render back to "just a room" and bury the
-      // prop. Object anchors are managed in the Props tab, separate from chars.
+    // A shot tagged with a prop is TWO different pictures depending on whether
+    // anyone else is in frame, and until 2026-08-01 both got the same treatment:
+    //
+    //  - PROP-HERO (no participants) — the object IS the subject. Prepend the
+    //    macro + shallow-DOF directive so it dominates, and skip the location:
+    //    a rich room description pulls the render back to "just a room" and
+    //    buries the prop (user 2026-06-21 «предметы программа не рисует»).
+    //
+    //  - PROP-IN-SCENE (>=1 participant) — the PERSON is the subject and the
+    //    prop is something they hold, wear or stand beside. Here the macro
+    //    directive is actively destructive: it orders the model to make the
+    //    object fill the frame as the single clear subject, and the `else if`
+    //    below then denied the shot its location entirely. Measured on `seller`
+    //    2026-08-01: 32 shots carried a person AND a prop, and every one of them
+    //    shipped that instruction — which is why a sewing machine came back the
+    //    size of the room, a car filled the background, a pallet replaced the
+    //    set, and the shots had no place at all behind the figure.
+    //    17 of the 19 renders the user rejected were exactly this case.
+    const propText   = propDescription?.trim() ?? '';
+    const propIsHero = propText.length > 0 && participants.length === 0;
+
+    if (propIsHero) {
       const dof = 'the prop fills the frame as the single clear subject in crisp sharp focus, the surroundings thrown far out of focus into soft neutral shapes, shallow depth of field, one warm focused light on the object';
-      const propClause = `macro insert, ${propDescription.trim()}, ${dof}`;
+      const propClause = `macro insert, ${propText}, ${dof}`;
       if (!positive.startsWith(propClause)) {
         positive = positive.trim().length > 0 ? `${propClause}, ${positive}` : propClause;
       }
-    } else if (locationDescription && locationDescription.trim().length > 0 && !usingQwenGraph) {
+    } else if (propText.length > 0) {
+      // Prop in a peopled scene: name it at its natural size, after the action,
+      // and let the location stand. Only the head clause of the description is
+      // used — the full prose is 20-30 words written for a macro insert, and on
+      // the Qwen path the positive already runs at ~67 words against a 55-word
+      // budget whose overflow is trimmed from the TAIL (Skill: gen-studio-qwen2511
+      // §2a). Spending the whole overrun on an object the shot merely contains
+      // would drop the light and the palette instead.
+      const head = propText.split(',')[0].trim().split(/\s+/).slice(0, 12).join(' ');
+      if (head.length > 0 && !positive.toLowerCase().includes(head.toLowerCase())) {
+        positive = positive.trim().length > 0 ? `${positive}, ${head}` : head;
+      }
+    }
+
+    // The location applies to every shot except a prop-hero macro.
+    if (!propIsHero && locationDescription && locationDescription.trim().length > 0 && !usingQwenGraph) {
       const desc = locationDescription.trim();
       if (!positive.endsWith(desc)) {
         positive = positive.trim().length > 0 ? `${positive}, ${desc}` : desc;
@@ -821,7 +852,7 @@ export class SceneRenderService {
     // appended here it landed at the tail of the positive, i.e. first in line to
     // be dropped by the scene word budget. Locations are a shared entity — they
     // get their own budget, composed after the action.
-    const qwenLocationPrompt = (usingQwenGraph && !propDescription)
+    const qwenLocationPrompt = (usingQwenGraph && !propIsHero)
       ? (locationDescription ?? undefined)
       : undefined;
 

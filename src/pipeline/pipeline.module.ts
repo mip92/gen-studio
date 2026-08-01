@@ -5,6 +5,7 @@ import { GenerationModule } from '../generation/generation.module';
 import { TTSModule } from '../tts/tts.module';
 import { BgmModule } from '../bgm/bgm.module';
 import { CharactersModule } from '../characters/characters.module';
+import { PropsModule } from '../props/props.module';
 import { ValidationModule } from '../validation/validation.module';
 import { YoutubeModule } from '../youtube/youtube.module';
 import { ThumbnailsModule } from '../thumbnails/thumbnails.module';
@@ -15,7 +16,7 @@ import { PipelineBootService } from './pipeline-boot.service';
 import { PipelineController } from './pipeline.controller';
 
 @Module({
-  imports:     [PrismaModule, EngineModule, QueueLedgerModule, TrainingModule, GenerationModule, TTSModule, BgmModule, CharactersModule, ValidationModule, YoutubeModule, ThumbnailsModule],
+  imports:     [PrismaModule, EngineModule, QueueLedgerModule, TrainingModule, GenerationModule, TTSModule, BgmModule, CharactersModule, PropsModule, ValidationModule, YoutubeModule, ThumbnailsModule],
   controllers: [PipelineController],
   providers:   [PipelineQueueService, PipelineBootService],
 })

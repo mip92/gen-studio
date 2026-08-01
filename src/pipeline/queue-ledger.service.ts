@@ -918,6 +918,22 @@ export class QueueLedgerService {
         };
       }
       case 'anchor':            return this.profileContext(await this.profileIdOf('anchorRenderJob', jobId), '🎭 ');
+      // Props are a first-class entity, not a character profile - resolve the
+      // project through the prop itself.
+      case 'prop_anchor': {
+        const j = await this.prisma.propAnchorJob.findUnique({
+          where:   { id: jobId },
+          include: { prop: { include: { project: true } } },
+        });
+        const project = j?.prop?.project ?? null;
+        return {
+          projectId:   project?.id   ?? null,
+          projectSlug: project?.slug ?? null,
+          projectName: project?.name ?? null,
+          visualStyle: (project as any)?.visualStyle ?? null,
+          label:       'PROP ' + (j?.prop?.code ?? jobId),
+        };
+      }
       case 'anchor_validation': return this.profileContext(await this.profileIdOf('anchorValidationJob', jobId), '🔎🎭 ');
       case 'dataset':           return this.profileContext(await this.profileIdOf('datasetJob', jobId), '');
       case 'training':          return this.profileContext(await this.profileIdOf('trainingJob', jobId), '');

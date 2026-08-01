@@ -11,23 +11,23 @@ datasource db {
 // ─── Project ─────────────────────────────────────────────────────────────────
 
 model Project {
-  id        String   @id @default(uuid())
-  slug      String   @unique
-  name      String
-  settings  Json?
+  id                        String    @id @default(uuid())
+  slug                      String    @unique
+  name                      String
+  settings                  Json?
   /// Full narration script for the project (Markdown). Source of truth lives
   /// in the database so the API can serve it without depending on filesystem
   /// state. Scenes hold their own snippet of this in Scene.narrationText.
-  scriptText String?
+  scriptText                String?
   /// Distribution target: "youtube" | "tiktok" | "shorts" | "longform".
   /// Drives platform-specific safety/length checks at shotlist time.
-  targetPlatform String?
+  targetPlatform            String?
   /// Safety tier for advertiser-friendliness checks. "advertiser_safe" =
   /// strict YouTube monetization guardrails (no self-harm, no graphic violence,
   /// no brands, etc.); "limited" = age-gate acceptable; "unrestricted" = no
   /// filtering. Default null = unrestricted. Applied by shotlist generator
   /// and prompt sanitizer.
-  safetyTier String?
+  safetyTier                String?
   /// Canonical negative prompt for every shot in this project. SDXL accepts it
   /// verbatim. Single source of truth — `Shot.promptFields.negative` is treated
   /// as a per-shot override; if absent or empty the renderer reads this value.
@@ -35,17 +35,17 @@ model Project {
   ///
   /// **Required** (NOT NULL + CHECK non-empty) — every project must define its
   /// own. See AGENTS.md §1, §6.
-  defaultNegative String
+  defaultNegative           String
   /// Canonical negative prompt for the i2v / video model (Wan2.2 etc.). Same
   /// fallback chain as `defaultNegative` but for video render workflows.
   /// Per-shot override lives in `Shot.promptFields.motionNegative`.
   /// **Required** (NOT NULL + CHECK non-empty).
-  defaultVideoNegative String
+  defaultVideoNegative      String
   /// Default motion-prompt text used when a video render has no explicit
   /// motion prompt and the shot is NOT marked static. Per-shot override:
   /// `Shot.promptFields.motionPrompt`.
   /// **Required** (NOT NULL + CHECK non-empty).
-  defaultMotionPrompt String
+  defaultMotionPrompt       String
   /// Default motion-prompt text used when a video render has no explicit
   /// motion prompt AND `Shot.promptFields.camera.movement` starts with
   /// "static". Should be a strong "freeze frame, no motion" directive.
@@ -55,7 +55,7 @@ model Project {
   /// (default; legacy projects); 'xtts2' = XTTS-v2 GPU voice cloning;
   /// 'f5' = F5-TTS Russian GPU voice cloning. Null = treat as 'silero'.
   /// Endpoints branch on this field.
-  ttsEngine               String?
+  ttsEngine                 String?
   /// Project-relative path to the single voice reference wav used by the
   /// voice-clone engines (xtts2 / f5). Convention:
   /// data/<slug>/tts/voice_reference.wav. Null = not uploaded yet (renders
@@ -64,19 +64,19 @@ model Project {
   /// MIRROR FIELD: when `ttsVoiceoverId` is set, this is kept in sync to the
   /// assigned Voiceover's shared `filePath` so all render/gating code can keep
   /// reading this single field. Direct legacy uploads still populate it too.
-  ttsVoiceRefPath         String?
+  ttsVoiceRefPath           String?
   /// FK to a shared Voiceover (закадровая озвучка) in the reusable library.
   /// Assigning a library voice sets this AND mirrors `ttsVoiceRefPath` to the
   /// voiceover's shared file — so a voice lives ONCE on disk and is referenced
   /// by many projects instead of copied into each. Null = no library voice
   /// assigned. onDelete: SetNull (deleting a voiceover unassigns, never cascades
   /// a project away).
-  ttsVoiceoverId          String?
+  ttsVoiceoverId            String?
   /// Visual style of this project. Drives workflow routing + LoRA pipeline +
   /// style-block injection into shot prompts. References visual_styles.id.
   /// Default photoreal_cinematic for backwards compatibility with last_shift /
   /// night_courier. See docs/VISUAL_STYLE_ARCHITECTURE.md.
-  visualStyle             String       @default("photoreal_cinematic")
+  visualStyle               String    @default("photoreal_cinematic")
   /// How shot durations are timed on the CapCut export timeline.
   /// "clip"      = (legacy, default) each animated shot occupies exactly its
   ///               rendered clip length (length/fps); static shots fall back to
@@ -87,23 +87,23 @@ model Project {
   ///               are held with a slow Ken-Burns move. This is the long-form
   ///               (~45 min) model where only the first minutes are animated and
   ///               the rest are stills. See exports.service + export_capcut.py.
-  exportTiming            String       @default("clip")
+  exportTiming              String    @default("clip")
   /// Published YouTube URL of the FINISHED video. When set, the project is
   /// considered DONE: the /actions page suppresses every pipeline gate for it
   /// (no more render/upscale/FPS/TTS nagging — the deliverable already shipped).
   /// Null = still in production. Set/cleared from the project overview page.
-  youtubeUrl              String?
+  youtubeUrl                String?
   /// Queue priority tier for "render this film first". 0 = normal. Higher wins,
   /// evaluated BEFORE QueueEntry.rank, so raising it moves the project's whole
   /// backlog — present AND future jobs — ahead of every lower-tier project
   /// without rewriting a single queue row. Ties inside a tier keep their rank
   /// order, so a project's internal ordering is preserved across a boost.
-  queuePriorityTier       Int          @default(0)
+  queuePriorityTier         Int       @default(0)
   /// When the current tier was set. Newest boost wins among equal tiers, so
   /// "prioritise this one now" beats a project boosted last week.
-  queuePrioritizedAt      DateTime?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  queuePrioritizedAt        DateTime?
+  createdAt                 DateTime  @default(now())
+  updatedAt                 DateTime  @updatedAt
 
   characters        Character[]
   characterLinks    ProjectCharacter[]
@@ -116,8 +116,9 @@ model Project {
   narrativeBlocks   NarrativeBlock[]
   ttsEmotionRefs    ProjectTTSEmotionRef[]
   thumbnailJobs     ThumbnailJob[]
+  props             Prop[]
   thumbnailIdeaJobs ThumbnailIdeaJob[]
-  ttsVoiceover      Voiceover?            @relation(fields: [ttsVoiceoverId], references: [id], onDelete: SetNull)
+  ttsVoiceover      Voiceover?             @relation(fields: [ttsVoiceoverId], references: [id], onDelete: SetNull)
 
   @@index([ttsVoiceoverId])
   @@map("projects")
@@ -169,38 +170,38 @@ model ProjectCharacter {
 }
 
 model CharacterProfile {
-  id             String   @id @default(uuid())
-  characterId    String
-  profileCode    String
-  ageLabel       String?
-  targetImages   Int?
-  promptBase     String
-  negative       String?
-  promptAngles   String?
-  promptVariety  String?
-  datasetPath    String?
+  id            String   @id @default(uuid())
+  characterId   String
+  profileCode   String
+  ageLabel      String?
+  targetImages  Int?
+  promptBase    String
+  negative      String?
+  promptAngles  String?
+  promptVariety String?
+  datasetPath   String?
   /// "Active" LoRA — the one used by default for scene rendering. Defaults to
   /// the final epoch from the most recent successful training; user can switch
   /// to any entry in `loraVariants` via the UI to test intermediate checkpoints.
-  loraPath       String?
+  loraPath      String?
   /// All trained LoRA files for this profile (final + epoch checkpoints from
   /// every successful training run). Each entry is { filename, fullPath, epoch?, sizeBytes, mtime, label }.
   /// Latest training overwrites this list to reflect current disk state.
-  loraVariants   Json?
-  triggerToken   String?
+  loraVariants  Json?
+  triggerToken  String?
   /// If true, this profile is rendered without LoRA and identity is locked
   /// via IP-Adapter FaceID (or PuLID) using a single reference portrait.
   /// Used for "passenger"-style minor characters where training a LoRA per
   /// person is uneconomical. The reference image lives in ReferenceAsset
   /// for this profileCode (sortOrder = 0 is the FaceID anchor).
-  useIpAdapter   Boolean  @default(false)
-  createdAt      DateTime @default(now())
+  useIpAdapter  Boolean  @default(false)
+  createdAt     DateTime @default(now())
 
-  character        Character         @relation(fields: [characterId], references: [id], onDelete: Cascade)
-  datasetJobs      DatasetJob[]
-  trainingJobs     TrainingJob[]
-  shotParticipants ShotParticipant[]
-  anchorRenderJobs AnchorRenderJob[]
+  character            Character             @relation(fields: [characterId], references: [id], onDelete: Cascade)
+  datasetJobs          DatasetJob[]
+  trainingJobs         TrainingJob[]
+  shotParticipants     ShotParticipant[]
+  anchorRenderJobs     AnchorRenderJob[]
   anchorValidationJobs AnchorValidationJob[]
 
   @@unique([characterId, profileCode])
@@ -277,9 +278,9 @@ model Scene {
   lightingMood                String?
   createdAt                   DateTime @default(now())
 
-  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  shots     Shot[]
-  ttsJobs   TTSJob[]
+  project Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  shots   Shot[]
+  ttsJobs TTSJob[]
 
   @@unique([projectId, sceneKey])
   @@map("scenes")
@@ -288,25 +289,25 @@ model Scene {
 // ─── Shots ───────────────────────────────────────────────────────────────────
 
 model Shot {
-  id                 String   @id @default(uuid())
-  projectId          String
-  sceneId            String
-  shotCode           String
-  promptFields       Json?
-  workflowRouteKey   String?
-  referenceProfileId String?
-  referenceImagePool Json?
+  id                   String   @id @default(uuid())
+  projectId            String
+  sceneId              String
+  shotCode             String
+  promptFields         Json?
+  workflowRouteKey     String?
+  referenceProfileId   String?
+  referenceImagePool   Json?
   /// Accumulated rendered candidates for this shot.
   /// Shape: [{filename, promptId, seed, strategyId, createdAt}]
-  renderedImages     Json?
+  renderedImages       Json?
   /// Filename of the candidate chosen as the canonical render for this shot.
-  chosenRender       String?
+  chosenRender         String?
   /// VideoRender.id chosen as the final/approved animation for this shot.
   /// Mirrors `chosenRender` for videos: once set, the scenes UI offers an upscale
   /// instead of another render, and downstream packaging treats this as the
   /// canonical motion clip. No FK so the row stays self-consistent if the video
   /// is hard-deleted; the setChosenVideo service validates membership.
-  chosenVideoId      String?
+  chosenVideoId        String?
   /// Final-cut render mode for this shot.
   /// "animated" = (default) the shot is rendered to a Wan2.2 i2v clip and FHD-
   ///              upscaled; the CapCut export lays the mp4 on the timeline.
@@ -316,7 +317,7 @@ model Shot {
   ///              timeline and adds a slow Ken-Burns move (zoom/pan/rotate). Used
   ///              for the long-form model where only the first minutes are
   ///              animated. Export readiness requires only a chosenRender PNG.
-  renderMode         String   @default("animated")
+  renderMode           String   @default("animated")
   /// Latest in-flight ComfyUI prompt_id for this shot (cleared once result is recorded).
   activeRenderPromptId String?
   /// Per-shot narration text (Russian, ~5s of voiceover per shot). When set,
@@ -324,65 +325,65 @@ model Shot {
   /// the shot's video timeline position. Independent of Scene.narrationText
   /// (which is the legacy whole-scene voiceover and is kept for backward
   /// compatibility with other projects that still use scene-level narration).
-  narrationText      String?
+  narrationText        String?
   /// User-approved TTSJob for this shot. Plain id (no FK) so deleting the
   /// TTSJob row doesn't cascade-null the shot state — UI just shows nothing
   /// approved if the id stops resolving. Mirrors Scene.approvedTTSJobId.
-  approvedTTSJobId   String?
+  approvedTTSJobId     String?
   /// Camera framing for this shot. Canonical values: "EWS" | "WS" | "MS" |
   /// "MCU" | "CU" | "ECU" | "OTS" | "BACK" | "POV". First-class column
   /// (not promptFields jsonb) so quota-checking and shot-variety enforcement
   /// can SQL-query distribution without parsing JSON. See [[feedback_shot_variety]].
-  shotType           String?
+  shotType             String?
   /// Camera angle. Canonical values: "eye" | "low" | "high" | "dutch".
-  cameraAngle        String?
+  cameraAngle          String?
   /// Camera movement. Canonical values: "static" | "track_lateral" |
   /// "push_in" | "pull_out" | "window_pov" | "locked_off" | "handheld".
-  cameraMove         String?
+  cameraMove           String?
   /// Dramaturgical beat this shot serves. Project-specific token, e.g.
   /// "opening_image", "catalyst", "midpoint_twist", "all_is_lost",
   /// "break_into_three", "final_image". Lets the shotlist tool verify every
   /// shot earns its place in the plot.
-  storyBeat          String?
+  storyBeat            String?
   /// What this shot is doing narratively: "plot" | "character" | "atmosphere"
   /// | "transition" | "iconic". Helps balance the act so atmosphere-only
   /// shots don't crowd out plot-advancing ones.
-  narrativeFunction  String?
+  narrativeFunction    String?
   /// Which character/passenger vignette this shot belongs to. Free-form
   /// slug per project (e.g. "military", "mother_baby", "child_girl",
   /// "conductor"). Lets the shotlist verify each vignette gets its quota
   /// of shots and that beats are spread inside the vignette.
-  vignetteSlug       String?
+  vignetteSlug         String?
   /// True if this shot has no main characters (pure exterior, object macro,
   /// landscape). Used to enforce the ~15% B-roll quota that night_courier
   /// lacked. Mutually compatible with isIconic.
-  isBroll            Boolean  @default(false)
+  isBroll              Boolean  @default(false)
   /// True if this shot is intentionally designed to be screenshot-worthy —
   /// composition, lighting and prop arrangement curated for thumbnail /
   /// preview use. Project should target ~1 iconic frame per 20-25 shots.
-  isIconic           Boolean  @default(false)
+  isIconic             Boolean  @default(false)
   /// Override of Scene.defaultTimeOfDay. Project-specific token. Null =
   /// inherit from scene.
-  timeOfDay          String?
+  timeOfDay            String?
   /// Override of Scene.defaultPaletteKey. Project-specific token. Null =
   /// inherit from scene.
-  paletteKey         String?
+  paletteKey           String?
   /// FK to the Location row whose `description` gets prepended into the
   /// shot's positive prompt at render time. Null = no location injection
   /// (use raw promptFields.positive verbatim). Set per-shot so a single
   /// canonical "interior of cramped Soviet train kupe" description can be
   /// reused by 90% of shots without duplicating prose in every promptFields.
-  locationId         String?
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  locationId           String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 
-  project      Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  scene        Scene             @relation(fields: [sceneId], references: [id], onDelete: Cascade)
-  location     Location?         @relation(fields: [locationId], references: [id], onDelete: SetNull)
-  participants ShotParticipant[]
-  renderJobs   SceneRenderJob[]
-  videoRenders VideoRender[]
-  ttsJobs      TTSJob[]
+  project        Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  scene          Scene                @relation(fields: [sceneId], references: [id], onDelete: Cascade)
+  location       Location?            @relation(fields: [locationId], references: [id], onDelete: SetNull)
+  participants   ShotParticipant[]
+  renderJobs     SceneRenderJob[]
+  videoRenders   VideoRender[]
+  ttsJobs        TTSJob[]
   validationJobs ImageValidationJob[]
 
   @@unique([projectId, shotCode])
@@ -489,22 +490,22 @@ model WorkflowRouteStep {
 // ─── Training ─────────────────────────────────────────────────────────────────
 
 model DatasetJob {
-  id                  String    @id @default(uuid())
-  profileId           String
-  status              String    // pending | blocked | running | completed | failed | cancelled
+  id                     String    @id @default(uuid())
+  profileId              String
+  status                 String // pending | blocked | running | completed | failed | cancelled
   /// If set, this job waits until the named profile's dataset has at least one image.
-  dependsOnProfileId  String?
+  dependsOnProfileId     String?
   /// If set, the reference image used by ComfyUI is picked from this profile's
   /// dataset folder (chaining: HERO_TEEN_15 → HERO_OVERLOAD_16/17).
-  referenceProfileId  String?
+  referenceProfileId     String?
   /// Specific filename inside referenceProfileId's COMFY_OUTPUT to use as the
   /// reference. If not set, a deterministic middle image is auto-picked.
   referenceImageFilename String?
-  comfyPromptId       String?
-  errorMessage        String?
-  queuedAt            DateTime  @default(now())
-  startedAt           DateTime?
-  completedAt         DateTime?
+  comfyPromptId          String?
+  errorMessage           String?
+  queuedAt               DateTime  @default(now())
+  startedAt              DateTime?
+  completedAt            DateTime?
 
   profile CharacterProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
 
@@ -516,7 +517,7 @@ model DatasetJob {
 model SceneRenderJob {
   id            String    @id @default(uuid())
   shotId        String
-  status        String    // pending | running | completed | failed | cancelled
+  status        String // pending | running | completed | failed | cancelled
   /// ComfyUI prompt_id once dispatched; used to poll history for outputs.
   comfyPromptId String?
   /// Render parameters at enqueue time (seed, batchSize, scenePrompt override, …).
@@ -543,23 +544,23 @@ model SceneRenderJob {
 /// for the vision model, and starting a ComfyUI job later unloads the model.
 /// See ImageValidationService.
 model ImageValidationJob {
-  id             String    @id @default(uuid())
-  shotId         String
-  status         String    @default("pending")   // pending | running | completed | failed
+  id              String    @id @default(uuid())
+  shotId          String
+  status          String    @default("pending") // pending | running | completed | failed
   /// What the frame is SUPPOSED to show — the resolved positive prompt captured
   /// from the render job — for the vision model to score the match against.
-  expectedPrompt String?
+  expectedPrompt  String?
   /// The shot's narration (VO). VO↔image match is the strongest correctness
   /// signal (a frame must show exactly the subject the voiceover names).
-  narration      String?
+  narration       String?
   /// Snapshot of the candidate filenames scored, in scoring order.
-  candidates     Json?
+  candidates      Json?
   /// Full per-candidate result: [{filename, score, matchesPrompt, issues[]}].
-  result         Json?
+  result          Json?
   /// Filename the model picked as best (also written to Shot.chosenRender).
   /// Null when NO candidate was acceptable (all severe / none matched) — in that
   /// case the shot's chosenRender is cleared and suggestedPrompt is filled.
-  chosenFilename String?
+  chosenFilename  String?
   /// When no candidate passed, the vision model's proposed improved positive
   /// prompt to fix the failures. The user reviews/edits/approves it in the UI,
   /// which writes it into Shot.promptFields.positive for the next render.
@@ -571,11 +572,11 @@ model ImageValidationJob {
   suggestedFields Json?
   /// One-line justification from the comparative judge call (which candidate
   /// won and why) when >1 candidate passed QC.
-  judgeReason    String?
-  errorMessage   String?
-  queuedAt       DateTime  @default(now())
-  startedAt      DateTime?
-  completedAt    DateTime?
+  judgeReason     String?
+  errorMessage    String?
+  queuedAt        DateTime  @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
 
   shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
 
@@ -593,29 +594,29 @@ model ImageValidationJob {
 /// proposes an improved promptBase for the user to edit/apply. Same single-slot
 /// pipeline + ComfyUI-off arbitration as ImageValidationJob. See AnchorValidationService.
 model AnchorValidationJob {
-  id             String    @id @default(uuid())
-  profileId      String
-  status         String    @default("pending")   // pending | running | completed | failed
+  id              String    @id @default(uuid())
+  profileId       String
+  status          String    @default("pending") // pending | running | completed | failed
   /// The character identity spec the portrait must depict — the profile's
   /// promptBase captured at enqueue (fed to the validator as REQUIRED content).
-  expectedPrompt String?
+  expectedPrompt  String?
   /// Snapshot of the candidate anchor filenames scored, in scoring order. They
   /// live in data/<slug>/reference/_candidates/<profileCode>/.
-  candidates     Json?
+  candidates      Json?
   /// Full per-candidate result: [{filename, score, matchesPrompt, severe, issues[]}].
-  result         Json?
+  result          Json?
   /// Filename the model picked as best (copied to <profileCode>_anchor.png).
   /// Null when NO candidate was acceptable (all anime/severe / none matched) —
   /// no anchor is set and suggestedPrompt is filled.
-  chosenFilename String?
+  chosenFilename  String?
   /// When no candidate passed, the vision model's proposed improved promptBase.
   /// The user reviews/edits/approves it in the UI, which writes it into
   /// CharacterProfile.promptBase for the next anchor render.
   suggestedPrompt String?
-  errorMessage   String?
-  queuedAt       DateTime  @default(now())
-  startedAt      DateTime?
-  completedAt    DateTime?
+  errorMessage    String?
+  queuedAt        DateTime  @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
 
   profile CharacterProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
 
@@ -656,34 +657,34 @@ model VideoRender {
 
   /// Upscale-on-demand (4x-UltraSharp → 1920×1080). Null until user clicks
   /// "upscale" on a completed video. Lifecycle mirrors the main status field.
-  upscaleStatus        String?
-  upscaledFilename     String?
-  upscalePromptId      String?
+  upscaleStatus       String?
+  upscaledFilename    String?
+  upscalePromptId     String?
   /// When this row's upscale lifecycle entered `pending`. Distinct from the
   /// main render's `queuedAt` because an upscale is requested some time after
   /// the underlying video finishes — sorting upscales by `queuedAt` would
   /// place every new upscale ahead of newly-queued renders.
-  upscaleQueuedAt      DateTime?
-  upscaleStartedAt     DateTime?
-  upscaleCompletedAt   DateTime?
-  upscaleErrorMessage  String?
+  upscaleQueuedAt     DateTime?
+  upscaleStartedAt    DateTime?
+  upscaleCompletedAt  DateTime?
+  upscaleErrorMessage String?
 
   /// FPS interpolation (RIFE/FILM → 2× framerate). MANDATORY final step before
   /// CapCut export. Null until the user queues it; can only be queued once the
   /// upscale has completed (it interpolates the FHD output). Lifecycle mirrors
   /// the upscale fields above: null → pending → running → completed | failed.
-  interpStatus         String?
+  interpStatus       String?
   /// Basename of the smoothed mp4 in `data/<project>/shots/<shotCode>/videos_smooth/`.
-  interpFilename       String?
-  interpPromptId       String?
+  interpFilename     String?
+  interpPromptId     String?
   /// Frame multiplier used (2 = double FPS). Snapshot at enqueue time.
-  interpMultiplier     Int?
+  interpMultiplier   Int?
   /// When this row's interpolation lifecycle entered `pending` — FIFO key,
   /// distinct from queuedAt/upscaleQueuedAt for the same reason upscale needs its own.
-  interpQueuedAt       DateTime?
-  interpStartedAt      DateTime?
-  interpCompletedAt    DateTime?
-  interpErrorMessage   String?
+  interpQueuedAt     DateTime?
+  interpStartedAt    DateTime?
+  interpCompletedAt  DateTime?
+  interpErrorMessage String?
 
   shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
 
@@ -697,7 +698,7 @@ model VideoRender {
 model TrainingJob {
   id             String    @id @default(uuid())
   profileId      String
-  status         String    // pending | preparing | captioning | training | completed | failed
+  status         String // pending | preparing | captioning | training | completed | failed
   baseModel      String
   triggerToken   String?
   datasetPath    String?
@@ -705,7 +706,7 @@ model TrainingJob {
   outputLoraPath String?
   logPath        String?
   errorMessage   String?
-  progress       Json?     // { phase, current, total, ... }
+  progress       Json? // { phase, current, total, ... }
   /// Effective queue ordering timestamp. Mirrors DatasetJob.queuedAt so the
   /// pipeline queue can order both job types by one field. Defaults to now()
   /// at row creation; gets swapped when the user reorders the queue in UI.
@@ -730,28 +731,28 @@ model TrainingJob {
 // rendering a TTS doesn't race with a scene/video render and vice versa.
 
 model TTSJob {
-  id             String    @id @default(uuid())
+  id               String    @id @default(uuid())
   /// Owner: either a Scene or a Shot, never both. Scene-level (legacy) =
   /// single long voiceover per scene saved to data/<slug>/scenes/<sceneKey>/.
   /// Shot-level (current default for night_courier-style projects) = one ~5s
   /// voiceover per shot saved to data/<slug>/shots/<shotCode>/. A row with
   /// both null is a bug; service code enforces exactly-one-of.
-  sceneId        String?
-  shotId         String?
+  sceneId          String?
+  shotId           String?
   /// Engine snapshot at enqueue time. 'silero' = Silero V5 ru worker;
   /// 'xtts2' = XTTS-v2 voice-clone worker; 'f5' = F5-TTS Russian voice-clone
   /// worker. Null = legacy rows pre-dating the field; treat as 'silero'.
-  engine         String?
+  engine           String?
   /// Text snapshot at enqueue time. Editing narration text later does NOT
   /// retroactively change rendered audio — re-queue to regenerate.
-  text           String
+  text             String
   /// Silero speaker id (silero engine only). V5 voices: aidar | baya |
   /// kseniya | xenia | eugene. V3/V4 add: ruslan | random.
   /// Ignored by the voice-clone engines (xtts2 / f5).
-  voice          String
+  voice            String
   /// Which .pt model file under .silero_cache/ was used. Null = auto-pick by
   /// MODEL_FILENAMES precedence (V5_5 wins). Example: "v3_1_ru.pt", "v4_ru.pt".
-  modelFilename  String?
+  modelFilename    String?
   /// Emotion preset, one of: neutral | happy | sad | angry | fear | disgust |
   /// surprise | calm. Null = neutral. INERT today: both voice-clone engines
   /// (xtts2, f5) ignore the categorical preset — tone comes from the speaker
@@ -764,34 +765,34 @@ model TTSJob {
   /// clip for the render). Overrides emotionPreset. Ignored for silero.
   emotionRefName   String?
   /// Output sample rate: 8000 | 24000 | 48000 (Silero supports these three).
-  sampleRate     Int
+  sampleRate       Int
   /// Playback rate (1.0 = normal, <1 slower, >1 faster). Applied via
   /// post-synthesis waveform resampling in the Python worker — Silero
   /// TTSModelMultiAcc_v3 (v5) doesn't expose `apply_ssml`.
-  rate           Float     @default(1.0)
+  rate             Float     @default(1.0)
   /// Extra silence to insert after every sentence boundary (in seconds).
   /// 0 = no extra pause; documentary narration commonly uses 3-5s so the
   /// editor can drop B-roll between beats. The Python worker splits on
   /// [.!?…]+, synthesises each chunk separately, then concatenates with
   /// `silence = zeros(int(sr * pause_sec))` between.
-  sentencePauseSec Float   @default(0)
-  status         String    // pending | running | completed | failed | cancelled
+  sentencePauseSec Float     @default(0)
+  status           String // pending | running | completed | failed | cancelled
   /// Basename of the wav. Scene-level jobs live in
   /// data/<slug>/scenes/<sceneKey>/, shot-level jobs in
   /// data/<slug>/shots/<shotCode>/.
-  outputFilename String?
+  outputFilename   String?
   /// Actual wav duration in milliseconds — probed from the RIFF header on
   /// completion (or backfilled when an older row is first read by the scenes
   /// endpoint). Null = not yet measured; UI falls back to the text-length
   /// heuristic (text.length / 15 cps) until populated.
-  durationMs     Int?
-  errorMessage   String?
-  queuedAt       DateTime  @default(now())
-  startedAt      DateTime?
-  completedAt    DateTime?
+  durationMs       Int?
+  errorMessage     String?
+  queuedAt         DateTime  @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
 
   scene Scene? @relation(fields: [sceneId], references: [id], onDelete: Cascade)
-  shot  Shot?  @relation(fields: [shotId],  references: [id], onDelete: Cascade)
+  shot  Shot?  @relation(fields: [shotId], references: [id], onDelete: Cascade)
 
   @@index([sceneId])
   @@index([shotId])
@@ -820,7 +821,7 @@ model ProjectTTSEmotionRef {
   filePath  String
   createdAt DateTime @default(now())
 
-  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
   @@unique([projectId, name])
   @@map("project_tts_emotion_refs")
@@ -836,23 +837,23 @@ model ProjectTTSEmotionRef {
 // into Project.ttsVoiceRefPath, which the render/gating code already reads.
 
 model Voiceover {
-  id        String   @id @default(uuid())
+  id             String   @id @default(uuid())
   /// Stable kebab/snake identifier, unique across the library, ASCII only.
   /// e.g. "cat_lady" or "female-tired". Used in the data/_voices/<slug>/ path.
-  slug      String   @unique
+  slug           String   @unique
   /// Human-friendly label for the UI dropdown. Russian is fine — never sent to TTS.
-  name      String
+  name           String
   /// App-relative path to the single clip: data/_voices/<slug>/voice_reference.<ext>.
-  filePath  String
+  filePath       String
   /// File extension including the dot (".wav", ".mp3", …).
-  ext       String
+  ext            String
   /// Byte size on disk (shown in the UI; informational).
-  bytes     Int
+  bytes          Int
   /// MD5 hex of the file bytes — unique, dedupes identical uploads into one row.
-  checksum  String   @unique
+  checksum       String   @unique
   /// Optional provenance link — the YouTube (or any) URL the reference clip was
   /// taken from, so the original source can be re-found. Null = unknown source.
-  sourceUrl String?
+  sourceUrl      String?
   /// App-relative path to the FULL, untrimmed source clip kept alongside the
   /// reference (data/_voices/<slug>/source.<ext>) so the clip can be re-trimmed
   /// later without re-downloading. Null = imported before this feature / no
@@ -862,13 +863,13 @@ model Voiceover {
   /// Trim window (milliseconds into `sourceFilePath`) that produced the current
   /// `filePath` clip. Both null = clip is the whole source / no trim recorded.
   /// Persisted so the trim UI can reopen at the last selection and re-cut.
-  trimStartMs Int?
-  trimEndMs   Int?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  trimStartMs    Int?
+  trimEndMs      Int?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   /// Projects that have this voice assigned (Project.ttsVoiceoverId).
-  projects  Project[]
+  projects Project[]
 
   @@map("voiceovers")
 }
@@ -888,17 +889,17 @@ model Voiceover {
 // the same way it breaks CLIP for SDXL.
 
 model NarrativeBlock {
-  id        String   @id @default(uuid())
-  projectId String
+  id            String   @id @default(uuid())
+  projectId     String
   /// Stable identifier for the block within the project. English. e.g. "start",
   /// "growth", "burnout". Used in filesystem paths data/<slug>/bgm/<blockSlug>/.
-  slug      String
+  slug          String
   /// Human-friendly title for the UI. Russian is fine here — never sent to ACE.
-  title     String?
-  sortOrder Int      @default(0)
+  title         String?
+  sortOrder     Int      @default(0)
   /// Default ACE-Step tag prompt inherited by every segment unless overridden.
   /// English comma-separated tags (e.g. "cinematic, warm, hopeful, piano").
-  moodPrompt String?
+  moodPrompt    String?
   /// ACE-Step 1.5 metadata conditioning for this act. These are NOT decoration:
   /// `TextEncodeAceStepAudio1.5` renders them into the model prompt as a labelled
   /// `# Metas` block (see comfy/text_encoders/ace15.py `_metas_to_cap`), so a
@@ -915,15 +916,15 @@ model NarrativeBlock {
   /// Ordered array of Shot.id strings this block covers. Source of truth for
   /// `targetSeconds` — kept as JSON instead of a join table because order matters
   /// and the block's "shape" is rarely edited (set once during script breakdown).
-  shotIds   Json
+  shotIds       Json
   /// Cached sum of shot durations in seconds. Recomputed when shotIds changes
   /// or shot videos are re-rendered with new lengths.
   targetSeconds Int?
   /// Lifecycle: filling (auto-fill loop active) | filled (sum(segments) >=
   /// targetSeconds, idle) | manual (user took over, no auto-fill).
-  status    String   @default("filling")
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  status        String   @default("filling")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   project  Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
   segments MusicSegment[]
@@ -934,12 +935,12 @@ model NarrativeBlock {
 }
 
 model MusicSegment {
-  id          String   @id @default(uuid())
-  blockId     String
-  sortOrder   Int      @default(0)
+  id            String   @id @default(uuid())
+  blockId       String
+  sortOrder     Int      @default(0)
   /// Override of block.moodPrompt for this segment. English ACE-Step tags. Null
   /// = use block default. Lets an arc inside one block ("warm → tense → release").
-  prompt      String?
+  prompt        String?
   /// Per-tile override of the block's ACE-Step metas. Null = inherit the block's
   /// value (which in turn may be null = keep the template default). Same
   /// validation rules as NarrativeBlock — see Skill(gen-studio-acestep) §2.
@@ -948,18 +949,18 @@ model MusicSegment {
   timesignature String?
   /// Target seconds for this segment. Final flac length is decided by ACE-Step
   /// (driven by node `EmptyAceStep1.5LatentAudio.seconds`); this is the request.
-  durationSec Int      @default(60)
+  durationSec   Int      @default(60)
   /// Spare tile: generated on the act mood prompt but laid raw (no fade / no
   /// crop) on its own export lane, as manual-editing material. false = a main
   /// tile that the exporter places checkerboard with a crossfade.
-  spare       Boolean  @default(false)
+  spare         Boolean  @default(false)
   /// AudioRenderJob.id chosen as the canonical take for this segment. Plain id,
   /// no FK — mirrors approvedTTSJobId convention, so deleting a job row doesn't
   /// cascade-null the segment.
   approvedJobId String?
-  createdAt   DateTime @default(now())
+  createdAt     DateTime @default(now())
 
-  block NarrativeBlock     @relation(fields: [blockId], references: [id], onDelete: Cascade)
+  block NarrativeBlock   @relation(fields: [blockId], references: [id], onDelete: Cascade)
   jobs  AudioRenderJob[]
 
   @@index([blockId, sortOrder])
@@ -969,7 +970,7 @@ model MusicSegment {
 model AudioRenderJob {
   id               String    @id @default(uuid())
   segmentId        String
-  status           String    // pending | running | completed | failed | cancelled
+  status           String // pending | running | completed | failed | cancelled
   /// ComfyUI prompt_id once dispatched.
   comfyPromptId    String?
   /// Render parameters at enqueue time: { seed, steps, cfg, samplerName,
@@ -999,17 +1000,17 @@ model AudioRenderJob {
 /// scene_render_jobs tracks shot renders. PipelineQueueService.tick() dispatches
 /// pending rows one at a time. See AnchorRenderService.
 model AnchorRenderJob {
-  id              String    @id @default(uuid())
-  profileId       String
-  status          String    @default("pending")
+  id            String    @id @default(uuid())
+  profileId     String
+  status        String    @default("pending")
   /// ComfyUI prompt_id once dispatched. Null until status moves from pending → running.
-  comfyPromptId   String?
+  comfyPromptId String?
   /// Absolute on-disk path of the saved anchor PNG once completed.
-  outputPath      String?
-  errorMessage    String?
-  queuedAt        DateTime  @default(now())
-  startedAt       DateTime?
-  completedAt     DateTime?
+  outputPath    String?
+  errorMessage  String?
+  queuedAt      DateTime  @default(now())
+  startedAt     DateTime?
+  completedAt   DateTime?
 
   profile CharacterProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
 
@@ -1066,24 +1067,24 @@ model ThumbnailIdeaJob {
 /// frame out of everything on the table — so the pool is deliberately additive
 /// and nothing is overwritten by the next round.
 model ThumbnailJob {
-  id            String    @id @default(uuid())
-  projectId     String
-  status        String    @default("pending")
+  id               String    @id @default(uuid())
+  projectId        String
+  status           String    @default("pending")
   /// Short human label of the concept ("птица в золотой клетке"), so a wall of
   /// candidates stays readable in the picker.
-  idea          String?
+  idea             String?
   /// Natural-language art prompt. NEVER asks for lettering (see the skill §5.6).
-  prompt        String
-  negative      String?
+  prompt           String
+  negative         String?
   /// Candidates to render for THIS idea. Several ideas × several candidates is
   /// how the pool reaches double digits.
-  batchSize     Int       @default(2)
+  batchSize        Int       @default(2)
   /// Filenames of the rendered candidates, relative to `artPath`.
-  candidates    Json?
+  candidates       Json?
   /// Set on the ONE job across the whole project whose candidate the operator
   /// chose; holds that candidate's filename. Picking a new winner clears it
   /// everywhere else, so "the chosen cover" is always a single row.
-  chosenFilename String?
+  chosenFilename   String?
   /// Keep the anchor's PIXEL channel (`reference_latents`) as well as the VL
   /// one. On = likeness holds; off = only "who this person is" semantics travel
   /// and the composition is free. Null = the service default. Per-idea because
@@ -1097,20 +1098,20 @@ model ThumbnailJob {
   /// whether a second person belongs in frame. Codes only, always from THIS
   /// project's cast — anchors from other films are deliberately out of scope,
   /// since on non-Qwen projects the first reference also carries the style.
-  refProfileCodes String[]
+  refProfileCodes  String[]
   /// Caption parameters for the overlay pass: lines, accent_word, accent_color,
   /// position, align, width_pct, font. Shape documented in render_caption.py.
-  captionSpec   Json?
+  captionSpec      Json?
   /// ComfyUI prompt_id once dispatched. Null until pending → running.
-  comfyPromptId String?
+  comfyPromptId    String?
   /// Directory of the rendered text-free art candidates.
-  artPath       String?
+  artPath          String?
   /// The finished cover (art + caption) once the overlay pass has run.
-  outputPath    String?
-  errorMessage  String?
-  queuedAt      DateTime  @default(now())
-  startedAt     DateTime?
-  completedAt   DateTime?
+  outputPath       String?
+  errorMessage     String?
+  queuedAt         DateTime  @default(now())
+  startedAt        DateTime?
+  completedAt      DateTime?
 
   project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
 
@@ -1134,7 +1135,7 @@ model CaptionJob {
   videoPath    String
   /// BCP-47 language of the caption track.
   language     String    @default("ru")
-  status       String    @default("pending")   // pending | running | completed | failed
+  status       String    @default("pending") // pending | running | completed | failed
   /// Path to the generated .srt once transcription completes.
   srtPath      String?
   /// True once captions.insert accepted the track.
@@ -1171,7 +1172,7 @@ model CaptionJob {
 // spent on the film.
 
 model QueueEntry {
-  id            String   @id @default(uuid())
+  id String @id @default(uuid())
 
   /// training | dataset | scene | video | video_post | tts | bgm | anchor
   /// | validation | anchor_validation | caption
@@ -1189,9 +1190,9 @@ model QueueEntry {
   /// the source row is REUSED across retries (video_post resets its upscale*
   /// fields on re-run) — the earlier attempt survives here as its own row even
   /// though the source row no longer remembers it.
-  attemptNumber Int      @default(1)
+  attemptNumber Int    @default(1)
 
-  status        String   @default("pending")  // pending | running | completed | failed | cancelled | skipped
+  status String @default("pending") // pending | running | completed | failed | cancelled | skipped
 
   /// Which mutually-exclusive engine this work needs, so the dispatcher can do
   /// arbitration generically instead of via one method per job type:
@@ -1200,21 +1201,21 @@ model QueueEntry {
   ///   whisper    → ComfyUI must be STOPPED (faster-whisper on GPU)
   ///   kohya      → ComfyUI must be STOPPED (LoRA training)
   ///   standalone → no arbitration (TTS python subprocess)
-  engineClass   String
+  engineClass String
   /// Batching key: the WORKFLOW/MODEL identity, not the job type. Two entries
   /// sharing a groupKey can run back-to-back without ComfyUI unloading and
   /// reloading checkpoints (~30 s vs ~2.5 min), which is why the dispatcher
   /// prefers to drain a groupKey before switching. Examples:
   /// "video:video_wan22_i2v_api.json", "video_post", "scene:coffee",
   /// "tts:qwen3", "ollama:vision", "kohya".
-  groupKey      String
+  groupKey    String
 
   /// Queue position. Ascending = dispatched earlier. New work appends at
   /// max+RANK_GAP; reordering rewrites ONLY this column (never queuedAt), and a
   /// drag to an arbitrary slot takes the midpoint between its new neighbours.
   /// Float (not Int) so midpoint insertion practically never needs renumbering,
   /// and (not Decimal) so it crosses the API as a plain JSON number.
-  rank          Float
+  rank Float
 
   // ── Denormalized snapshot: what this work WAS, still readable after every
   //    upstream row is gone. Captured once at enqueue time.
@@ -1260,19 +1261,19 @@ model QueueEntry {
   /// re-touched; a later edit must not rewrite history that was already true.
   classifiedAt  DateTime?
 
-  queuedAt      DateTime  @default(now())
+  queuedAt        DateTime  @default(now())
   /// LEGACY, always null. Held the anti-starvation clock for the head of the
   /// queue back when the dispatcher could let a same-groupKey job cut ahead of
   /// it. Batching moved to enqueue time (nothing overtakes the head any more),
   /// so nothing reads or writes this; kept only to avoid a rewrite of 33k rows
   /// of history for a dropped column.
   firstEligibleAt DateTime?
-  startedAt     DateTime?
-  completedAt   DateTime?
+  startedAt       DateTime?
+  completedAt     DateTime?
   /// completedAt − startedAt, written once at close. Precomputed so the film's
   /// total time is a SUM over an indexed column instead of 38k+ date deltas.
-  durationMs    Int?
-  errorMessage  String?
+  durationMs      Int?
+  errorMessage    String?
 
   /// True = reconstructed by scripts/backfill_queue_entries.ts from the job
   /// tables rather than recorded live. Its timings are real (they come from the
@@ -1316,4 +1317,63 @@ model VisualStyle {
   updatedAt              DateTime @default(now()) @updatedAt
 
   @@map("visual_styles")
+}
+
+/// Story OBJECTS — a jacket, a car, a sewing machine. A first-class entity
+/// alongside characters, NOT a kind of character: props have no age profiles, no
+/// LoRA, no dataset, and their anchor is an object study rather than a portrait
+/// (user 2026-08-01 «предметы это не люди, они отдельно»).
+///
+/// The table predates this model — it was created by hand and lived outside the
+/// Prisma schema, which is why `props.controller.ts` talks to it through
+/// $queryRaw. Declared here 2026-08-01 so the queue ledger can resolve a prop
+/// anchor job the same generic way it resolves every other job type. The mapping
+/// matches the live DDL exactly; no migration recreates this table.
+model Prop {
+  id          String   @id @default(dbgenerated("gen_random_uuid()::text"))
+  projectId   String
+  code        String
+  name        String
+  description String
+  /// Path (relative to APP_ROOT) of the installed object anchor, or null while
+  /// the prop is text-only. Set either by promoting a render
+  /// (POST /props/:id/anchor/from-render) or by generating one
+  /// (POST /props/:id/generate-anchor).
+  anchorPath  String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now())
+
+  project    Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  anchorJobs PropAnchorJob[]
+
+  @@unique([projectId, code])
+  @@map("props")
+}
+
+/// Anchor render jobs for PROPS. Deliberately a separate table from
+/// `anchor_render_jobs`: that one is keyed by CharacterProfile and carries the
+/// portrait/vision-QC lifecycle, none of which applies to an object.
+model PropAnchorJob {
+  id            String    @id @default(uuid())
+  propId        String
+  status        String    @default("pending")
+  /// Engine this job was queued for: qwen | flux_comic | sdxl_comic. Null means
+  /// "resolve from project settings at dispatch". Stored so a queued job renders
+  /// on the engine that was picked when it was queued, not on whatever the
+  /// project setting says by the time the queue reaches it.
+  pipeline      String?
+  /// ComfyUI prompt_id once dispatched. Null until pending → running.
+  comfyPromptId String?
+  /// Directory of the rendered candidates once completed.
+  outputPath    String?
+  errorMessage  String?
+  queuedAt      DateTime  @default(now())
+  startedAt     DateTime?
+  completedAt   DateTime?
+
+  prop Prop @relation(fields: [propId], references: [id], onDelete: Cascade)
+
+  @@index([propId])
+  @@index([status, queuedAt])
+  @@map("prop_anchor_jobs")
 }

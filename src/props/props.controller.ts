@@ -1,8 +1,11 @@
-import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post } from '@nestjs/common';
-import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Res, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { ApiBody, ApiConsumes, ApiOperation, ApiTags } from '@nestjs/swagger';
+import type { Response } from 'express';
 import { IsOptional, IsString } from 'class-validator';
-import { copyFileSync, existsSync, mkdirSync } from 'fs';
+import { copyFileSync, createReadStream, existsSync, mkdirSync, statSync } from 'fs';
 import * as path from 'path';
+import { PropAnchorService } from './prop-anchor.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 /** Repo root, same env override as the render services. Three levels up because
@@ -52,7 +55,10 @@ class AssignPropDto {
 @ApiTags('Props')
 @Controller()
 export class PropsController {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly propAnchor: PropAnchorService,
+  ) {}
 
   @Get('projects/:projectId/props')
   @ApiOperation({ summary: 'List props (object anchors) for a project' })
@@ -165,6 +171,93 @@ export class PropsController {
       RETURNING id, "projectId", code, name, description, "anchorPath", "updatedAt"
     `;
     return rows[0];
+  }
+
+  /**
+   * Render an object study for this prop and install it as the anchor.
+   *
+   * The sibling route `anchor/from-render` only works for a prop that already
+   * HAS a solo shot to promote. Props that only ever appear beside a person had
+   * no way to get an anchor at all — on `seller` that was CAR and MACHINE, the
+   * two the user complained about most, because a prop with no anchor reaches
+   * the model as prose and prose does not pin a shape.
+   *
+   * Queued like every other GPU job; poll GET /props/:id/anchor-jobs.
+   */
+  @Post('props/:id/generate-anchor')
+  @ApiOperation({
+    summary: 'Queue an object-study render for this prop and install it as the anchor',
+    description:
+      'Enqueues a prop_anchor_jobs row. Renders the object ALONE on a neutral ground '
+      + 'from Prop.description, then installs the first candidate at '
+      + 'data/<slug>/reference/OBJ_<CODE>_anchor.png. Candidates stay under '
+      + 'reference/_candidates/OBJ_<CODE>/ so a different one can be promoted by hand. '
+      + 'Props are their own entity — this does NOT go through the character anchor pipeline.',
+  })
+  generateAnchor(@Param('id') id: string, @Body() body?: { pipeline?: string }) {
+    return this.propAnchor.enqueue(id, body?.pipeline ?? null);
+  }
+
+  @Get('props/:id/anchor-candidates')
+  @ApiOperation({ summary: 'List object-study candidates on disk and which one is installed' })
+  listAnchorCandidates(@Param('id') id: string) {
+    return this.propAnchor.listCandidates(id);
+  }
+
+  @Get('props/:id/anchor-candidates/:filename/raw')
+  @ApiOperation({ summary: 'Stream one object-study candidate (for <img src=...>)' })
+  async getAnchorCandidateRaw(
+    @Param('id') id: string,
+    @Param('filename') filename: string,
+    @Res() res: Response,
+  ) {
+    const p = await this.propAnchor.candidatePath(id, filename);
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Length', statSync(p).size);
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    createReadStream(p).pipe(res);
+  }
+
+  @Get('props/:id/anchor/raw')
+  @ApiOperation({ summary: "Stream the installed object anchor (404 while the prop is text-only)" })
+  async getAnchorRaw(@Param('id') id: string, @Res() res: Response) {
+    const p = await this.propAnchor.anchorPath(id);
+    if (!p) throw new NotFoundException('This prop has no anchor yet');
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Length', statSync(p).size);
+    res.setHeader('Cache-Control', 'no-store');
+    createReadStream(p).pipe(res);
+  }
+
+  @Post('props/:id/upload-anchor')
+  @ApiOperation({
+    summary: 'Upload a PNG/JPG and install it as this prop object anchor',
+    description: 'multipart/form-data, field name "file", max 10 MB. Same escape hatch the character panel has.',
+  })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({ schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } } } })
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadAnchor(
+    @Param('id')    id:   string,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    if (!file) throw new BadRequestException('field "file" is required (multipart/form-data)');
+    const MAX = 10 * 1024 * 1024;
+    if (file.size > MAX) throw new BadRequestException(`file too large (${file.size}); max ${MAX}`);
+    const anchorPath = await this.propAnchor.uploadAnchor(id, file.buffer);
+    return { propId: id, anchorPath, sizeBytes: file.size };
+  }
+
+  @Post('props/:id/anchor/select')
+  @ApiOperation({ summary: 'Install one candidate as the anchor for this prop' })
+  selectAnchorCandidate(@Param('id') id: string, @Body() body: { filename: string }) {
+    return this.propAnchor.selectCandidate(id, body?.filename);
+  }
+
+  @Get('props/:id/anchor-jobs')
+  @ApiOperation({ summary: 'List object-anchor render jobs for this prop (newest first, 50 max)' })
+  listAnchorJobs(@Param('id') id: string) {
+    return this.propAnchor.list(id);
   }
 
   @Delete('props/:id/anchor')

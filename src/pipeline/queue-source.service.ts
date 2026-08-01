@@ -33,6 +33,7 @@ const SOURCE: Record<JobType, SourceColumns> = {
   tts:        { delegate: 'tTSJob',              status: 'status',        prompt: null,              output: 'outputFilename',     error: 'errorMessage',        completed: 'completedAt' },
   bgm:        { delegate: 'audioRenderJob',      status: 'status',        prompt: 'comfyPromptId',   output: 'outputFilename',     error: 'errorMessage',        completed: 'completedAt' },
   anchor:     { delegate: 'anchorRenderJob',     status: 'status',        prompt: 'comfyPromptId',   output: 'outputPath',         error: 'errorMessage',        completed: 'completedAt' },
+  prop_anchor: { delegate: 'propAnchorJob',     status: 'status',        prompt: 'comfyPromptId',   output: 'outputPath',         error: 'errorMessage',        completed: 'completedAt' },
   thumbnail:  { delegate: 'thumbnailJob',        status: 'status',        prompt: 'comfyPromptId',   output: 'artPath',            error: 'errorMessage',        completed: 'completedAt' },
   thumbnail_ideas: { delegate: 'thumbnailIdeaJob', status: 'status',      prompt: null,              output: null,                 error: 'errorMessage',        completed: 'completedAt' },
   validation: { delegate: 'imageValidationJob',  status: 'status',        prompt: null,              output: 'chosenFilename',     error: 'errorMessage',        completed: 'completedAt' },
