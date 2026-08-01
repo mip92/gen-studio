@@ -62,7 +62,10 @@ PROPS['seller'] = {
     'TRIPOD':  'the phone stand',
 }
 
-LORA['seller'] = 0.8   # pixel channel is OFF there, so the LoRA carries the style alone
+# seller: the 0.8 experiment failed (2026-08-01 evening) — with the pixel channel
+# OFF the VL channel alone cannot hold face or drawing style and renders went
+# anime. qwenReferenceLatents is back ON and strengthModel back at the tuned 0.5,
+# same as every other realcomic_qwen project. Labels only from here on.
 
 # `station` keeps qwenReferenceLatents ON, so its 0.5 is still correct - labels only.
 # Brand names are dropped from the labels on purpose: this film does not name
