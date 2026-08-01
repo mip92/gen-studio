@@ -62,6 +62,7 @@ def render_page(
     bake_content: bool = True,
     frames_only: bool = False,
     draw_frames: bool = True,
+    progress: Optional[float] = None,   # 0..1 position in the book → real page stacks
 ) -> Image.Image:
     """Build and return the page image at (width*ss, height*ss).
 
@@ -89,7 +90,8 @@ def render_page(
             style.draw_frame(fdraw, rect_px, seed + i)
         return overlay
 
-    page = style.render_background((W, H), texture_path, seed, panels_px).convert("RGB")
+    page = style.render_background((W, H), texture_path, seed, panels_px,
+                                   progress=progress).convert("RGB")
     draw = ImageDraw.Draw(page)
 
     for i, p in enumerate(panels):

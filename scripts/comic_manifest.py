@@ -307,6 +307,9 @@ def build(slug, max_spreads, panel_frac, out, pack=False, supersample=DEFAULT_SU
         # "none" = hard cut.
         "page_transition": "turn3d", "page_transition_us": 800_000,
         "max_panel_slots": max((len(p["panels"]) for p in pages), default=1),
+        # total spreads in the film — chunk manifests carry only a slice of
+        # `pages`, but the page stacks must reflect the WHOLE book's progress
+        "page_total": len(pages),
         "pages": pages, "music_tracks": music,
     }
     os.makedirs(os.path.dirname(out), exist_ok=True)

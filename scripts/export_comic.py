@@ -364,7 +364,7 @@ def _outgoing_panels(page: dict, frames_dir: Path) -> List[dict]:
 
 def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
                     width, height, ss, style, texture, frames_dir: Path,
-                    tail_page=None) -> int:
+                    tail_page=None, page_total: int = 0) -> int:
     """At each spread boundary, overlay a wide book (opaque) + a leaf that flips
     across the spine. The leaf carries baked panel content (stills). The spine is
     the canvas centre, and scale_x scales about the centre, so animating scale_x
@@ -412,10 +412,10 @@ def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
                 return b
         return boxes[-1]
 
-    def _bake_bg(panels_subset, seed, out: Path) -> str:  # opaque full book (static)
+    def _bake_bg(panels_subset, seed, out: Path, prog=None) -> str:  # opaque full book (static)
         render_page(width=width, height=height, panels=panels_subset, style_name=style,
                     texture_path=texture, supersample=tss, seed=seed,
-                    bake_content=True, draw_frames=True).save(out)
+                    bake_content=True, draw_frames=True, progress=prog).save(out)
         return str(out).replace("\\", "/")
 
     def _bake_leaf(all_panels, seed, out: Path, right: bool) -> str:  # ONE page only
@@ -454,7 +454,9 @@ def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
         a_panels = _outgoing_panels(A, frames_dir)
         b_panels = B.get("panels") or []
         A_out = {**A, "panels": a_panels}
-        bg    = _bake_bg(_side(A_out, False) + _side(B, True), sA, pages_dir / f"turn_bg_{i:03d}.png")
+        # book state mid-flip: halfway between spread A's and B's reading progress
+        prog = (min(1.0, (sA - 0.5) / (page_total - 1)) if page_total > 1 else None)
+        bg    = _bake_bg(_side(A_out, False) + _side(B, True), sA, pages_dir / f"turn_bg_{i:03d}.png", prog)
         front = _bake_leaf(a_panels, sA, pages_dir / f"turn_front_{i:03d}.png", right=True)
         back  = _bake_leaf(b_panels, sB, pages_dir / f"turn_back_{i:03d}.png",  right=False)
 
@@ -501,6 +503,12 @@ def build_comic_draft(manifest: dict) -> Path:
     style  = str(manifest.get("page_style") or "old_comic")
     texture = manifest.get("texture_path") or None
     pages   = manifest.get("pages") or []
+    # REAL PAGE COUNT: total spreads in the FILM, not in this manifest — a chunk
+    # manifest carries only a slice of pages but inherits `page_total` from the
+    # full one, so every chunk sees the same book. Fallback (older manifests):
+    # the highest global pageIndex present.
+    page_total = int(manifest.get("page_total") or 0) \
+        or (max((int(p.get("pageIndex", 0)) for p in pages), default=0) + 1)
 
     drafts_root = Path(manifest.get("capcut_drafts_root") or manifest["output_root"])
     drafts_root.mkdir(parents=True, exist_ok=True)
@@ -560,7 +568,8 @@ def build_comic_draft(manifest: dict) -> Path:
         sheet = render_page(width=width, height=height, panels=panels,
                             style_name=style, texture_path=texture,
                             supersample=ss, seed=pidx + 1,
-                            bake_content=False, draw_frames=False)
+                            bake_content=False, draw_frames=False,
+                            progress=(pidx / (page_total - 1)) if page_total > 1 else 0.0)
         png = pages_dir / f'spread_{pidx:03d}.png'
         sheet.save(png)
         bg_seg = draft.VideoSegment(
@@ -711,7 +720,7 @@ def build_comic_draft(manifest: dict) -> Path:
         total_kf += _add_page_turns(
             script, pages, spread_bounds, pages_dir,
             width=width, height=height, ss=ss, style=style, texture=texture,
-            frames_dir=frames_dir, tail_page=tail_page)
+            frames_dir=frames_dir, tail_page=tail_page, page_total=page_total)
         if tail_page:
             timeline_end_us += TURN_US
 

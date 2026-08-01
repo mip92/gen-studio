@@ -111,7 +111,8 @@ class PageStyle(ABC):
 
     @abstractmethod
     def render_background(self, size: Tuple[int, int], texture_path: Optional[str],
-                          seed: int, panels_px: Optional[List[RectPx]] = None) -> Image.Image: ...
+                          seed: int, panels_px: Optional[List[RectPx]] = None,
+                          progress: Optional[float] = None) -> Image.Image: ...
 
     @abstractmethod
     def draw_frame(self, draw: "ImageDraw.ImageDraw", rect_px: RectPx, seed: int) -> None: ...
@@ -167,10 +168,15 @@ class OldComicPageStyle(PageStyle):
         pg = Image.blend(pg, Image.new("RGB", (w, h), self.PAPER), 0.25)
         return pg
 
-    def render_background(self, size, texture_path, seed, panels_px=None):
+    def render_background(self, size, texture_path, seed, panels_px=None, progress=None):
         """Open-book spread: dark desk, two near-full-sheet paper pages with a
         VISIBLE cut edge (thickness) + drop shadow + crisp boundary line, and a
-        SOFT central binding shadow (smooth bell — never a hard black bar)."""
+        SOFT central binding shadow (smooth bell — never a hard black bar).
+
+        `progress` (0..1, optional) = how far through the book this spread sits.
+        It redistributes the side stacks — read sheets pile up on the LEFT, unread
+        ones shrink on the RIGHT — so the book no longer looks permanently opened
+        at its middle. None keeps the legacy symmetric mid-book look."""
         w, h = size
         boxes, mid = _page_boxes(panels_px, w, h)
         paper = self._paper_fill((w, h), texture_path, seed)
@@ -234,19 +240,40 @@ class OldComicPageStyle(PageStyle):
             lwl = max(1, int(min(w, h) * 0.0009))  # thin, crisp contour (user 2026-07-23)
             K = 7                                  # one fewer stacked leaf (user 2026-07-24)
             Nb = 26
+            # REAL PAGE COUNT (user 2026-08-01): split a fixed total of 2K visible
+            # sheets between the stacks by `progress` — first spread ≈ 1 left / 13
+            # right, last ≈ the reverse. Legacy (progress=None) stays 7/7.
+            if progress is None:
+                kL = kR = K
+            else:
+                p01 = max(0.0, min(1.0, float(progress)))
+                tot = 2 * K
+                kL = max(1, min(tot - 1, 1 + int(round((tot - 2) * p01))))
+                kR = tot - kL
             room_R = max(0, (w - dm) - xR)
             room_L = max(0, xL - dm)
-            oR = xR + int(room_R * 0.55)          # outermost sheet x (right / left)
-            oL = xL - int(room_L * 0.55)
+            fL, fR = kL / K, kR / K                # 1.0 = the legacy mid-book stack
+            oR = xR + int(room_R * min(0.9, 0.55 * fR))   # outermost sheet x (right / left)
+            oL = xL - int(room_L * min(0.9, 0.55 * fL))
+            footL = max(3, int(foot * min(1.0, max(0.3, fL))))  # per-stack fore-edge depth
+            footR = max(3, int(foot * min(1.0, max(0.3, fR))))
 
-            # bottom band drop-shadow + paper fill (thick at outer corners, pinching
-            # to the spine). Drawn first so the side bands sit on top of it.
-            bottom = [(oL + (oR - oL) * (i / 48),
-                       yb + foot * (2.0 * (i / 48) - 1.0) ** 2) for i in range(49)]
+            # bottom band drop-shadow + paper fill: thick under each stack in
+            # proportion to ITS sheet count, pinching to the spine. Drawn first so
+            # the side bands sit on top of it.
+            span = max(1, oR - oL)
+            sx = min(0.999, max(0.001, (mid - oL) / span))  # spine along the band
+            def _bdepth(t):
+                if t <= sx:
+                    u = 1.0 - t / sx
+                    return footL * u * u
+                u = (t - sx) / (1.0 - sx)
+                return footR * u * u
+            bottom = [(oL + span * (i / 48), yb + _bdepth(i / 48)) for i in range(49)]
             shp2 = Image.new("L", (w, h), 0)
             ImageDraw.Draw(shp2).polygon(
-                bottom + [(oR, min(h - 1, yb + foot + go)),
-                          (oL, min(h - 1, yb + foot + go))], fill=150)
+                bottom + [(oR, min(h - 1, yb + max(footL, footR) + go)),
+                          (oL, min(h - 1, yb + max(footL, footR) + go))], fill=150)
             shp2 = shp2.filter(ImageFilter.GaussianBlur(go))
             bg = Image.composite(Image.new("RGB", (w, h), (0, 0, 0)), bg, shp2)
             d = ImageDraw.Draw(bg)
@@ -258,18 +285,20 @@ class OldComicPageStyle(PageStyle):
             # is one sheet peeking out below the one above. From its step the sheet drops
             # to the fore-edge, then runs ACROSS the bottom converging at the binding
             # (spine). Paper, not wood.
-            rise = int(foot * 1.15)                       # total staircase drop below the corner
-            for (edge_x, sign, room) in ((xR, +1, room_R), (xL, -1, room_L)):
+            for (edge_x, sign, room, kS, footS, oS) in (
+                    (xR, +1, room_R, kR, footR, oR), (xL, -1, room_L, kL, footL, oL)):
                 if room <= 8:
                     continue
+                riseS = int(footS * 1.15)          # staircase drop below this corner
+                extent = abs(oS - edge_x)          # this stack's horizontal spread
                 poly_top = [(edge_x, ytop)]
                 sheets = []
                 cx = edge_x
-                for i in range(1, K + 1):
-                    f = i / K
-                    ox = edge_x + sign * int(room * 0.55 * f)      # this step's outer x
-                    ty = min(yb, ytop + int(rise * f))             # this step's top (LOWER outward)
-                    depth = yb + int(foot * f)                     # this sheet's fore-edge depth
+                for i in range(1, kS + 1):
+                    f = i / kS
+                    ox = edge_x + sign * int(extent * f)           # this step's outer x
+                    ty = min(yb, ytop + int(riseS * f))            # this step's top (LOWER outward)
+                    depth = yb + int(footS * f)                    # this sheet's fore-edge depth
                     poly_top += [(cx, ty), (ox, ty)]               # riser down, then tread out
                     path = [(cx, ty), (ox, ty), (ox, depth)]       # tread + straight side down
                     for j in range(1, Nb + 1):                     # bottom edge → converge to spine
@@ -280,7 +309,7 @@ class OldComicPageStyle(PageStyle):
                     sheets.append(path)
                     cx = ox
                 # paper fill: staircase top → down the outer side → back along page edge
-                d.polygon(poly_top + [(cx, yb + foot), (edge_x, yb)], fill=self.EDGE)
+                d.polygon(poly_top + [(cx, yb + footS), (edge_x, yb)], fill=self.EDGE)
                 for path in sheets:                                # ONE consistent contour colour
                     d.line(path, fill=PAGE_LINE, width=lwl)
         return bg
@@ -317,7 +346,7 @@ class OldComicPageStyle(PageStyle):
 class PlainPageStyle(PageStyle):
     key = "plain"
 
-    def render_background(self, size, texture_path, seed, panels_px=None):
+    def render_background(self, size, texture_path, seed, panels_px=None, progress=None):
         return Image.new("RGB", size, (210, 210, 210))
 
     def draw_frame(self, draw, rect_px, seed):
