@@ -451,31 +451,31 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
   /**
    * Resolve the i2v workflow file — an explicit per-shot choice, never inferred:
    *   'cfg'          → 20 steps @ cfg 4 on both experts, 40 passes = «качество».
-   *   'fast'         → 4-step lightx2v full-distill fp8, cfg=1 on both, 4
-   *                    passes, the negative is never evaluated = «быстро».
-   *   'guard' / none → cfg 2.5 on the high-noise expert only, 6 passes = «страж»,
-   *                    the DEFAULT since 2026-07-30.
+   *   'guard'        → cfg 2.5 on the high-noise expert only, 6 passes = «страж».
+   *   'fast' / none  → 4-step lightx2v full-distill fp8, cfg=1 on both, 4
+   *                    passes, the negative is never evaluated = «быстро»,
+   *                    the DEFAULT again since 2026-08-01 (user call).
    *
-   * The default moved off 'fast' on the user's call: at cfg=1 ComfyUI does not
-   * evaluate the uncond branch at all, so `motionNegative` — baked on every shot
-   * in the corpus — was dead weight, and figures kept walking into frames that
-   * were supposed to stay empty. 'guard' turns the negative on for exactly the
-   * two steps where an A14B MoE decides composition, for +31 % (~196 s vs the
-   * measured 150 s) rather than the 6.5× that 'cfg' costs.
+   * The default was 'guard' for two days (2026-07-30 → 2026-08-01) on the theory
+   * that turning the negative on for the two steps where an A14B MoE decides
+   * composition would stop figures walking into frames — but that never got a
+   * rendered A/B, and it costs +31 % on every clip in the queue. Back to 'fast':
+   * at cfg=1 the positive motion prompt is the only live channel, which is what
+   * Skill(gen-studio-wan22) is written around. «страж» stays one click away for
+   * the shots that actually need it.
    *
    * The fallback matters as much as the select: `POST shots/:id/videos` is the
    * ONLY way a video is ever queued, and every scripted bulk enqueue omits
-   * `mode`. Leaving the fallback on 'fast' would have meant the UI said «страж»
-   * while a mass re-render quietly ran without it.
+   * `mode` — so this line is what a mass re-render runs on.
    *
    * There is still NO 'auto' — the old auto INFERRED the slow path from shot
    * properties and silently multiplied render time. This is a fixed default the
    * user chose, overridable per render, not an inference.
    */
   private resolveWorkflowFilename(mode: 'fast' | 'cfg' | 'guard' | undefined): string {
-    if (mode === 'cfg')  return CFG_WORKFLOW_FILENAME;
-    if (mode === 'fast') return WORKFLOW_FILENAME;
-    return GUARD_WORKFLOW_FILENAME;
+    if (mode === 'cfg')   return CFG_WORKFLOW_FILENAME;
+    if (mode === 'guard') return GUARD_WORKFLOW_FILENAME;
+    return WORKFLOW_FILENAME;
   }
 
   private loadTemplate(projectSlug: string, workflowFilename?: string | null): Record<string, any> {
