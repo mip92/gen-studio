@@ -1,0 +1,47 @@
+{
+  "doc": "Comic panel SHAPES — the single source of truth for every render size in template-layout mode. Each shape fixes the pixel size of all four pipeline stages: `gen` (base image generation bucket, per model family), `wan` (Wan 2.2 i2v video render, both dims MUST be multiples of 16), `smooth` (upscale+RIFE target, node 5 of video_upscale_interp_api.json) and `still` (final still upscale target, upscale_to_fhd.py --target). The `landscape` row deliberately equals the legacy hardcodes (1344x768 / 1280x720 / 768x432 / 1920x1080) — a shot without a panel assignment resolves to `landscape`, which makes the legacy pipeline a special case of this table. Read by scripts/comic_page_registry.py (python) and src/comic/page-template-registry.service.ts (NestJS). Stage aspects may deviate from `aspect` by <2% (validated); the contain-fit placer in export_comic absorbs the sliver.",
+  "shapes": {
+    "landscape": {
+      "aspect": 1.77778,
+      "gen": { "sdxl": [1344, 768], "flux": [1280, 720], "qwen": [1344, 768] },
+      "wan": [768, 432],
+      "smooth": [1920, 1080],
+      "still": [1920, 1080]
+    },
+    "wide": {
+      "aspect": 2.35294,
+      "gen": { "sdxl": [1536, 656], "flux": [1536, 656], "qwen": [1536, 656] },
+      "wan": [864, 368],
+      "smooth": [1920, 816],
+      "still": [1920, 816]
+    },
+    "square": {
+      "aspect": 1.0,
+      "gen": { "sdxl": [1024, 1024], "flux": [1024, 1024], "qwen": [1024, 1024] },
+      "wan": [640, 640],
+      "smooth": [1440, 1440],
+      "still": [1440, 1440]
+    },
+    "tall": {
+      "aspect": 0.66667,
+      "gen": { "sdxl": [832, 1248], "flux": [832, 1248], "qwen": [832, 1248] },
+      "wan": [480, 720],
+      "smooth": [1080, 1620],
+      "still": [1080, 1620]
+    },
+    "narrow": {
+      "aspect": 0.5625,
+      "gen": { "sdxl": [720, 1280], "flux": [720, 1280], "qwen": [720, 1280] },
+      "wan": [432, 768],
+      "smooth": [1080, 1920],
+      "still": [1080, 1920]
+    },
+    "tall_page": {
+      "aspect": 0.45,
+      "gen": { "sdxl": [672, 1488], "flux": [672, 1488], "qwen": [672, 1488] },
+      "wan": [368, 816],
+      "smooth": [1080, 2400],
+      "still": [1080, 2400]
+    }
+  }
+}

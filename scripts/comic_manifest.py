@@ -33,8 +33,11 @@ SPREAD_SIZES = [12]
 # that with 18% to spare, at which point extra pixels CANNOT reach the screen.
 # ss8 (15360×8640 = 132 MPix, 85 MB/spread) was 2.37× past that ceiling and made
 # the blur WORSE, not better: CapCut has to resample that monster itself, and its
-# minification mushes the thin ink lines that ss8 existed to protect. Overridable
-# with --supersample for A/B tests (user 2026-07-26).
+# minification mushes the picture instead of sharpening it (user 2026-07-26).
+# Since 2026-08-07 the panel borders don't ride the sheet at all — export_comic
+# renders each panel's frame as its OWN small PNG at the zoom's raster — so the
+# sheet raster only serves the paper/page edges and never needs more than this.
+# Overridable with --supersample for A/B tests.
 DEFAULT_SUPERSAMPLE = 4
 MARGIN   = 0.015      # outer margin around the whole spread (trimmed — bigger panels)
 MARGIN_Y = 0.040      # top margin
@@ -55,6 +58,24 @@ OPEN_HOLD, TRAVEL_US, END_HOLD = 900_000, 650_000, 700_000  # END_HOLD = quick p
 ZOOM_MIN, ZOOM_MAX = 1.2, 7.0
 DEFAULT_PANEL_FRAC = 0.72   # camera fills 72% of frame with a panel (was 0.85) —
                             # less zoom-in → less magnification of the baked sheet
+# Per-SHAPE fill for TEMPLATE mode (user 2026-08-06: «чтобы как можно больше можно
+# было разглядеть»): how much of the frame the panel takes along its LIMITING axis
+# at the hold. The zoom formula is contain-fit (frac / max(w,h)), so raising frac
+# is the only way to see the picture bigger without cropping it. Shapes that match
+# the 16:9 canvas can go near-fullscreen (a sliver of neighbours keeps the comic
+# feel); vertical shapes are height-limited anyway — pushing them harder only
+# magnifies the paper beside them, so they stay a touch lower. The sheet
+# supersample auto-scales from the resulting max zoom (see build()), and an
+# explicit --panel-frac still overrides all of this. A template slot's own
+# `panelFrac` wins over both.
+SHAPE_FRAC = {
+    "landscape": 0.90,   # 16:9 = canvas shape — almost fullscreen
+    "wide":      0.93,   # 2.35:1 strip — width-limited, bands show context anyway
+    "square":    0.86,   # side margins are inherent on 16:9 — fill the height
+    "tall":      0.84,   # 2:3 portrait
+    "narrow":    0.82,   # 9:16
+    "tall_page": 0.80,   # full-page vertical — already near page height
+}
 
 
 def shot_hold_us(kind, source_us, narration_us, export_timing):
@@ -135,14 +156,147 @@ def resolve_video(slug, code, interp, upsc, base):
     return None
 
 
+def _build_template_pages(cur, pid, export_timing, panel_frac, max_spreads, resolve_shot):
+    """TEMPLATE-LAYOUT branch: build spreads from the explicit page plan
+    (comic_pages + shots.comicPageId/comicSlot) instead of the mechanical
+    row-major grid. Panel rects and the CAMERA READING ORDER come from the
+    page's template (comic_page_templates.json, slots[].order) — the camera
+    still flies arrive → hold-while-the-video-plays → travel, exactly like the
+    uniform branch, only the route is authored by the template. A spread is
+    the page pair (pageIndex 2k, 2k+1); an odd tail leaves the right page as
+    empty paper. Returns (pages, page_start, shot_arrival, max_zoom)."""
+    import comic_page_registry as reg
+
+    templates = {t["id"]: t for t in reg.load_templates()}
+    shapes_aspect = {k: v["aspect"] for k, v in reg.load_shapes().items()}
+
+    cur.execute('SELECT id, "pageIndex", "templateId" FROM comic_pages '
+                'WHERE "projectId"=%s ORDER BY "pageIndex"', (pid,))
+    plan = cur.fetchall()
+    for i, (_pgid, pindex, tid) in enumerate(plan):
+        if pindex != i:
+            raise SystemExit(f"comic plan: pageIndex sequence has a gap/dup at {pindex} (expected {i})")
+        if tid not in templates:
+            raise SystemExit(f"comic plan: page {pindex} uses unknown template '{tid}'")
+    if len(plan) % 2:
+        # A spread is a page PAIR and the drawn paper page is derived from each
+        # side's panel bbox — an empty right page would render half a book (the
+        # very "jumping pages" the template mode exists to avoid). Plans are
+        # authored FIRST, and 3/4/6-slot templates can tile any shot count into
+        # an even number of pages.
+        raise SystemExit(f"comic plan: {len(plan)} pages — the plan must have an EVEN page count "
+                         "(use a 3-slot template for a short tail or merge a beat)")
+
+    cur.execute("""
+        SELECT sc."sortOrder", sc."sceneKey", sh.id, sh."shotCode", sh."renderMode",
+               sh."chosenRender", vr."interpFilename", vr."upscaledFilename",
+               vr."outputFilename", vr.params, tj."outputFilename", tj."durationMs", tj.text,
+               sh."comicPageId", sh."comicSlot", sh."comicPanelShape"
+        FROM shots sh JOIN scenes sc ON sh."sceneId"=sc.id
+        LEFT JOIN video_renders vr ON vr.id=sh."chosenVideoId"
+        LEFT JOIN tts_jobs tj ON tj.id=sh."approvedTTSJobId"
+        WHERE sh."projectId"=%s AND sh."comicPageId" IS NOT NULL
+    """, (pid,))
+    by_page_slot = {}
+    for r in cur.fetchall():
+        page_id, slot, shape = r[13], r[14], r[15]
+        if slot is None:
+            raise SystemExit(f"comic plan: shot {r[3]} has comicPageId but no comicSlot")
+        if (page_id, slot) in by_page_slot:
+            raise SystemExit(f"comic plan: two shots occupy page {page_id} slot {slot}")
+        by_page_slot[(page_id, slot)] = (resolve_shot(r[:13]), shape, r[3])
+
+    pages, page_start, shot_arrival = [], 0, {}
+    max_zoom = 1.0
+    n_spreads = (len(plan) + 1) // 2
+    for sidx in range(n_spreads):
+        if max_spreads and sidx >= max_spreads:
+            break
+        halves = []
+        for side, k in (("left", 2 * sidx), ("right", 2 * sidx + 1)):
+            if k < len(plan):
+                halves.append((side, plan[k]))
+        # items in reading order: the WHOLE left page (template order), then the
+        # whole right page — same page-by-page reading as the uniform branch.
+        items = []
+        for side, (page_id, pindex, tid) in halves:
+            tmpl = templates[tid]
+            for s in sorted(tmpl["slots"], key=lambda x: x["order"]):
+                entry = by_page_slot.get((page_id, s["slot"]))
+                if entry is None:
+                    raise SystemExit(f"comic plan: page {pindex} slot {s['slot']} "
+                                     f"({tid}) has no shot assigned")
+                sh, shape, code = entry
+                if shape != s["shape"]:
+                    raise SystemExit(f"comic plan: shot {code} comicPanelShape='{shape}' "
+                                     f"!= template slot shape '{s['shape']}' (page {pindex})")
+                items.append((s, reg.rect_to_sheet(s["rect"], side), sh))
+        panels, states = [], [{"t_us": 0, "cx": 0.5, "cy": 0.5, "zoom": 1.0}]
+        cursor = OPEN_HOLD
+        for slot_i, (tslot, rect, sh) in enumerate(items):
+            cx, cy = rect["x"] + rect["w"] / 2, rect["y"] + rect["h"] / 2
+            # slot's own panelFrac > explicit --panel-frac > per-shape default
+            slot_frac = tslot.get("panelFrac")
+            frac = slot_frac \
+                or (panel_frac if panel_frac != DEFAULT_PANEL_FRAC
+                    else SHAPE_FRAC.get(tslot["shape"], panel_frac))
+            m = max(rect["w"], rect["h"])
+            # The SMALLEST slots zoom the hardest and land "right in the paper" —
+            # ease their fill down a touch (user 2026-08-06: «слишком близко,
+            # буквально немного, для самых маленьких сцен»). Linear ramp: no
+            # change at m ≥ 0.26 (mid grid and larger), −8% by m ≤ 0.16 (the
+            # small flanking squares). A slot's explicit panelFrac is exact.
+            if not slot_frac and m < 0.26:
+                frac *= 1.0 - 0.08 * min(1.0, (0.26 - m) / 0.10)
+            zoom = max(ZOOM_MIN, min(ZOOM_MAX, frac / m))
+            max_zoom = max(max_zoom, zoom)
+            hold = shot_hold_us(sh["kind"], sh["source_us"], sh["narration_us"], export_timing)
+            arrival = cursor + TRAVEL_US
+            depart = arrival + hold
+            states.append({"t_us": arrival, "cx": cx, "cy": cy, "zoom": zoom})
+            states.append({"t_us": depart, "cx": cx, "cy": cy, "zoom": zoom})
+            cursor = depart
+            panels.append({"slot": slot_i, "shotCode": sh["shotCode"], "rect": rect,
+                           "shape": tslot["shape"],
+                           # pixel aspect of the panel's content — export_comic's
+                           # placer needs it: at uniform_scale=1 CapCut fits the
+                           # material INSIDE the 16:9 canvas, so a non-16:9 clip's
+                           # footprint is not (1,1) and the legacy fit=min(rw,rh)
+                           # would underfill the rect. Legacy manifests omit the
+                           # key -> 16:9 assumed -> old formula, bit-identical.
+                           "content_aspect": shapes_aspect[tslot["shape"]],
+                           "still_path": sh["still"], "media": sh["media"],
+                           "narration": sh["narration"], "zoom": zoom,
+                           "arrival_us": arrival, "hold_us": hold, "depart_us": depart})
+        page_end = cursor + END_HOLD
+        states.append({"t_us": page_end, "cx": 0.5, "cy": 0.5, "zoom": 1.0})
+        tid_left = halves[0][1][2]
+        pages.append({"pageIndex": sidx, "pageKey": f"{tid_left}_{sidx}",
+                      "page_start_us": page_start, "page_duration_us": page_end,
+                      "panels": panels, "camera_states": states})
+        for p in panels:
+            shot_arrival[p["shotCode"]] = page_start + p["arrival_us"]
+        page_start += page_end
+    return pages, page_start, shot_arrival, max_zoom
+
+
 def build(slug, max_spreads, panel_frac, out, pack=False, supersample=DEFAULT_SUPERSAMPLE):
     conn = psycopg2.connect(**DB); cur = conn.cursor()
-    cur.execute('SELECT id,"exportTiming" FROM projects WHERE slug=%s', (slug,))
+    cur.execute('SELECT id,"exportTiming",settings FROM projects WHERE slug=%s', (slug,))
     row = cur.fetchone()
     if not row:
         raise SystemExit(f"project {slug} not found")
-    pid, export_timing = row
+    pid, export_timing, settings = row
     export_timing = "narration" if export_timing == "narration" else "clip"
+    # objects on the desk around the book — configured per project in the UI
+    # (Project.settings.comicDeskProps), validated against the registries so a
+    # renamed/removed item never crashes a render.
+    from comic_desk_props import validate as validate_desk_props
+    from comic_page_style import parse_color
+    desk_props = validate_desk_props((settings or {}).get("comicDeskProps"))
+    # desk colour override ('#rrggbb'); None/malformed → the style's default wood
+    desk_color = (settings or {}).get("comicDeskColor")
+    desk_color = desk_color if parse_color(desk_color) else None
 
     cur.execute("""
         SELECT sc."sortOrder", sc."sceneKey", sh.id, sh."shotCode", sh."renderMode",
@@ -182,61 +336,85 @@ def build(slug, max_spreads, panel_frac, out, pack=False, supersample=DEFAULT_SU
         return dict(shotCode=code, still=still, media=media, kind=kind,
                     source_us=source_us, narration_us=narration_us, narration=narration)
 
-    # ── assemble spread GROUPS ──
-    # default: chunk PER SCENE (a spread ≈ a scene beat; short scenes → short tail
-    # spreads). --pack: chunk the whole film into full 12s ignoring scene borders
-    # (every spread full except the very last; a spread may span two scenes).
-    groups = []                                    # list of (skey, [shot,...])
-    if pack:
-        flat = []
-        for so in order:
-            sk = scenes[so][0][1]
-            for r in scenes[so]:
-                flat.append((sk, resolve_shot(r)))
-        i = 0
-        for size in chunk_sizes(len(flat)):
-            chunk = flat[i:i + size]; i += size
-            groups.append((chunk[0][0], [s for _, s in chunk]))
-    else:
-        for so in order:
-            shots = [resolve_shot(r) for r in scenes[so]]
-            sk = scenes[so][0][1]
-            i0 = 0
-            for size in chunk_sizes(len(shots)):
-                groups.append((sk, shots[i0:i0 + size])); i0 += size
+    # ── layout mode ──
+    # The PRESENCE of comic_pages rows is the single opt-in switch for the
+    # template-layout mode. Zero rows (every legacy project) → the untouched
+    # uniform branch below, byte-identical manifests.
+    cur.execute('SELECT count(*) FROM comic_pages WHERE "projectId"=%s', (pid,))
+    template_mode = (cur.fetchone()[0] or 0) > 0
 
-    pages, page_start, shot_arrival = [], 0, {}
-    for sidx, (skey, group) in enumerate(groups):
-        if max_spreads and sidx >= max_spreads:
-            break
-        rects = spread_rects(len(group))
-        panels, states = [], [{"t_us": 0, "cx": 0.5, "cy": 0.5, "zoom": 1.0}]
-        cursor = OPEN_HOLD
-        for slot, sh in enumerate(group):
-            rect = rects[slot]
-            cx, cy = rect["x"] + rect["w"] / 2, rect["y"] + rect["h"] / 2
-            zoom = max(ZOOM_MIN, min(ZOOM_MAX, panel_frac / max(rect["w"], rect["h"])))
-            hold = shot_hold_us(sh["kind"], sh["source_us"], sh["narration_us"], export_timing)
-            arrival = cursor + TRAVEL_US
-            depart = arrival + hold
-            states.append({"t_us": arrival, "cx": cx, "cy": cy, "zoom": zoom})
-            states.append({"t_us": depart, "cx": cx, "cy": cy, "zoom": zoom})
-            cursor = depart
-            panels.append({"slot": slot, "shotCode": sh["shotCode"], "rect": rect,
-                           "still_path": sh["still"], "media": sh["media"],
-                           "narration": sh["narration"], "zoom": zoom,
-                           "arrival_us": arrival, "hold_us": hold, "depart_us": depart})
-        # After the last panel, QUICKLY PULL BACK to the wide spread (general view)
-        # over END_HOLD, so the page turn begins from the wide book instead of a hard
-        # cut off a zoomed-in panel (user 2026-07-24). The final camera state = wide.
-        page_end = cursor + END_HOLD
-        states.append({"t_us": page_end, "cx": 0.5, "cy": 0.5, "zoom": 1.0})
-        pages.append({"pageIndex": sidx, "pageKey": f"{skey}_{sidx}",
-                      "page_start_us": page_start, "page_duration_us": page_end,
-                      "panels": panels, "camera_states": states})
-        for p in panels:
-            shot_arrival[p["shotCode"]] = page_start + p["arrival_us"]
-        page_start += page_end
+    if template_mode:
+        if pack:
+            print("comic_manifest: template layout plan found — --pack ignored (the plan fixes pagination)")
+        pages, page_start, shot_arrival, max_zoom = _build_template_pages(
+            cur, pid, export_timing, panel_frac, max_spreads, resolve_shot)
+        # Supersample sized from the ACTUAL max zoom of this plan, CAPPED at 4:
+        # the crisp-at-zoom element — the panel borders — no longer lives on the
+        # sheet (export_comic renders each panel's frame as its own small PNG at
+        # the zoom's raster), and for the sheet itself (paper, page edges) ss>4
+        # is a net LOSS — CapCut's minification of the giant raster softened the
+        # picture monotonically in the 2026-07-26 A/B. An explicit --supersample
+        # still wins.
+        if supersample == DEFAULT_SUPERSAMPLE:
+            import math as _math
+            supersample = max(2, min(4, _math.ceil(max_zoom * 1.1)))
+            print(f"comic_manifest: template mode, max zoom {max_zoom:.3f} -> supersample {supersample}")
+    else:
+        # ── assemble spread GROUPS (legacy uniform grid — DO NOT TOUCH) ──
+        # default: chunk PER SCENE (a spread ≈ a scene beat; short scenes → short tail
+        # spreads). --pack: chunk the whole film into full 12s ignoring scene borders
+        # (every spread full except the very last; a spread may span two scenes).
+        groups = []                                    # list of (skey, [shot,...])
+        if pack:
+            flat = []
+            for so in order:
+                sk = scenes[so][0][1]
+                for r in scenes[so]:
+                    flat.append((sk, resolve_shot(r)))
+            i = 0
+            for size in chunk_sizes(len(flat)):
+                chunk = flat[i:i + size]; i += size
+                groups.append((chunk[0][0], [s for _, s in chunk]))
+        else:
+            for so in order:
+                shots = [resolve_shot(r) for r in scenes[so]]
+                sk = scenes[so][0][1]
+                i0 = 0
+                for size in chunk_sizes(len(shots)):
+                    groups.append((sk, shots[i0:i0 + size])); i0 += size
+
+        pages, page_start, shot_arrival = [], 0, {}
+        for sidx, (skey, group) in enumerate(groups):
+            if max_spreads and sidx >= max_spreads:
+                break
+            rects = spread_rects(len(group))
+            panels, states = [], [{"t_us": 0, "cx": 0.5, "cy": 0.5, "zoom": 1.0}]
+            cursor = OPEN_HOLD
+            for slot, sh in enumerate(group):
+                rect = rects[slot]
+                cx, cy = rect["x"] + rect["w"] / 2, rect["y"] + rect["h"] / 2
+                zoom = max(ZOOM_MIN, min(ZOOM_MAX, panel_frac / max(rect["w"], rect["h"])))
+                hold = shot_hold_us(sh["kind"], sh["source_us"], sh["narration_us"], export_timing)
+                arrival = cursor + TRAVEL_US
+                depart = arrival + hold
+                states.append({"t_us": arrival, "cx": cx, "cy": cy, "zoom": zoom})
+                states.append({"t_us": depart, "cx": cx, "cy": cy, "zoom": zoom})
+                cursor = depart
+                panels.append({"slot": slot, "shotCode": sh["shotCode"], "rect": rect,
+                               "still_path": sh["still"], "media": sh["media"],
+                               "narration": sh["narration"], "zoom": zoom,
+                               "arrival_us": arrival, "hold_us": hold, "depart_us": depart})
+            # After the last panel, QUICKLY PULL BACK to the wide spread (general view)
+            # over END_HOLD, so the page turn begins from the wide book instead of a hard
+            # cut off a zoomed-in panel (user 2026-07-24). The final camera state = wide.
+            page_end = cursor + END_HOLD
+            states.append({"t_us": page_end, "cx": 0.5, "cy": 0.5, "zoom": 1.0})
+            pages.append({"pageIndex": sidx, "pageKey": f"{skey}_{sidx}",
+                          "page_start_us": page_start, "page_duration_us": page_end,
+                          "panels": panels, "camera_states": states})
+            for p in panels:
+                shot_arrival[p["shotCode"]] = page_start + p["arrival_us"]
+            page_start += page_end
 
     # ── BGM (anchored on the comic timeline) ──
     music = []
@@ -310,6 +488,10 @@ def build(slug, max_spreads, panel_frac, out, pack=False, supersample=DEFAULT_SU
         # total spreads in the film — chunk manifests carry only a slice of
         # `pages`, but the page stacks must reflect the WHOLE book's progress
         "page_total": len(pages),
+        # objects on the desk around the book (Project.settings.comicDeskProps,
+        # validated) — chunk manifests inherit this, same desk on every chunk
+        "desk_props": desk_props,
+        "desk_color": desk_color,   # '#rrggbb' wood override (comicDeskColor)
         "pages": pages, "music_tracks": music,
     }
     os.makedirs(os.path.dirname(out), exist_ok=True)

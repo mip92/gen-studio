@@ -1,0 +1,32 @@
+{
+  "project": "car_flipper",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "220 ТЫСЯЧ ПРОБЕГА. СТАЛО 89 🔩",
+      "shots": [
+        "A0_SH16",
+        "A0_SH17",
+        "A0_SH19",
+        "A1_SH07",
+        "A1_SH10",
+        "A1_SH13"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "«КАК СЕБЕ БРАЛ». ЧЕРЕЗ СТЕКЛО 🗣️",
+      "shots": [
+        "A11_SH14",
+        "A11_SH15",
+        "A11_SH16",
+        "A11_SH17",
+        "A11_SH18"
+      ]
+    }
+  ]
+}

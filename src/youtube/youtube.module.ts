@@ -14,7 +14,8 @@ import { YoutubeUploadService } from './youtube-upload.service';
   providers:   [YoutubeService, YoutubeAuthService, YoutubeUploadService, YoutubeCaptionsService, YoutubeLaunchService],
   controllers: [YoutubeController, YoutubeAuthController, YoutubeLaunchController],
   // YoutubeCaptionsService is consumed by PipelineQueueService (the queue runs
-  // the slow whisper transcription in its single slot).
-  exports:     [YoutubeCaptionsService],
+  // the slow whisper transcription in its single slot). YoutubeAuthService is
+  // consumed by ReleasesModule (publish-date backfill reads videos.list).
+  exports:     [YoutubeCaptionsService, YoutubeAuthService],
 })
 export class YoutubeModule {}

@@ -33,12 +33,26 @@ export type JobType =
   | 'thumbnail_ideas'
   // Object anchor for a PROP. Separate from 'anchor', which is keyed by
   // CharacterProfile — props are their own entity (user 2026-08-01).
-  | 'prop_anchor';
+  | 'prop_anchor'
+  // Project-wide VO QC batch: ONE run transcribes + analyses every narration
+  // wav due for checking (VoValidationRun). Whisper engine class — same GPU
+  // arbitration as 'caption'.
+  | 'vo_validation'
+  // Project-wide image QC batch (ImageQcRun): DWPose/scrfd deterministic gate
+  // + targeted Qwen fact-checklist. Replaces the retired per-shot 'validation'
+  // LLM-judge flow — that type stays in the vocabulary only so its history
+  // rows keep rendering; nothing enqueues it anymore.
+  | 'image_qc'
+  // Project-wide video QC batch (VideoQcRun): deterministic clip scanner
+  // (motion energy, skin-hue drift, closing-frame anatomy) + anchored Qwen-VL
+  // check of suspicious frames. Advisory only — never picks or gates a clip.
+  | 'video_qc';
 
 export const JOB_TYPES: readonly JobType[] = [
   'training', 'dataset', 'scene', 'video', 'video_post', 'tts',
   'bgm', 'anchor', 'validation', 'anchor_validation', 'caption',
-  'thumbnail', 'thumbnail_ideas', 'prop_anchor',
+  'thumbnail', 'thumbnail_ideas', 'prop_anchor', 'vo_validation',
+  'image_qc', 'video_qc',
 ] as const;
 
 export function isJobType(t: string): t is JobType {
@@ -81,6 +95,12 @@ export const ENGINE_CLASS: Record<JobType, EngineClass> = {
   anchor_validation: 'ollama',
   thumbnail_ideas:   'ollama',
   caption:           'whisper',
+  vo_validation:     'whisper',
+  // Pose worker holds the GPU via onnxruntime-cuda, then the fact stage loads
+  // the Ollama vision model — both need the card to themselves.
+  image_qc:          'ollama',
+  // Same shape: torch-GPU scanner subprocess, then Ollama for flagged moments.
+  video_qc:          'ollama',
   training:          'kohya',
   tts:               'standalone',
 };
@@ -128,6 +148,12 @@ export const INFRA_JOB_TYPES: readonly JobType[] = [
   // Writing cover concepts produces no rival artifact — it is overhead the
   // finished film paid for, like a QC pass.
   'thumbnail_ideas',
+  // VO QC pass — same reasoning as 'validation'/'caption'.
+  'vo_validation',
+  // Image QC pass — same reasoning.
+  'image_qc',
+  // Video QC pass — same reasoning.
+  'video_qc',
 ] as const;
 
 export function isInfraJobType(t: JobType): boolean {
@@ -176,10 +202,17 @@ export function groupKeyFor(
     case 'bgm':        return 'bgm:acestep';
     case 'validation':
     case 'anchor_validation': return 'ollama:vision';
+    // Loads its own (pose) models first, but its Ollama stage uses the same
+    // vision model as anchor validation — share the group.
+    case 'image_qc':          return 'ollama:vision';
+    case 'video_qc':          return 'ollama:vision';
     // Own group: this one loads the 30B, the validators load the 8B, and
     // interleaving them would swap models on every entry.
     case 'thumbnail_ideas':   return 'ollama:ideas';
     case 'caption':    return 'whisper';
+    // Same group as 'caption' — both load faster-whisper, so back-to-back
+    // entries skip a model reload window.
+    case 'vo_validation': return 'whisper';
     case 'training':   return 'kohya';
   }
 }

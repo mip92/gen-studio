@@ -56,8 +56,8 @@ export class ThumbnailsController {
 
   /** Render more frames for an existing idea, keeping the ones already there. */
   @Post('jobs/:jobId/more')
-  addMore(@Param('jobId') jobId: string, @Body() body?: { count?: number }) {
-    return this.thumbnails.addMore(jobId, Math.min(8, Math.max(1, body?.count ?? 5)));
+  addMore(@Param('jobId') jobId: string, @Body() body?: { count?: number; quality?: string }) {
+    return this.thumbnails.addMore(jobId, Math.min(8, Math.max(1, body?.count ?? 5)), body?.quality);
   }
 
   /** Stop an idea that is still queued or rendering. Keeps the row. */

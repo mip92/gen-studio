@@ -31,6 +31,17 @@ export interface SceneJobParams {
   negativeExtra?:  string;
   width:           number;
   height:          number;
+  /** Comic panel shape of the shot ("wide"|"landscape"|"square"|"tall") when
+   *  the shot is planned into a page template. ABSENT on every legacy render —
+   *  strategies with hardcoded base latents keep their historical numbers
+   *  byte-identical unless this is set, and only switch to params.width/height
+   *  (the shape's gen bucket) when it is. */
+  panelShape?:     string;
+  /** Hires-fix upscale target (the shape's `still` size) — only set together
+   *  with panelShape. Hires strategies write it into their LatentUpscale node
+   *  instead of the legacy "only if larger than base" comparison. */
+  hiresWidth?:     number;
+  hiresHeight?:    number;
   seed:            number;
   steps?:          number;
   cfg?:            number;

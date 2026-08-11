@@ -22,17 +22,17 @@ Manifest schema (see ExportsService.buildManifest for the writer):
   "background_fill":    "blur" | "color" | "",  # optional; vertical Shorts: fill
                                                 #   the canvas behind a 16:9 clip
                                                 #   in a 9:16 frame. "" = legacy.
-  "scenes": [
-    {
-      "sceneKey":   "S01",
+  "scenes": [                      # one entry per ACT (Scene row; real keys look
+    {                              #   like "act_01_boarding" / "origin" / "A1")
+      "sceneKey":   "act_01_boarding",
       "narration":  { "path": "...wav", "duration_us": 12345678 } | null,
       "shots": [
         # animated shot, legacy clip timing (no kind/source_us):
-        { "shotCode": "S01_SH01", "path": "...mp4", "duration_us": 5062500 },
+        { "shotCode": "A1_SH01", "path": "...mp4", "duration_us": 5062500 },
         # animated shot slowed to the VO (narration timing):
-        { "shotCode": "S01_SH02", "path": "...mp4", "duration_us": 11000000, "source_us": 5062500 },
+        { "shotCode": "A1_SH02", "path": "...mp4", "duration_us": 11000000, "source_us": 5062500 },
         # static shot — still PNG held + Ken Burns:
-        { "shotCode": "S01_SH03", "path": "...png", "duration_us": 9000000, "kind": "image" },
+        { "shotCode": "A1_SH03", "path": "...png", "duration_us": 9000000, "kind": "image" },
         ...
       ]
     }

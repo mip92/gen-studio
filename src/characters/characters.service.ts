@@ -7,6 +7,7 @@ import { CreateProfileDto } from './dto/create-profile.dto';
 import { scanLoraVariants, loraOutputName, LoraVariant } from '../training/lora-variants.util';
 import { loraOutputDirFor } from '../training/character-paths.util';
 import { DatasetService } from '../training/dataset.service';
+import { AnchorRenderService } from './anchor-render.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..');
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
@@ -24,6 +25,9 @@ export class CharactersService {
   constructor(
     private readonly prisma:  PrismaService,
     private readonly dataset: DatasetService,
+    /** Owner of the anchor-inheritance links — a new profile is slotted into
+     *  the character's age chain right after it is created. */
+    private readonly anchor:  AnchorRenderService,
   ) {}
 
   /**
@@ -106,7 +110,13 @@ export class CharactersService {
           },
         },
       },
-      include: { profiles: true },
+      include: {
+        profiles: true,
+        // projectLinks (with visualStyle) let the project cast page pick the
+        // right preview source per card (anchor vs dataset) without loading
+        // the whole library.
+        projectLinks: { include: { project: { select: { id: true, slug: true, name: true, visualStyle: true } } } },
+      },
       orderBy: { createdAt: 'asc' },
     });
   }
@@ -206,10 +216,20 @@ export class CharactersService {
 
   /** Paginated library list for the infinite-scroll /characters grid. Returns
    *  one page of characters (same row shape as listLibrary) + the total count,
-   *  so the client knows when to stop loading. */
-  async listLibraryPage(skip = 0, take = 24) {
+   *  so the client knows when to stop loading. `q` narrows by code/displayName
+   *  (case-insensitive contains) for the attach-to-project autocomplete. */
+  async listLibraryPage(skip = 0, take = 24, q?: string) {
+    const where = q
+      ? {
+          OR: [
+            { code:        { contains: q, mode: 'insensitive' as const } },
+            { displayName: { contains: q, mode: 'insensitive' as const } },
+          ],
+        }
+      : undefined;
     const [rows, total] = await this.prisma.$transaction([
       this.prisma.character.findMany({
+        where,
         include: {
           profiles:     true,
           projectLinks: { include: { project: { select: { id: true, slug: true, name: true, visualStyle: true } } } },
@@ -218,7 +238,7 @@ export class CharactersService {
         skip,
         take,
       }),
-      this.prisma.character.count(),
+      this.prisma.character.count({ where }),
     ]);
     return { rows, total };
   }
@@ -272,7 +292,7 @@ export class CharactersService {
     });
     if (dup) throw new BadRequestException(`Profile code "${dto.profileCode}" already exists for this character`);
 
-    return this.prisma.characterProfile.create({
+    const profile = await this.prisma.characterProfile.create({
       data: {
         characterId,
         profileCode:   dto.profileCode,
@@ -285,6 +305,19 @@ export class CharactersService {
         triggerToken:  dto.triggerToken,
       },
     });
+
+    // Slot the new state into the character's anchor-inheritance chain by age
+    // (see AnchorRenderService.linkChainForCharacter). `overwrite: false` keeps
+    // every link the user already made; a profile created without an ageLabel
+    // simply lands at the end of the chain and can be re-pointed by hand.
+    // Best-effort: a chain failure must never fail profile creation.
+    try {
+      await this.anchor.linkChainForCharacter(characterId, { overwrite: false });
+    } catch (e: any) {
+      this.logger.warn(`Auto-link of anchor chain for ${dto.profileCode} failed: ${e?.message ?? e}`);
+    }
+
+    return profile;
   }
 
   async findOne(projectIdOrSlug: string, characterId: string) {

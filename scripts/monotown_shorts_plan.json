@@ -1,0 +1,34 @@
+{
+  "project": "monotown",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ТРИ ТОННЫ НАД ГОЛОВАМИ ⚙️",
+      "shots": [
+        "A0_SH01",
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH08"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ГУДОК ОТМЕНИЛИ В ЦЕЛЯХ ЭКОНОМИИ 📯",
+      "shots": [
+        "A5_SH01",
+        "A5_SH02",
+        "A5_SH03",
+        "A5_SH04",
+        "A5_SH05",
+        "A5_SH12",
+        "A5_SH16"
+      ]
+    }
+  ]
+}

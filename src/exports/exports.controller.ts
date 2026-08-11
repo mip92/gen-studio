@@ -1,5 +1,7 @@
-import { Body, Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, NotFoundException, Param, Post, Query, Res } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
+import type { Response } from 'express';
+import { createReadStream, statSync } from 'fs';
 import { ExportsService } from './exports.service';
 
 /** Optional POST body for the shorts export — a plan pushed by the caller
@@ -68,6 +70,40 @@ export class ExportsController {
   comicStatus(@Param('idOrSlug') idOrSlug: string, @Query('name') name?: string) {
     // No name -> the current build from the manifest, so any page can poll it.
     return this.exports.comicStatus(idOrSlug, name);
+  }
+
+  @Post('comic/test-spread')
+  @ApiOperation({
+    summary: 'TEMPORARY: render ONE comic spread as a PNG (sync)',
+    description:
+      'Baked look of the first spread (stills + frames + desk props) for iterating '
+      + 'on the desk styling without a full draft build. Fetch the result via '
+      + 'GET comic/test-spread/png. To be deleted once the desk look settles.',
+  })
+  comicTestSpread(@Param('idOrSlug') idOrSlug: string) {
+    return this.exports.comicTestSpread(idOrSlug);
+  }
+
+  @Get('comic/test-spread/png')
+  @ApiOperation({ summary: 'TEMPORARY: stream the last test-spread PNG (for <img src=...>)' })
+  async comicTestSpreadPng(@Param('idOrSlug') idOrSlug: string, @Res() res: Response) {
+    const p = await this.exports.comicTestSpreadPng(idOrSlug);
+    if (!p) throw new NotFoundException('нет тестового разворота — сначала POST comic/test-spread');
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Length', statSync(p).size);
+    res.setHeader('Cache-Control', 'no-store');
+    createReadStream(p).pipe(res);
+  }
+
+  @Get('comic/desk-props/:item')
+  @ApiOperation({ summary: 'Stream a desk-prop sprite PNG (settings-page previews)' })
+  deskPropSprite(@Param('item') item: string, @Res() res: Response) {
+    const p = this.exports.deskPropSprite(item);
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Content-Length', statSync(p).size);
+    // the sprites do change while the desk look is being iterated — keep it short
+    res.setHeader('Cache-Control', 'private, max-age=60');
+    createReadStream(p).pipe(res);
   }
 
   @Post('comic/chunks')

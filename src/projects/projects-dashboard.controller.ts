@@ -1,8 +1,9 @@
-import { BadRequestException, Body, Controller, Get, NotFoundException, Param, Patch } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Logger, NotFoundException, Param, Patch } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { IsOptional, IsString } from 'class-validator';
 import { existsSync, statSync } from 'fs';
 import * as path from 'path';
+import { anchorExistsForProfile, anchorSlugCandidates } from '../characters/anchor-fs.util';
 import { PrismaService } from '../prisma/prisma.service';
 import { DatasetService } from '../training/dataset.service';
 import { probeWavDurationMs } from '../tts/wav-duration';
@@ -15,9 +16,12 @@ class SetScriptBody {
   text?: string;
 }
 
+
 @ApiTags('Projects')
 @Controller('projects/:idOrSlug')
 export class ProjectsDashboardController {
+  private readonly logger = new Logger(ProjectsDashboardController.name);
+
   constructor(
     private readonly prisma:  PrismaService,
     private readonly dataset: DatasetService,
@@ -28,6 +32,12 @@ export class ProjectsDashboardController {
    * Aggregated state for the project dashboard frontend.
    * Returns every profile with: dataset image count, lora readiness,
    * latest dataset/training job statuses. One call powers the whole grid.
+   *
+   * Also returns `identity` — which identity asset this project's visual style
+   * actually uses. Without it the overview showed "LoRA готовы 0 / N" forever
+   * for anchor-driven styles (realcomic_qwen, graphic_novel_*), whose profiles
+   * have no `loraPath` by design: 39 of 42 films train no per-character LoRA at
+   * all (user 2026-08-10 «мы должны отображать только то что используем»).
    */
   @Get('dashboard')
   @ApiOperation({ summary: 'Aggregated profile readiness for the project dashboard' })
@@ -36,6 +46,8 @@ export class ProjectsDashboardController {
       where: { OR: [{ id: idOrSlug }, { slug: idOrSlug }] },
     });
     if (!project) throw new NotFoundException(`Project "${idOrSlug}" not found`);
+
+    const identity = await this.identityFor((project as { visualStyle?: string | null }).visualStyle);
 
     // Fetch characters attached via EITHER legacy `Character.projectId` OR the
     // Phase 1 `ProjectCharacter` M:N join. Without the OR clause library
@@ -56,16 +68,24 @@ export class ProjectsDashboardController {
             trainingJobs: { orderBy: { createdAt: 'desc' }, take: 1 },
           },
         },
+        // A cameo character's anchor PNG lives under its HOME project's slug and
+        // is reused everywhere, so the probe below must look under every slug the
+        // character is attached to — same rule as ActionsService's generate_anchor
+        // gate and AnchorRenderService.getAnchorPath.
+        project:      { select: { slug: true } },
+        projectLinks: { select: { project: { select: { slug: true } } } },
       },
       orderBy: { createdAt: 'asc' },
     });
 
-    const profiles = characters.flatMap((c) =>
-      c.profiles.map((p) => {
+    const profiles = characters.flatMap((c) => {
+      const anchorSlugs = anchorSlugCandidates(project.slug, c);
+      return c.profiles.map((p) => {
         const images       = this.dataset.listImages(p.profileCode);
         const lastDsJob    = p.datasetJobs[0]    ?? null;
         const lastTrainJob = p.trainingJobs[0]   ?? null;
         const loraReady    = !!p.loraPath && existsSync(p.loraPath);
+        const anchorReady  = anchorExistsForProfile(anchorSlugs, p.profileCode);
 
         let phase: 'idle' | 'queued' | 'generating' | 'has_dataset' | 'training' | 'ready' = 'idle';
         if (loraReady)                                        phase = 'ready';
@@ -87,6 +107,7 @@ export class ProjectsDashboardController {
           triggerToken:  p.triggerToken,
           datasetCount:  images.length,
           loraReady,
+          anchorReady,
           loraPath:      p.loraPath,
           loraSizeMB:    loraReady ? Math.round(statSync(p.loraPath!).size / 1_000_000) : null,
           phase,
@@ -104,13 +125,76 @@ export class ProjectsDashboardController {
             completedAt: lastTrainJob.completedAt,
           },
         };
-      }),
-    );
+      });
+    });
 
     return {
       project: { id: project.id, slug: project.slug, name: project.name },
+      identity,
       profiles,
     };
+  }
+
+  /**
+   * What identity asset the project's visual style actually consumes, read from
+   * the `visual_styles` registry (the same source AnchorRenderService's
+   * style-readiness endpoint uses — NOT the ad-hoc
+   * `visualStyle !== 'photoreal_cinematic'` test scattered elsewhere).
+   *
+   *   kind: 'lora'   → per-character LoRA is trained and required
+   *   kind: 'anchor' → identity comes from an approved anchor portrait
+   *
+   * Unknown/absent style falls back to 'photoreal_cinematic' semantics, which is
+   * what every caller in this codebase assumes for a null visualStyle.
+   */
+  private async identityFor(visualStyle?: string | null): Promise<{
+    visualStyle:   string;
+    identityStack: string;
+    loraPipeline:  string;
+    kind:          'lora' | 'anchor';
+  }> {
+    const styleId = visualStyle ?? 'photoreal_cinematic';
+    const rows = await this.prisma.$queryRaw<Array<{
+      id: string; identityStack: string; loraPipeline: string;
+    }>>`SELECT id, "identityStack", "loraPipeline" FROM visual_styles WHERE id = ${styleId}`;
+    const row = rows[0];
+    if (!row) {
+      return {
+        visualStyle:   styleId,
+        identityStack: 'lora_face_lock',
+        loraPipeline:  'character_lora_florence2',
+        kind:          'lora',
+      };
+    }
+    return {
+      visualStyle:   row.id,
+      identityStack: row.identityStack,
+      loraPipeline:  row.loraPipeline,
+      kind:          this.identityKind(row.identityStack),
+    };
+  }
+
+  /**
+   * Which asset pins a character's identity, per `visual_styles.identityStack`.
+   *
+   * Only the face-lock stack uses a trained per-character LoRA; the IP-Adapter
+   * stacks use an approved anchor portrait. Note `loraPipeline:
+   * 'style_lora_dataset'` is a STYLE LoRA — not per character — so those styles
+   * are anchor-driven here too.
+   *
+   * An unrecognised stack is listed explicitly rather than falling through to
+   * 'anchor': the registry is meant to grow (pixar_3d, soviet_animation… — see
+   * docs/VISUAL_STYLE_ARCHITECTURE.md), and a silent default would point the
+   * overview's click-through at the wrong /actions gate for a whole film.
+   */
+  private identityKind(stack: string): 'lora' | 'anchor' {
+    if (stack === 'lora_face_lock') return 'lora';
+    if (stack === 'ip_adapter_only' || stack === 'ip_adapter_plus_style_lora') return 'anchor';
+    // Unknown stack: assume the anchor path, which is what every style added
+    // since photoreal_cinematic has used — but say so in the log, because the
+    // real fix is to teach this method the new value.
+    this.logger.warn(`Unknown visual_styles.identityStack "${stack}" — assuming anchor identity`);
+    return 'anchor';
   }
 
   /**
@@ -237,8 +321,24 @@ export class ProjectsDashboardController {
     // (photoreal pipeline) or just promptBase+triggerToken (cartoon / anchor
     // pipeline). Exposed in the response so the frontend can label gating
     // states correctly. Default keeps legacy projects on photoreal.
+    //
+    // Deliberately still the ad-hoc test, not `identityFor()` above: this decides
+    // per-participant RENDER readiness (promptBase + triggerToken present), which
+    // is a looser question than «is there an approved anchor» that the dashboard
+    // counter asks. Switching it would change which shots the acts list shows as
+    // renderable across every project — a separate call, not a side effect of the
+    // overview fix (2026-08-10).
     const visualStyle: string = (project as { visualStyle?: string }).visualStyle ?? 'photoreal_cinematic';
     const isCartoon = visualStyle !== 'photoreal_cinematic';
+
+    // Comic panel shapes (template-layout mode) — $queryRaw because the column
+    // may predate the generated Prisma client (documented repo pattern). One
+    // query for the whole project; empty map on legacy projects.
+    const shapeRows = await this.prisma.$queryRaw<Array<{ id: string; shape: string | null }>>`
+      SELECT id, "comicPanelShape" AS shape FROM shots
+      WHERE "projectId" = ${project.id} AND "comicPanelShape" IS NOT NULL
+    `;
+    const panelShapeByShot = new Map(shapeRows.map((r) => [r.id, r.shape]));
 
     const response = {
       project: { id: project.id, slug: project.slug, name: project.name, visualStyle },
@@ -321,6 +421,8 @@ export class ProjectsDashboardController {
 
           return {
             cameraFraming,
+            /** Comic panel shape (template-layout plan), null on legacy shots. */
+            comicPanelShape:      panelShapeByShot.get(sh.id) ?? null,
             id:                   sh.id,
             shotCode:             sh.shotCode,
             beat:                 pf.narrativeBeat   ?? null,

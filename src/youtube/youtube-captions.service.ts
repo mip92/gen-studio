@@ -21,8 +21,9 @@ const CAPTION_TIMEOUT_MS = Number(process.env.CAPTION_TIMEOUT_MS ?? 90 * 60 * 10
 
 /** Compact vocabulary bias from the known VO text: distinctive Capitalized words
  *  (names/places) + number-bearing tokens, deduped and capped. Whisper's
- *  initial_prompt window is small, so we feed the hard words, not the whole script. */
-function buildGlossary(vo: string): string {
+ *  initial_prompt window is small, so we feed the hard words, not the whole script.
+ *  Exported — VoValidationService biases its per-shot transcriptions the same way. */
+export function buildGlossary(vo: string): string {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const raw of vo.split(/\s+/)) {

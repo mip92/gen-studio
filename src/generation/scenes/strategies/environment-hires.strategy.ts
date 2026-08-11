@@ -44,9 +44,11 @@ export class EnvironmentHiresSceneStrategy implements SceneStrategy {
       : DEFAULT_NEGATIVE;
     this.set(wf, '4', 'text', negative);
 
-    // Base latent — always SDXL-native landscape (overrides any params.width)
-    this.set(wf, '5', 'width',      1344);
-    this.set(wf, '5', 'height',     768);
+    // Base latent — SDXL-native landscape on the legacy path (overrides any
+    // params.width); the panel shape's gen bucket when the shot is planned
+    // into a comic panel (params carry it, panelShape flags it).
+    this.set(wf, '5', 'width',      params.panelShape ? params.width  : 1344);
+    this.set(wf, '5', 'height',     params.panelShape ? params.height : 768);
     this.set(wf, '5', 'batch_size', params.batchSize ?? 1);
 
     // Base sampler
@@ -54,11 +56,17 @@ export class EnvironmentHiresSceneStrategy implements SceneStrategy {
     if (params.steps !== undefined) this.set(wf, '6', 'steps', params.steps);
     if (params.cfg   !== undefined) this.set(wf, '6', 'cfg',   params.cfg);
 
-    // Upscale target — keep template's FHD default unless caller explicitly
-    // requested a larger size. scene-render service defaults params.width/height
-    // to the SDXL base (1344×768), which would make this upscale a no-op.
-    if (params.width  && params.width  > 1344) this.set(wf, '20', 'width',  params.width);
-    if (params.height && params.height > 768)  this.set(wf, '20', 'height', params.height);
+    if (params.panelShape && params.hiresWidth && params.hiresHeight) {
+      // Comic panel: hires-fix straight to the shape's still target.
+      this.set(wf, '20', 'width',  params.hiresWidth);
+      this.set(wf, '20', 'height', params.hiresHeight);
+    } else {
+      // Upscale target — keep template's FHD default unless caller explicitly
+      // requested a larger size. scene-render service defaults params.width/height
+      // to the SDXL base (1344×768), which would make this upscale a no-op.
+      if (params.width  && params.width  > 1344) this.set(wf, '20', 'width',  params.width);
+      if (params.height && params.height > 768)  this.set(wf, '20', 'height', params.height);
+    }
 
     // Refiner — same seed (preserves composition), shorter, partial denoise for detail polish
     this.set(wf, '21', 'seed', params.seed);

@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, NotFoundException, Param, Patch, Post, Query, Res } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import { IsArray, IsNumber, IsOptional, IsString, IsUUID, ValidateNested } from 'class-validator';
@@ -9,7 +9,6 @@ import { ShotsService } from './shots.service';
 import { CreateShotDto } from './dto/create-shot.dto';
 import { UpdateShotDto } from './dto/update-shot.dto';
 import { SceneRenderService } from '../generation/scenes/scene-render.service';
-import { ImageValidationService } from '../validation/image-validation.service';
 
 class ParticipantInput {
   @IsString()
@@ -99,7 +98,6 @@ export class ShotsStandaloneController {
   constructor(
     private readonly shotsService: ShotsService,
     private readonly sceneRender:  SceneRenderService,
-    private readonly validation:   ImageValidationService,
   ) {}
 
   @Get(':shotId')
@@ -147,42 +145,6 @@ export class ShotsStandaloneController {
     @Body() body: { filename: string | null },
   ) {
     return this.shotsService.setChosenRender(shotId, body.filename);
-  }
-
-  @Post(':shotId/validate')
-  @ApiOperation({ summary: 'Queue an image-validation pass. INCREMENTAL: only candidates that have never been scored are sent to the model; earlier verdicts are reused. No-op when every candidate already has a verdict.' })
-  async validate(@Param('shotId') shotId: string) {
-    const job = await this.validation.enqueue(shotId, null);
-    // Re-checking invalidates whatever was chosen before (by the AI or by hand):
-    // clear it so the shot shows "under review" and the fresh pass decides anew.
-    if (job) await this.shotsService.setChosenRender(shotId, null);
-    return {
-      queued: !!job,
-      jobId:  job?.id ?? null,
-      reason: job ? null : 'все кандидаты уже проверены (или проверка уже в очереди)',
-    };
-  }
-
-  @Post(':shotId/apply-suggested-prompt')
-  @ApiOperation({ summary: 'Approve the vision model\'s structured suggestion — positive replaces promptFields.positive, negative tokens append to promptFields.negative (optionally queue an ADDITIVE re-render)' })
-  async applySuggestedPrompt(
-    @Param('shotId') shotId: string,
-    @Body() body: { positive?: string; negative?: string; prompt?: string; rerender?: boolean; validate?: boolean },
-  ) {
-    // `prompt` is the legacy flat-positive body — treat it as `positive`.
-    const positive = (body?.positive ?? body?.prompt)?.trim() || undefined;
-    const negative = body?.negative?.trim() || undefined;
-    if (!positive && !negative) {
-      throw new BadRequestException('positive and/or negative is required');
-    }
-    const shot = await this.shotsService.applySuggestedFields(shotId, { positive, negative });
-    if (body.rerender) {
-      // ADDITIVE re-render: previous candidates and their verdicts stay (user
-      // 2026-07-04: a new render must never delete the NN's comments or the
-      // already-generated photos). Validation of the new batch is opt-in.
-      await this.sceneRender.enqueueRender({ shotId, validate: body.validate === true });
-    }
-    return shot;
   }
 
   @Patch(':shotId/chosen-video')

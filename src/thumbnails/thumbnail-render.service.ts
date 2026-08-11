@@ -10,7 +10,14 @@ import { ENGINE_CLASS, JobType } from '../pipeline/queue-entry.types';
 import { ComfyService } from '../comfy/comfy.service';
 import { normalizeStyleLora } from '../generation/scenes/scene-render.service';
 import { QwenSceneGraphBuilder } from '../generation/scenes/qwen/qwen-scene-graph.builder';
-import { composeQwenInstruction, KEEP_REFERENCE_STYLE, REALCOMIC_T2I_STYLE } from '../generation/scenes/qwen/qwen-prompt';
+import { composeQwenInstruction, KEEP_REFERENCE_STYLE, REALCOMIC_COVER_STYLE } from '../generation/scenes/qwen/qwen-prompt';
+import {
+  batchDiversityProblems,
+  composeCoverPrompt,
+  coverPromptProblems,
+  sanitizeCoverPrompt,
+  type CoverPromptFields,
+} from './cover-prompt.gate';
 
 const execFileAsync = promisify(execFile);
 
@@ -37,8 +44,10 @@ const CAPTION_PYTHON = process.env.EXPORT_PYTHON ?? process.env.PYTHON_BIN
  *   1. NO Lightning LoRA, real steps, cfg above 1. Costs minutes instead of
  *      seconds, and — the part that matters here — a cfg above 1.0 is what makes
  *      the negative prompt live at all, so "no text, no letters" finally bites.
- *   2. NO reference_latents. The anchor is an identity donor only; its pixel
- *      channel would drag the studio-grey portrait framing into the cover.
+ *   2. reference_latents ON by default (the scenes default OFF): a cover is
+ *      judged on likeness, so the anchor's pixel channel is kept even though it
+ *      can bleed the studio-grey portrait framing into the composition. Per-idea
+ *      override (`referenceLatents: false`) when that bleed shows up.
  *
  * The art comes back with zero lettering by construction; the caption is drawn
  * afterwards by scripts/render_caption.py from a font file (user decision
@@ -62,8 +71,18 @@ const OLLAMA_URL = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
  * `qwen3-vl:8b` to trade the Russian back for speed.
  */
 const IDEAS_MODEL = process.env.OLLAMA_IDEAS_MODEL ?? 'qwen3-vl:30b';
-/** How much screenplay to feed it. Enough for the arc and the real numbers. */
-const SCRIPT_BUDGET = 8_000;
+/**
+ * Screenplay context for the idea model.
+ *
+ * Preferred source: the project's English short script (settings.scriptShort.en,
+ * written by the scenario skill) plus the screenplay's FINALE verbatim. Fallback
+ * when the short script is missing yet: opening + finale slices. The old blind
+ * slice(0, 8000) showed the model only the setup — and a cover concept is almost
+ * always about the reckoning, so it hallucinated one (car_flipper round of
+ * 2026-08-07: an invented fire, a broken signature, three contradictory ages).
+ */
+const SCRIPT_HEAD = 6_000;
+const SCRIPT_TAIL = 6_000;
 
 /** Frames per idea. Five gives a real choice inside one concept — at two, a
  *  weak pair kills an idea that was actually fine. */
@@ -83,14 +102,95 @@ const THUMB_HEIGHT = 720;
 /**
  * Real sampling, since the speed LoRA is out of the chain.
  *
- * 15 steps at cfg 3.0 (user's call, 2026-07-28). Every step is expensive twice
- * over here: the 20B model does not fit in the 16 GB card, so its weights are
- * streamed per step, and cfg above 1.0 runs the positive and negative branches
- * separately — two passes over those streamed weights. The earlier 25 was a
- * guess of mine, never measured against anything.
+ * 26 steps at cfg 3.0. Every step is expensive twice over here: the 20B model
+ * does not fit in the 16 GB card, so its weights are streamed per step, and cfg
+ * above 1.0 runs the positive and negative branches separately — two passes over
+ * those streamed weights.
+ *
+ * Raised from 15 on 2026-08-08, together with the palette rules and the LoRA
+ * strength below, against the complaint that covers come out grey and flat next
+ * to ordinary shots. 15 was neither regime: the scenes' 4 steps are what the
+ * Lightning distillation was trained for, while this chain drops Lightning and
+ * runs the raw base, whose own numbers are 40 steps / cfg 4.0. Undersampling a
+ * base model reads exactly as flat, low-contrast colour. 26 is the compromise
+ * that keeps one cover under a couple of minutes.
  */
-const THUMB_STEPS = 15;
+const THUMB_STEPS = 26;
 const THUMB_CFG = 3.0;
+
+/**
+ * Sampling tiers, because "full" is not always worth its wait.
+ *
+ * Cost is passes over the streamed weights per frame: steps × (cfg > 1 ? 2 : 1).
+ * A cover at `full` costs 52 against an ordinary shot's 4 — and the job renders
+ * a whole batch, so five frames is ~15 minutes (user, 2026-08-10).
+ *
+ *   scene    — exactly the ordinary-shot regime. Lightning is a step-distillation
+ *              LoRA trained FOR cfg 1.0, so guidance is baked in and the negative
+ *              branch is inert; raising cfg here would only burn the image. Fast,
+ *              and the user reports ordinary scenes look right, so this is a
+ *              legitimate cover tier, not merely a preview.
+ *   balanced — Lightning KEPT at its own cfg 1.0, twice the steps of a scene:
+ *              more room for the model to redraw and relight without paying the
+ *              double-branch cost of cfg > 1. See the table below for why this
+ *              is not "full with fewer steps".
+ *   full     — the 2026-08-08 settings, kept as the default so nothing changes
+ *              for anyone who does not pick a tier.
+ */
+export type ThumbQuality = 'scene' | 'balanced' | 'full';
+
+const THUMB_TIERS: Record<ThumbQuality, { lightning: boolean; steps: number; cfg: number }> = {
+  scene:    { lightning: true,  steps: 4,           cfg: 1.0 },
+  // Lightning STAYS here, and only the step count rises. The 2026-08-10 version
+  // of this tier dropped Lightning and ran 14 steps at cfg 2.5, which was the
+  // worst cell of the table on both axes at once: 28 passes per frame (7× the
+  // scene tier) AND 14 steps on a bare 20B, which is the same undersampling that
+  // produced the "covers are grey and flat" complaint of 08-08. Measured on
+  // car_flipper «ДВА ОДОМЕТРА», batch 5: it was still running at 17 minutes.
+  //
+  // Steps and Lightning are independent knobs in QwenSceneGraphBuilder, so the
+  // honest middle rung is more room to redraw at the cfg the LoRA was distilled
+  // for: 8 passes per frame, ~2× the scene tier instead of 7×. The negative
+  // stays inert at cfg 1.0 — acceptable, because the caption is stamped from a
+  // font file afterwards and 300+ shots per film render this way without
+  // spraying letters. `full` remains one click away when a live negative is
+  // genuinely wanted.
+  balanced: { lightning: true,  steps: 8,           cfg: 1.0 },
+  full:     { lightning: false, steps: THUMB_STEPS, cfg: THUMB_CFG },
+};
+
+/**
+ * Default tier: the ordinary-shot regime.
+ *
+ * `full` held this slot until 2026-08-10, when a single car_flipper batch ran 36
+ * minutes and the user called it unacceptable — correctly: 5 frames × 52 passes
+ * is 260 passes of a 20B model that has to be streamed past a 16 GB card.
+ *
+ * The 2026-08-08 "covers come out grey and flat" complaint does NOT argue
+ * against this. That was 15 steps with Lightning REMOVED — undersampling a base
+ * model, which reads as flat, low-contrast colour. Lightning at 4 steps is not
+ * undersampling; it is the regime the LoRA was distilled for, and it is what
+ * every ordinary shot in every film already renders at. Those look right.
+ *
+ * `full` stays one click away for a cover worth the wait.
+ */
+const DEFAULT_QUALITY: ThumbQuality = 'scene';
+
+/** Coerce whatever is on the row (or in a request body) to a known tier. */
+export function normalizeThumbQuality(v: unknown): ThumbQuality {
+  return v === 'scene' || v === 'balanced' || v === 'full' ? v : DEFAULT_QUALITY;
+}
+
+/**
+ * Word cap for the cover's scene prompt inside composeQwenInstruction.
+ *
+ * The scenes cap at 55 because a long positive loses the fight to the anchor's
+ * pose (measured, caregiver A0_SH19). A cover is a single hero frame rendered
+ * at real steps, and the idea model is asked for 40-90 words of composition —
+ * capping that at 55 silently ate exactly the trailing clauses that matter most
+ * here: the palette and the quiet lower third the caption is drawn on.
+ */
+const THUMB_SCENE_BUDGET = 90;
 
 /**
  * The "no lettering" requirement lives HERE, in the negative, and nowhere else.
@@ -109,7 +209,13 @@ const THUMB_NEGATIVE =
   // labels and signs get written on even when nothing asked for text.
   'labels, signage, printed words on paper, writing on tickets, handwriting, logos, ' +
   'photograph, photorealistic, 3D render, plastic skin, anime, manga, chibi, ' +
-  'deformed hands, extra fingers, two heads, blurry, low contrast, low quality';
+  'deformed hands, extra fingers, two heads, blurry, low contrast, low quality, ' +
+  // The "ugly cover" cluster, added 2026-08-08 with the craft block in the idea
+  // prompt: flat frontal light and a cluttered single plane are what made earlier
+  // covers read as cheap even when the concept was fine.
+  'flat lighting, flat single plane, cluttered background, busy background, ' +
+  'muddy colours, washed out, dull grey haze over everything, empty grey backdrop, ' +
+  'studio portrait backdrop, centred passport-photo framing';
 
 /**
  * Caption gate.
@@ -136,13 +242,19 @@ const THUMB_NEGATIVE =
  * A rejected caption is DROPPED, not repaired: the picker then opens with an
  * empty caption box, which is honest, instead of pre-filled garbage that looks
  * approved.
+ *
+ * Since 2026-08-08 the model drafts captions in ENGLISH (user's call): the 30B's
+ * free-composed Russian kept slipping agreement errors — «ПИСЬМО НЕ БЫЛО»,
+ * «ВИКТОР НЕ УБРАЛ ПУТЬ» — past both gates, every word real, the sentence not.
+ * The operator translates the chosen draft into Russian by hand before it is
+ * drawn; the lexicon pass below therefore only applies to Cyrillic words.
  */
 const CAPTION_MAX_LINES = 2;
 const CAPTION_MIN_WORDS = 2;
 const CAPTION_MAX_WORDS = 6;
-const VOWELS_RU = 'АЕЁИОУЫЭЮЯ';
+const CAPTION_VOWELS = 'АЕЁИОУЫЭЮЯAEIOUY';
 /** Punctuation a caption may legitimately carry, plus digits for the numbers. */
-const CAPTION_ALLOWED = /^[А-ЯЁ0-9\s.,!?:;«»"'()\-—–]+$/;
+const CAPTION_ALLOWED = /^[А-ЯЁA-Z0-9\s.,!?:;«»"'()\-—–]+$/;
 
 /** Words split off a caption line, punctuation stripped, empties dropped. */
 function captionWords(line: string): string[] {
@@ -167,7 +279,7 @@ export function captionProblem(lines: string[], accentWord?: string): string | n
     // The caption is drawn in capitals; a lowercase reply means the model
     // ignored the format, which correlates with it ignoring the rest.
     if (line !== line.toUpperCase()) return `строка не капсом: «${line}»`;
-    if (!CAPTION_ALLOWED.test(line)) return `посторонние символы (латиница?): «${line}»`;
+    if (!CAPTION_ALLOWED.test(line)) return `посторонние символы: «${line}»`;
 
     const words = captionWords(line);
     if (words.length < CAPTION_MIN_WORDS || words.length > CAPTION_MAX_WORDS) {
@@ -175,9 +287,9 @@ export function captionProblem(lines: string[], accentWord?: string): string | n
     }
     for (const w of words) {
       if (/^\d+$/.test(w)) continue;                       // a bare number is fine
-      const hasVowel = [...w].some((ch) => VOWELS_RU.includes(ch));
+      const hasVowel = [...w].some((ch) => CAPTION_VOWELS.includes(ch));
       if (!hasVowel && w.length > 2) return `слово без гласных «${w}»`;
-      if (/[^АЕЁИОУЫЭЮЯ0-9\s]{5,}/.test(w)) return `нечитаемое скопление согласных «${w}»`;
+      if (/[^АЕЁИОУЫЭЮЯAEIOUY0-9\s]{5,}/.test(w)) return `нечитаемое скопление согласных «${w}»`;
     }
   }
 
@@ -203,6 +315,9 @@ export interface ThumbnailIdea {
   referenceLatents?: boolean;
   /** Candidates for this idea (default 5). */
   batchSize?: number;
+  /** Sampling tier — 'scene' | 'balanced' | 'full'. Omitted = full, so the
+   *  operator who does not care keeps the behaviour they already had. */
+  quality?: string;
   /** Caption the model proposed alongside the art, so the picker opens with its
    *  wording already filled in. */
   captionSpec?: unknown;
@@ -286,10 +401,12 @@ export class ThumbnailRenderService {
     // Single letters are skipped: the lexicon has no one-character entries, so
     // the one-letter prepositions («в», «с», «к», «у», «о») would come back
     // "unknown" and kill a perfectly good caption. Caught on the live winner
-    // «В ТВОЕЙ БУДКЕ ГОЛОСА». Numbers are skipped for the same reason.
+    // «В ТВОЕЙ БУДКЕ ГОЛОСА». Numbers are skipped for the same reason. Latin
+    // words are skipped too: captions are ENGLISH drafts now, and the Russian
+    // lexicon would reject every one of them wholesale.
     const probe = [...new Set(
       words.map((w) => w.trim().toLowerCase())
-           .filter((w) => w.length > 1 && !/^\d+$/.test(w)),
+           .filter((w) => w.length > 1 && !/^\d+$/.test(w) && /[а-яё]/.test(w)),
     )];
     if (probe.length === 0) return new Set();
 
@@ -515,43 +632,177 @@ export class ThumbnailRenderService {
       .flatMap((l) => l.character.profiles)
       .map((p) => `${p.profileCode}: ${(p.promptBase ?? '').slice(0, 220)}`)
       .join('\n');
-    const script = (project.scriptText ?? '').slice(0, SCRIPT_BUDGET);
-    if (!script.trim()) {
+    const fullScript = project.scriptText ?? '';
+    if (!fullScript.trim()) {
       throw new BadRequestException(`У проекта ${project.slug} пустой scriptText — модели не из чего придумывать`);
     }
 
+    // The English short script (settings.scriptShort.en) is the canon of MEANING:
+    // arc, finale, leitmotif, the real numbers. The verbatim finale rides along in
+    // both branches — a cover concept is almost always about the reckoning.
+    const shortScript = String((project.settings as any)?.scriptShort?.en ?? '').trim();
+    const finale = fullScript.slice(-SCRIPT_TAIL);
+    const brief = shortScript
+      ? [`Story brief (canonical — trust it over your own reading of the screenplay):`, shortScript, ``]
+      : [];
+
+    /**
+     * Send the WHOLE screenplay whenever it fits. It almost always does — the six
+     * films that have covers run 5 200 to 10 000 characters, roughly 1 300 to
+     * 2 500 tokens against a 32 768-token context. Truncating them bought nothing
+     * and cost the feature its variety:
+     *
+     * car_flipper, 2026-08-10 — script 9 116 chars, brief present, so the old
+     * code took the `brief + finale` branch and the model saw the brief plus the
+     * LAST 6 000 characters only. The first three thousand — the teenage garage
+     * years, the whole first half of the arc — were never shown. All six concepts
+     * then came out of that one slice: "steam rises" in 6 of 6, "thirty payment
+     * forms" in 5 of 6. The model was not repeating itself; it was describing the
+     * only part of the film it had been given.
+     */
+    const WHOLE_SCRIPT_CAP = 24_000;
+    const storySections = fullScript.length <= WHOLE_SCRIPT_CAP
+      ? [...brief, `Screenplay, complete:`, fullScript]
+      : [
+          // Only for a genuinely long script. Take a middle slice too — the old
+          // head+tail shape made the entire second and third acts invisible,
+          // which is exactly where a cautionary tale keeps its best images.
+          ...brief,
+          `Screenplay opening:`,
+          fullScript.slice(0, SCRIPT_HEAD),
+          ``,
+          `Screenplay middle, verbatim excerpt:`,
+          fullScript.slice(
+            Math.floor(fullScript.length / 2) - SCRIPT_HEAD / 2,
+            Math.floor(fullScript.length / 2) + SCRIPT_HEAD / 2,
+          ),
+          ``,
+          `Screenplay finale, verbatim excerpt:`,
+          finale,
+        ];
+
     const instructions = [
       `You design YouTube thumbnails for a Russian cautionary-tale film channel («И ЭТО ВСЯ ТВОЯ ЖИЗНЬ»).`,
-      `Invent ${count} DISTINCT cover concepts for the film below. Different ideas, not variations of one.`,
+      `Invent ${count} DISTINCT cover concepts for the film below.`,
+      ``,
+      `DIVERSITY IS THE POINT, and it is CHECKED mechanically after you answer: two concepts that share`,
+      `an object, or repeat the same three-word phrase, are sent back for rework. Each concept MUST use a`,
+      `DIFFERENT composition from this list; at most ONE concept in the whole set may be a face close-up.`,
+      `Each concept also needs its OWN key object, its OWN time of day and its OWN pair of colours —`,
+      `a set of six variations on one idea is a failed set, however good the idea is:`,
+      `  - "split": two moments of the same person or place sharing one frame, and the contrast between`,
+      `    them IS the story. For a person use two profile codes of the SAME character at different ages.`,
+      `    Write it as ONE continuous image — "the boy at the workbench on one side, the same man thirty`,
+      `    years older on the other". Never write the words "split frame", "left half" or "right side`,
+      `    shows": those get drawn as a literal dividing line down the middle of the picture;`,
+      `  - "object-hero": the story's key object huge and sharp in the foreground, the person small or out`,
+      `    of focus behind it;`,
+      `  - "scale": one tiny lone figure against an enormous environment that dwarfs it;`,
+      `  - "confrontation": two people face each other, the tension readable in posture and distance;`,
+      `  - "pov": over the hero's shoulder — we see what they see, and the thing they see is in focus;`,
+      `  - "hands": no face in frame at all — hands doing or holding the decisive thing;`,
+      `  - "face-plus": the classic big face in strong emotion. Allowed ONCE, and only with a second`,
+      `    story-telling element sharing the frame — never the face alone.`,
+      ``,
+      `THE COVER MUST BE BEAUTIFUL, not merely shocking. A grim frame nobody wants to look at loses to a`,
+      `gorgeous one. Every prompt must build the image out of these four craft elements — they are what`,
+      `separates a still that looks composed by a cinematographer from a snapshot:`,
+      `  1. DEPTH IN THREE LAYERS: something close to the lens (a shoulder, a railing, leaves, steam), the`,
+      `     subject in the middle, and a background that recedes. A flat single-plane frame is the single`,
+      `     most common reason a render looks cheap. Weave all three into ONE flowing sentence, the way a`,
+      `     person describes a photograph out loud. Do NOT answer this rule as a form: labels like`,
+      `     "Close layer:", "Middle ground:", "Foreground:" or "Background:" are a memo about the picture,`,
+      `     and the model draws the memo — three unrelated sub-pictures with no subject.`,
+      `  2. LIGHT YOU CAN SEE TRAVELLING: a rim or back light that separates the subject from the`,
+      `     background, plus a visible source inside the frame when the scene allows one (a lamp, a`,
+      `     headlight, a window, a screen).`,
+      `  3. ATMOSPHERE THE LIGHT CATCHES: haze, dust motes, rain, steam, snow, smoke, breath in cold air.`,
+      `     This is what turns a correct image into a beautiful one — never leave the air empty.`,
+      `  4. CLEAN SHAPE READING: one dominant subject, generous negative space, the subject placed off`,
+      `     centre. It is looked at two centimetres wide, so big simple silhouettes beat fine detail.`,
       ``,
       `Each concept needs:`,
       `- "idea": a short RUSSIAN label, 2-5 words.`,
-      `- "prompt": the art prompt in ENGLISH prose, 2-4 sentences. Rules, all mandatory:`,
-      `    * one big face in extreme emotion (terror, devastation) is the main click driver;`,
-      `    * one shock element and one concrete object taken FROM THE SCRIPT (a real prop, a real number made physical);`,
-      `    * name the light and the palette;`,
+      `- "composition": the pattern name from the list above ("split", "object-hero", …).`,
+      `- "prompt": the art prompt in ENGLISH prose, 3-6 sentences, 40-90 words. Rules, all mandatory:`,
+      `    * THE HOOK IS A CONTRADICTION: two elements in frame that clash and make the viewer ask "how`,
+      `      did THIS lead to THAT?" — polished dress shoes on a muddy village road, a wedding photo on`,
+      `      top of packed moving boxes. Emotion alone is not a hook.`,
+      `    * every object and event must come from the story below — nothing invented;`,
+      `    * name the light and the palette — and the palette must CARRY COLOUR. A cover competes in a`,
+      `      grid of bright thumbnails, so name two or three saturated hues that fight each other (sodium`,
+      `      orange against night blue, red against wet green). NEVER write "desaturated", "muted", "grey",`,
+      `      "monochrome", "washed out", "drained" or "faded" — those words are an order, and they are why`,
+      `      earlier covers came back flat and grey. Drama comes from the subject and the light, not from`,
+      `      draining the colour out;`,
+      `    * name a strong light DIRECTION and a source (low sun raking across, a single overhead bulb, a`,
+      `      screen lighting the face from below) — flat even daylight is what makes a frame look dead;`,
       `    * the lower third of the frame must be a QUIET low-detail surface (floor, asphalt, shadow) — a caption is drawn there later;`,
-      `    * describe only what IS in the picture. Never write "no text" or any other negation — negations do not work on this model.`,
+      `    * a number from the story becomes a QUANTITY THE EYE GRASPS WITHOUT COUNTING — a thick fan of`,
+      `      banknotes, a shelf packed end to end, an overflowing box, a wall of them. NEVER a specific`,
+      `      count ("thirty folders", "68 exercise books"): nobody can count at thumbnail size, and a`,
+      `      counted pile of documents comes back as garbled glyphs because the technical negative forbids`,
+      `      the very lettering the papers invite. Same ban on written digits, tags, labels, signs,`,
+      `      engraved dates, calendars and any paper with visible writing;`,
+      `    * describe only what IS in the picture: never "no text", never "missing X", never "an empty`,
+      `      chair where someone should be" — negations and absences cannot be drawn; name the visible`,
+      `      thing instead;`,
+      `    * no meta-language: never write "shock element", "concrete object" or "the composition shows" —`,
+      `      write the finished frame itself.`,
       `NEVER write a profile code (SOLMOTHER_BASE, ANNOUNCER_OLD …) inside "prompt". Those belong only in`,
       `"refProfileCodes". In the prose call people by what they are — "the woman", "the older man", "the boy".`,
       `A code left in the prose gets DRAWN: one render came back with "SOLMOTHER" printed on a ticket.`,
+      `This is the rule broken most often — 24 of the last 40 covers had a code left in the prose — so it is`,
+      `now checked mechanically and a concept that still carries one is sent back.`,
+      ``,
+      `- "light": the light of this frame on its own, 4-10 words — source plus direction. Examples:`,
+      `  "a single overhead bulb, hard shadows straight down", "low winter sun raking from frame left",`,
+      `  "the screen lighting her face from below, everything behind it dark".`,
+      `- "palette": 2-3 saturated hues that FIGHT each other, 4-10 words, e.g. "sodium orange against deep`,
+      `  night blue, wet black asphalt". This field is mandatory and is appended to the end of the render`,
+      `  instruction, which is the position the films' own shots put their palette in. Never desaturating`,
+      `  words here either.`,
+      `- "motif": the ONE object this concept is built on, 1-3 words in English ("the odometer", "the`,
+      `  thermos"). Two concepts in the set may not share a motif — this is compared mechanically.`,
+      `- "moment": which moment of the film this concept is taken from, 2-5 words in RUSSIAN («первая`,
+      `  сделка в гараже», «ночь после суда»). SPREAD THE SET ACROSS THE WHOLE ARC — the beginning, the`,
+      `  middle and the reckoning, not six angles on the finale. Two concepts may not share a moment, and`,
+      `  this too is compared mechanically. You have the complete screenplay above; use its middle, not`,
+      `  only its last page.`,
+      ``,
+      `A worked example, from a real failure. THIS was returned for a film about a car dealer, and every`,
+      `line of it is wrong in a way that costs a render:`,
+      `  BAD: "Split frame: left shows young Viktor (VIK_TEEN) holding an instrument cluster under garage`,
+      `  light; steam rises from wet car beneath him. Right side shows older Viktor (VIK_OLD) washing a`,
+      `  flooded vehicle at dawn with cracked wrist pouch on arm—stack of thirty payment forms rests near`,
+      `  rubber boots. Orange-gold backlight separates both figures against grey sky and concrete floor."`,
+      `  Why it fails: "Split frame:" and "left shows" draw a literal divider; the two codes get drawn as`,
+      `  letters; "thirty payment forms" cannot be counted and invites glyphs; "grey sky" and "concrete`,
+      `  floor" name the frame's dominant colour as grey in the closing clause, so the whole cover greys out.`,
+      `  GOOD: "A boy of sixteen crouches over an opened instrument cluster on an oil-dark workbench, the`,
+      `  same man forty years later stands beyond him hosing down a flooded sedan, both of them held by the`,
+      `  hard amber beam of a work lamp that rakes across the wet floor and throws their shadows long into`,
+      `  the blue dark of the yard behind."`,
+      `  light: "one amber work lamp low at frame left, hard raking beam"`,
+      `  palette: "amber work-lamp orange against cold cobalt night, oil-black reflections"`,
+      `  motif: "the instrument cluster"`,
       ``,
       `Hard limits on content: this is a drama channel, not horror. Nothing bloody, gory, injured or dead —`,
       `no blood, no bloodstains, no wounds, no corpses. The dread comes from loss, silence and time passing,`,
-      `and every object you put in frame must actually appear in the screenplay below.`,
+      `and every object you put in frame must actually appear in the story below.`,
       ``,
-      `- "caption_lines": 1-2 RUSSIAN lines in CAPITALS. A concrete number or fact from the script plus a consequence or an open loop. Never repeat the video title. 2-6 words per line.`,
-      `    * THE CAPTION IS THE HARDEST PART AND YOUR PREVIOUS ATTEMPTS FAILED IT. Every line must be`,
-      `      ordinary, grammatical Russian that a native speaker would actually say out loud.`,
-      `    * Use only common everyday words. NEVER invent a word, never use a rare or bookish one,`,
-      `      never bend a word to fit — and if a line does not parse as Russian, replace the whole line.`,
-      `    * Real failures from earlier rounds, all rejected — do not produce anything like them:`,
-      `      «СЛУШАЛ ГОЛОС — СТАНДОР», «ОДИН СОБЫТИЙ — ТУДЕЛКА», «ВЕЗДА ОДИН БИЛЕТ», «30 ЛЕТ ПИСЬМЕН»,`,
-      `      «МАТЬ И ПУСТОТНОСТЬ», «НО ЛЮБОВЬ — ГРУСТЬ». «СТАНДОР», «ТУДЕЛКА», «ВЕЗДА» and`,
-      `      «ПУСТОТНОСТЬ» are not Russian words; «ОДИН СОБЫТИЙ» and «30 ЛЕТ ПИСЬМЕН» do not agree.`,
-      `    * Good, for contrast — plain words, correct grammar, a concrete fact and a gap:`,
-      `      «ПИСЬМО 27.06.1985 / СЫН НЕ ПРИЕХАЛ», «30 ЛЕТ В ОДНОЙ БУДКЕ / НИКТО НЕ ЗНАЛ ЛИЦА».`,
-      `    * Nouns and verbs must agree in case and number. Read each line back before you answer.`,
+      `- "negative": 3-6 EXTRA comma-separated things to keep OUT of this specific cover — the failure you`,
+      `  expect from THIS composition, not generic quality words. A standard technical negative is always`,
+      `  applied on top, so do not repeat "text, blurry, extra fingers". Write the wrong reading a diffusion`,
+      `  model reaches for by default: "smiling, heroic pose, confident smirk" for a scene of ruin,`,
+      `  "tidy showroom, polished floor" for a working garage, "crowd, other people" for a frame about being`,
+      `  alone. It bites only on the "full" quality tier, which renders at cfg 3.0 — on the cheaper tiers`,
+      `  the negative is inert, so never rely on it to fix a defect the positive can avoid.`,
+      ``,
+      `- "caption_lines": 1-2 ENGLISH lines in CAPITALS, 2-6 words per line. A working draft — the operator`,
+      `  translates the chosen one into Russian before it is drawn on the cover. A concrete number or fact`,
+      `  from the story plus a consequence or an open loop. Plain everyday words, no poetry, never repeat`,
+      `  the video title. Good: «30 YEARS IN ONE BOOTH / NOBODY KNEW HER FACE», «THE LETTER CAME / 40 YEARS LATE».`,
       `- "accent_word": the ONE word from caption_lines to paint red — prefer the emotional verb over the number.`,
       `    * It must appear VERBATIM in caption_lines, otherwise there is nothing to colour.`,
       `- "refProfileCodes": WHICH people this particular concept needs, as an array of 0-3 profile codes copied EXACTLY from the cast list below.`,
@@ -565,8 +816,7 @@ export class ThumbnailRenderService {
       `Cast (profile code: appearance):`,
       cast || '(none)',
       ``,
-      `Screenplay:`,
-      script,
+      ...storySections,
       ``,
       `Return JSON: {"ideas": [...]}. No preamble.`,
     ].join('\n');
@@ -589,24 +839,212 @@ export class ThumbnailRenderService {
       // hallucinating a profile would otherwise fail the render minutes later.
       const known = new Set(project.characterLinks.flatMap((l) => l.character.profiles).map((p) => p.profileCode));
 
+      // The art prompt gets the same treatment the captions already had: a
+      // mechanical gate, one repair round, then a loud drop. See
+      // cover-prompt.gate.ts for why prose rules alone were not enough.
+      const surviving = await this.gateCoverPrompts(ideas, project.slug);
+      if (surviving.length === 0) {
+        throw new BadRequestException(
+          `${IDEAS_MODEL} не смогла выдать ни одного годного арт-промпта даже после доработки — нажми «Предложить идеи» ещё раз`,
+        );
+      }
+
       // Captions in two passes: the cheap mechanical gate per idea, then ONE
       // lexicon spawn over everything that survived it (the dictionary costs
       // ~4 s to load, so it must not run per idea).
-      const captions = ideas.map((i) => this.acceptCaption(i, project.slug));
+      const captions = surviving.map((i) => this.acceptCaption(i, project.slug));
       const nonWords = await this.unknownRussianWords(
         captions.flatMap((c) => (c ? c.lines.flatMap(captionWords) : [])),
       );
 
-      return ideas.map((i, n) => ({
+      return surviving.map((i, n) => ({
         idea:   typeof i.idea === 'string' ? i.idea : undefined,
         prompt: String(i.prompt).trim(),
         refProfileCodes: (Array.isArray(i.refProfileCodes) ? i.refProfileCodes : [])
           .map(String).filter((c: string) => known.has(c)).slice(0, 3),
-        refReason: typeof i.refReason === 'string' ? i.refReason : undefined,
+        // Per-idea negative, appended to the technical one at dispatch: the model
+        // names the wrong reading THIS composition invites, which a single global
+        // negative cannot know (a smile on a scene of ruin, a crowd in a frame
+        // about being alone).
+        negative: typeof i.negative === 'string' && i.negative.trim()
+          ? `${THUMB_NEGATIVE}, ${i.negative.trim()}`
+          : undefined,
+        // The composition pattern rides in front of refReason so the operator
+        // sees at a glance which slot of the diversity list each concept fills.
+        refReason: [
+          typeof i.composition === 'string' && i.composition.trim() ? `[${i.composition.trim()}]` : '',
+          typeof i.refReason === 'string' ? i.refReason : '',
+        ].filter(Boolean).join(' ') || undefined,
         // Carried through so the picker can pre-fill the caption form with the
         // model's own wording — but only if it survived both gates.
         captionSpec: this.dropIfNonWords(captions[n], nonWords, i, project.slug),
       }));
+    }
+  }
+
+  /**
+   * Art-prompt gate: sanitize → validate → ONE repair round → validate → drop.
+   *
+   * Why a repair round rather than a straight reject: a 30B call over the whole
+   * screenplay costs minutes, and the defects measured on 2026-08-11 were almost
+   * all WORDING (a code left in the prose, a layer label, "thirty forms") on top
+   * of a concept that was fine. Throwing the batch away to re-roll the same
+   * concepts differently-worded is the expensive way to fix a typo. The repair
+   * call sees only the failing concepts and the exact violations, so it is small.
+   *
+   * What survives is returned with `prompt` already composed — prose + light +
+   * palette, palette last. What does not survive is dropped and LOGGED with the
+   * reason: a silently shortened set of ideas reads to the operator as "the model
+   * only had four ideas", which is a different and misleading fact.
+   */
+  private async gateCoverPrompts(ideas: any[], slug: string): Promise<any[]> {
+    const fields = (list: any[]): CoverPromptFields[] => list.map((i) => ({
+      prompt:  String(i.prompt ?? ''),
+      light:   typeof i.light === 'string' ? i.light : undefined,
+      palette: typeof i.palette === 'string' ? i.palette : undefined,
+      motif:   typeof i.motif === 'string' ? i.motif : undefined,
+      moment:  typeof i.moment === 'string' ? i.moment : undefined,
+    }));
+
+    // Pass 1 — deterministic cleanup. Writes back onto the idea objects so the
+    // repair call and the final compose both see the cleaned text.
+    for (const idea of ideas) {
+      const { prompt, fixes } = sanitizeCoverPrompt(String(idea.prompt ?? ''));
+      idea.prompt = prompt;
+      if (fixes.length) {
+        this.logger.warn(`cover prompt «${idea.idea ?? '?'}» (${slug}): ${fixes.join('; ')}`);
+      }
+    }
+
+    // Pass 2 — what cleanup must not guess at, per concept and across the batch.
+    const problemsFor = (list: any[]): string[][] => {
+      const f = fields(list);
+      const own = f.map((x) => coverPromptProblems(x));
+      const shared = batchDiversityProblems(f);
+      return own.map((p, i) => [...p, ...shared[i]]);
+    };
+
+    let problems = problemsFor(ideas);
+    const failing = ideas.filter((_, i) => problems[i].length > 0);
+
+    if (failing.length) {
+      this.logger.warn(
+        `cover gate (${slug}): ${failing.length} of ${ideas.length} concepts need rework — `
+        + ideas
+            .map((idea, i) => (problems[i].length ? `«${idea.idea ?? '?'}»: ${problems[i].length}` : ''))
+            .filter(Boolean)
+            .join(', '),
+      );
+      const repaired = await this.repairCoverPrompts(ideas, problems, slug);
+      if (repaired) {
+        for (const [i, fix] of repaired) {
+          if (typeof fix.prompt === 'string' && fix.prompt.trim()) {
+            ideas[i].prompt = sanitizeCoverPrompt(fix.prompt).prompt;
+          }
+          if (typeof fix.light === 'string' && fix.light.trim())     ideas[i].light   = fix.light;
+          if (typeof fix.palette === 'string' && fix.palette.trim()) ideas[i].palette = fix.palette;
+          if (typeof fix.motif === 'string' && fix.motif.trim())     ideas[i].motif   = fix.motif;
+          if (typeof fix.moment === 'string' && fix.moment.trim())   ideas[i].moment  = fix.moment;
+        }
+        problems = problemsFor(ideas);
+      }
+    }
+
+    // Compose the survivors, drop the rest loudly.
+    const out: any[] = [];
+    ideas.forEach((idea, i) => {
+      if (problems[i].length) {
+        this.logger.error(
+          `cover DROPPED «${idea.idea ?? '?'}» (${slug}): ${problems[i].join(' | ')}`,
+        );
+        return;
+      }
+      idea.prompt = composeCoverPrompt({
+        prompt:  idea.prompt,
+        light:   typeof idea.light === 'string' ? idea.light : undefined,
+        palette: typeof idea.palette === 'string' ? idea.palette : undefined,
+      });
+      out.push(idea);
+    });
+
+    if (out.length < ideas.length) {
+      this.logger.warn(`cover gate (${slug}): ${out.length} of ${ideas.length} concepts survived`);
+    }
+    return out;
+  }
+
+  /**
+   * One repair call. Sends ONLY the failing concepts and their violations — no
+   * screenplay, because the fix is wording, not content, and re-sending the
+   * script would double the cost of the whole feature.
+   *
+   * @returns [index, patch] pairs, or null if the model gave nothing usable
+   *          (in which case the caller drops the failures, which is the honest
+   *          outcome rather than rendering them anyway).
+   */
+  private async repairCoverPrompts(
+    ideas: any[],
+    problems: string[][],
+    slug: string,
+  ): Promise<Array<[number, any]> | null> {
+    const broken = ideas
+      .map((idea, i) => ({ i, idea, problems: problems[i] }))
+      .filter((x) => x.problems.length > 0);
+    if (!broken.length) return null;
+
+    const instructions = [
+      `You are fixing YouTube cover art prompts that failed an automated check.`,
+      `Keep each concept's IDEA exactly as it is — same people, same objects, same moment.`,
+      `Change only the wording that the listed violations point at.`,
+      ``,
+      `Rules the check enforces:`,
+      `- write the finished frame as flowing prose, never labels like "Split frame:", "Foreground:",`,
+      `  "Background:", never "we see", never "left half";`,
+      `- never a profile code (VIK_OLD, LIDA_MID …) in the prose — say "the older man", "the boy";`,
+      `- name at least TWO saturated hues that fight each other; never "grey", "muted", "washed out",`,
+      `  "faded", "dull", "desaturated" — those drain the render;`,
+      `- name a light source AND its direction;`,
+      `- no negations and no absences — only what IS in the frame;`,
+      `- quantities the eye grasps without counting ("a thick fan of notes"), never "thirty folders",`,
+      `  never written digits;`,
+      `- nothing that carries text: no signs, labels, printed forms, calendars, plates;`,
+      `- 35-95 words.`,
+      ``,
+      `Fix these:`,
+      ...broken.flatMap((x) => [
+        ``,
+        `#${x.i} «${x.idea.idea ?? '?'}»`,
+        `prompt: ${x.idea.prompt}`,
+        `light: ${x.idea.light ?? '(missing)'}`,
+        `palette: ${x.idea.palette ?? '(missing)'}`,
+        `motif: ${x.idea.motif ?? '(missing)'}`,
+        `moment: ${x.idea.moment ?? '(missing)'}`,
+        `violations:`,
+        ...x.problems.map((p) => `  - ${p}`),
+      ]),
+      ``,
+      `Return JSON: {"fixes": [{"index": <the # above>, "prompt": "...", "light": "...", "palette": "...",`,
+      `"motif": "...", "moment": "..."}]}. Every concept listed above must appear exactly once. No preamble.`,
+    ].join('\n');
+
+    const content = await this.askModel(instructions);
+    if (!content) {
+      this.logger.error(`cover repair (${slug}): модель вернула пустой ответ, дефектные концепты будут отброшены`);
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(content) as { fixes?: any[] };
+      const out: Array<[number, any]> = [];
+      for (const fix of parsed.fixes ?? []) {
+        const i = Number(fix?.index);
+        if (!Number.isInteger(i) || i < 0 || i >= ideas.length) continue;
+        out.push([i, fix]);
+      }
+      this.logger.log(`cover repair (${slug}): доработано ${out.length} из ${broken.length}`);
+      return out.length ? out : null;
+    } catch (e) {
+      this.logger.error(`cover repair (${slug}): ответ не разобран как JSON — ${String(e).slice(0, 200)}`);
+      return null;
     }
   }
 
@@ -635,8 +1073,9 @@ export class ThumbnailRenderService {
           referenceLatents: idea.referenceLatents ?? null,
           captionSpec:      (idea.captionSpec ?? null) as any,
           batchSize:      Math.min(8, Math.max(1, idea.batchSize ?? DEFAULT_BATCH)),
+          quality:        normalizeThumbQuality(idea.quality),
           status:         'pending',
-        },
+        } as any,
       });
       await this.ledger.enqueue('thumbnail', job.id);
       created.push(job);
@@ -688,7 +1127,7 @@ export class ThumbnailRenderService {
    * The row is re-queued rather than duplicated, so the ledger records this as
    * another attempt on the same unit of work.
    */
-  async addMore(jobId: string, count = DEFAULT_BATCH): Promise<any> {
+  async addMore(jobId: string, count = DEFAULT_BATCH, quality?: string): Promise<any> {
     const job = await this.jobs.findUnique({ where: { id: jobId } });
     if (!job) throw new NotFoundException(`Thumbnail job ${jobId} not found`);
     if (ACTIVE_JOB_STATUSES.includes(job.status)) {
@@ -700,6 +1139,11 @@ export class ThumbnailRenderService {
       data: {
         status:        'pending',
         batchSize:     Math.min(8, Math.max(1, count)),
+        // A top-up keeps the concept's tier unless the operator explicitly asks
+        // for another one — the common case is "same look, more frames", and
+        // silently re-rolling at a different tier would make the pool
+        // incomparable with itself.
+        ...(quality !== undefined ? { quality: normalizeThumbQuality(quality) } : {}),
         comfyPromptId: null,
         errorMessage:  null,
         startedAt:     null,
@@ -848,9 +1292,21 @@ export class ThumbnailRenderService {
     const instruction = composeQwenInstruction({
       participants,
       scenePrompt:    job.prompt,
-      styleDirective: carryAnchorStyle ? KEEP_REFERENCE_STYLE : REALCOMIC_T2I_STYLE,
+      // REALCOMIC_COVER_STYLE, not the scenes' REALCOMIC_T2I_STYLE: the style
+      // directive is composed LAST, and the t2i one ends on "muted cinematic
+      // color palette" — a closing order to drain the colour out of the one
+      // frame in the system that has to win a fight in a grid of bright
+      // thumbnails. See the constant's comment for the measurement.
+      styleDirective: carryAnchorStyle ? KEEP_REFERENCE_STYLE : REALCOMIC_COVER_STYLE,
       withReferences: anchors.length > 0,
+      sceneBudget:    THUMB_SCENE_BUDGET,
     });
+
+    const tier = THUMB_TIERS[normalizeThumbQuality((job as any).quality)];
+    this.logger.log(
+      `thumbnail ${job.id}: tier=${normalizeThumbQuality((job as any).quality)} `
+      + `steps=${tier.steps} cfg=${tier.cfg} lightning=${tier.lightning} batch=${job.batchSize ?? 2}`,
+    );
 
     const wf = new QwenSceneGraphBuilder().build(
       JSON.parse(readFileSync(workflowPath, 'utf-8')),
@@ -861,8 +1317,8 @@ export class ThumbnailRenderService {
         height:    THUMB_HEIGHT,
         batchSize: job.batchSize ?? 2,
         seed:      Math.floor(Math.random() * 2 ** 31),
-        steps:     THUMB_STEPS,
-        cfg:       THUMB_CFG,
+        steps:     tier.steps,
+        cfg:       tier.cfg,
         scheduler: 'sgm_uniform',
         // The round number is in the prefix so a top-up cannot collide with the
         // frames already in the pool if ComfyUI's output dir was cleaned and its
@@ -877,12 +1333,17 @@ export class ThumbnailRenderService {
         // Forced ON when the anchor is also the style carrier — that is the
         // channel the linework and palette travel through.
         referenceLatents: carryAnchorStyle ? true : (job.referenceLatents ?? true),
-        lightning:        false,
+        lightning:        tier.lightning,
         // Omitted entirely when the anchor carries the style: any LoRA here
         // would overrule the very look we are copying.
+        // Fallback strength 0.5, not 1.0: the scenes' A/B (2026-07-27) put full
+        // strength at "flat, washed-out engraving, face more caricatured", and
+        // 0.5 kept the ink line while leaving the light and depth alive. A cover
+        // is judged on exactly that. Projects that tuned settings.styleLora
+        // still win — this only replaces the blind default.
         styleLora: carryAnchorStyle ? undefined : {
           name:          projectLora?.name ?? 'style\\RealComic_2509_base.safetensors',
-          strengthModel: projectLora?.strengthModel ?? 1.0,
+          strengthModel: projectLora?.strengthModel ?? 0.5,
         },
       } as any,
     ) as Record<string, any>;

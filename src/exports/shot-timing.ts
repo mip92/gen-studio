@@ -67,5 +67,24 @@ export function narrationUsFromTts(
   if (!t) return null;
   return t.durationMs != null && t.durationMs > 0
     ? t.durationMs * 1000
-    : Math.max(800_000, Math.round((t.text.length / 15) * 1_000_000));
+    : narrationUsFromText(t.text);
+}
+
+/**
+ * Rough playback length of a line that has not been spoken yet, from its text.
+ *
+ * This is the estimate the project already ran on, lifted out of
+ * `ShotsService.setAnimatedPrefix` so it stops being a private inline rule:
+ * ~15 characters per second, floored at {@link MIN_SHOT_US}. Same rate the
+ * approved-take fallback above uses for legacy rows without a probed
+ * `durationMs` — applied one step earlier, to narration with no take at all.
+ *
+ * It exists so a length that depends on VO can be computed BEFORE the VO is
+ * rendered, instead of collapsing to a flat default that badly understates a
+ * long line. Anything derived from it should be recomputed once takes land.
+ */
+export function narrationUsFromText(text: string | null | undefined): number | null {
+  const t = (text ?? '').trim();
+  if (!t) return null;
+  return Math.max(MIN_SHOT_US, Math.round((t.length / 15) * 1_000_000));
 }

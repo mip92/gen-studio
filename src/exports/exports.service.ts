@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
+import { ComicPlanService } from '../comic/comic-plan.service';
 import { shotHoldUs } from './shot-timing';
 import { SPARE_TRACK_COUNT } from '../bgm/bgm.types';
 
@@ -37,6 +38,10 @@ const COMIC_MANIFEST_PYTHON = process.env.COMIC_PYTHON ?? SHORTS_PYTHON;
 // final draft: flat video + LIVE narration, music and subtitles, so all the hand
 // work happens once. Separate scripts throughout — the single-draft comic export
 // above is untouched.
+// TEMPORARY (user 2026-08-01): one-spread test render — iterate on the desk /
+// props / paper styling without a full draft build. Delete with the script.
+const COMIC_TEST_SPREAD_SCRIPT  = path.join(APP_ROOT, 'scripts', 'comic_test_spread.py');
+
 const COMIC_CHUNKS_SCRIPT       = path.join(APP_ROOT, 'scripts', 'comic_chunks.py');
 const COMIC_CHUNKS_BUILD_SCRIPT = path.join(APP_ROOT, 'scripts', 'comic_chunks_build.py');
 const COMIC_ASSEMBLE_SCRIPT     = path.join(APP_ROOT, 'scripts', 'comic_assemble.py');
@@ -220,7 +225,10 @@ export class ExportsService {
   /** Slugs with a comic draft render currently in flight (async build guard). */
   private readonly buildingComic = new Set<string>();
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly comicPlan: ComicPlanService,
+  ) {}
 
   /** Find a project by slug or id (mirrors ProjectsService pattern). */
   private async findProject(idOrSlug: string) {
@@ -340,7 +348,7 @@ export class ExportsService {
         `Project ${project.slug} is not ready to export: `
         + `${readiness.missingShots.length} shot(s) not render-ready `
         + `(animated need a chosen video + FHD upscale + FPS interpolation; static need a chosen render), `
-        + `${readiness.missingScenes.length} empty scene(s), `
+        + `${readiness.missingScenes.length} empty act(s), `
         + `${readiness.missingMusic.length} act(s) without approved music.`,
       );
     }
@@ -440,8 +448,8 @@ export class ExportsService {
     let timelineCursorUs = 0;
 
     for (const scene of scenes) {
-      // Shots within a scene sort by shotCode — they're like "S01_SH01",
-      // "S01_SH02" so a plain lexical sort matches the storyboard order.
+      // Shots within an act sort by shotCode — they're like "A1_SH01",
+      // "A1_SH02" so a plain lexical sort matches the storyboard order.
       const shots = [...scene.shots].sort((a, b) => a.shotCode.localeCompare(b.shotCode));
 
       const shotEntries: ManifestShot[] = [];
@@ -651,17 +659,17 @@ export class ExportsService {
         placed++;
       }
     }
-    // ── Anchor music to the first scene ─────────────────────────────────
+    // ── Anchor music to the first shot on the timeline ──────────────────
     // Shift the earliest scored act to timeline 0 when the film opens on an
-    // un-scored cold-open, so music starts with the first scene. Only that one
-    // act moves (all its tiles share block_start_us); later acts stay put.
+    // un-scored cold-open, so music starts with the very first shot. Only that
+    // one act moves (all its tiles share block_start_us); later acts stay put.
     if (musicTracks.length > 0) {
       const earliest = Math.min(...musicTracks.map((mt) => mt.block_start_us));
       if (earliest > 0) {
         for (const mt of musicTracks) {
           if (mt.block_start_us === earliest) mt.block_start_us = 0;
         }
-        this.logger.log(`anchoring earliest BGM act from ${earliest}us → 0 so music starts at the first scene`);
+        this.logger.log(`anchoring earliest BGM act from ${earliest}us → 0 so music starts at the first shot`);
       }
     }
     this.logger.log(`built ${musicTracks.length} music_tracks across ${blocks.length} block(s)`);
@@ -954,6 +962,10 @@ export class ExportsService {
       throw new BadRequestException(
         `Комикс для «${project.slug}» уже собирается — дождитесь завершения (не запускайте повторно).`);
     }
+    // Template-layout plan gate: a broken plan dies HERE as a 400 with the full
+    // issue list, not inside the detached python build. Legacy projects (no
+    // plan) pass through with zero checks.
+    await this.comicPlan.assertReady(project.id);
 
     const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
     mkdirSync(outDir, { recursive: true });
@@ -1012,6 +1024,73 @@ export class ExportsService {
     return { draft_name: draftName, spreads, status: 'building' };
   }
 
+  /**
+   * TEMPORARY (user 2026-08-01): render ONE spread of the comic as a PNG — the
+   * fully baked look (stills + frames + desk props + page stacks) — so the desk
+   * styling can be iterated in seconds. Synchronous: a fresh 1-spread manifest
+   * (fast) + one sheet render at supersample 2 (tens of seconds at worst).
+   * Returns the PNG's absolute path; the UI fetches it via GET
+   * comic/test-spread/png. Delete together with comic_test_spread.py.
+   */
+  async comicTestSpread(idOrSlug: string): Promise<{ png: string; spread: number }> {
+    const project = await this.findProject(idOrSlug);
+    for (const s of [COMIC_MANIFEST_SCRIPT, COMIC_TEST_SPREAD_SCRIPT]) {
+      if (!existsSync(s)) throw new BadRequestException(`script missing: ${s}`);
+    }
+    if (!existsSync(PYTHON_BIN)) {
+      throw new BadRequestException(`python bin missing: ${PYTHON_BIN} (set EXPORT_PYTHON env)`);
+    }
+
+    const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
+    mkdirSync(outDir, { recursive: true });
+    // own manifest file — comic_manifest.json belongs to the real exports and
+    // the chunk status endpoint reads it, so the 1-spread test must not clobber it
+    const manifestPath = path.join(outDir, 'comic_test_manifest.json');
+
+    this.logger.log(`Comic test spread: building 1-spread manifest for ${project.slug}`);
+    const m = await runPython(COMIC_MANIFEST_PYTHON, [
+      '-X', 'utf8', COMIC_MANIFEST_SCRIPT, '--slug', project.slug,
+      '--pack', '--max-spreads', '1', '--out', manifestPath,
+    ]);
+    if (m.code !== 0) {
+      throw new BadRequestException(`comic_manifest.py exited ${m.code}: ${m.stderr.trim().slice(-800)}`);
+    }
+
+    const png = path.join(outDir, 'comic_test_spread.png');
+    this.logger.log(`Comic test spread: rendering for ${project.slug}`);
+    const r = await runPython(PYTHON_BIN, [
+      '-X', 'utf8', COMIC_TEST_SPREAD_SCRIPT,
+      '--manifest', manifestPath, '--out', png, '--supersample', '2',
+    ]);
+    if (r.code !== 0) {
+      throw new BadRequestException(`comic_test_spread.py exited ${r.code}: ${r.stderr.trim().slice(-800)}`);
+    }
+    if (!existsSync(png)) {
+      throw new BadRequestException('comic_test_spread.py wrote no PNG');
+    }
+    return { png, spread: 0 };
+  }
+
+  /** Absolute path of the last test-spread PNG, or null. (TEMPORARY, see above.) */
+  async comicTestSpreadPng(idOrSlug: string): Promise<string | null> {
+    const project = await this.findProject(idOrSlug);
+    const png = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic', 'comic_test_spread.png');
+    return existsSync(png) ? png : null;
+  }
+
+  /** Desk-prop sprite (scripts/desk_props/<item>.png) for the settings-page
+   *  previews. Item keys are validated against the on-disk registry — the same
+   *  files comic_desk_props.py composites, so what the picker shows is exactly
+   *  what lands on the desk. */
+  deskPropSprite(item: string): string {
+    if (!/^[a-z_]{1,32}$/.test(item)) {
+      throw new BadRequestException(`bad item key: ${item}`);
+    }
+    const p = path.join(APP_ROOT, 'scripts', 'desk_props', `${item}.png`);
+    if (!existsSync(p)) throw new NotFoundException(`no sprite for "${item}"`);
+    return p;
+  }
+
   // ── Chunked comic export ───────────────────────────────────────────────────
 
   /**
@@ -1036,6 +1115,8 @@ export class ExportsService {
       throw new BadRequestException(
         `Комикс для «${project.slug}» уже собирается — дождитесь завершения.`);
     }
+    // Same template-plan gate as the single-draft export (no-op for legacy).
+    await this.comicPlan.assertReady(project.id);
 
     const outDir = path.join(APP_ROOT, 'data', project.slug, 'exports', 'comic');
     mkdirSync(outDir, { recursive: true });

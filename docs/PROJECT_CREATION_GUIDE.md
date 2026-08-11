@@ -372,7 +372,7 @@ COMMIT;
 | Метод | URL | Что делает |
 |---|---|---|
 | GET | `/projects/:idOrSlug/script` | читает Project.scriptText |
-| GET | `/projects/:idOrSlug/scenes` | список сцен + шотов + участников |
+| GET | `/projects/:idOrSlug/scenes` | список актов + кадров + участников |
 | PATCH | `/profiles/:profileId` | правит promptBase / promptAngles / promptVariety / negative / ageLabel / targetImages / triggerToken |
 | GET | `/profiles/:profileId/loras` | список обученных LoRA для профиля |
 | POST | `/profiles/:profileId/loras/active` | назначить активную LoRA |
@@ -380,7 +380,7 @@ COMMIT;
 | PATCH | `/shots/:shotId` | правит shot (promptFields, ...) |
 | PATCH | `/tts/shots/:shotId/narration` | правит narrationText шота |
 | POST | `/tts/shots/:shotId` | сгенерить TTS для шота |
-| POST | `/shots/:shotId/renders` | поставить scene render |
+| POST | `/shots/:shotId/renders` | зарегистрировать готовый файл-кандидат кадра (НЕ ставит рендер; рендер — POST /generation/shots/:shotId/enqueue) |
 
 ### НЕТ PATCH endpoint для:
 - `Project.scriptText` → direct SQL exception

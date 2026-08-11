@@ -19,6 +19,7 @@ import type { Response } from 'express';
 import { existsSync } from 'fs';
 import * as path from 'path';
 import { VoiceoversService } from './voiceovers.service';
+import { ARTIFACT_PROFILES } from '../tts/artifact-profiles';
 
 const MIME_BY_EXT: Record<string, string> = {
   '.wav':  'audio/wav',
@@ -43,6 +44,17 @@ export class VoiceoversController {
   @ApiOperation({ summary: 'List the shared voiceover library (закадровая озвучка)' })
   list() {
     return this.svc.list();
+  }
+
+  // Declared BEFORE @Get(':id') so "artifact-profiles" is not swallowed as an id.
+  @Get('artifact-profiles')
+  @ApiOperation({
+    summary: 'The leading-bleed («понь» / «ща») profiles a voice can be assigned',
+    description: 'Options for Voiceover.artifactProfile. Empty is always allowed and means '
+              + 'the voice does not bleed, so trimming is refused for it.',
+  })
+  artifactProfiles() {
+    return ARTIFACT_PROFILES.map((p) => ({ key: p.key, label: p.label, hint: p.hint }));
   }
 
   @Post()
@@ -125,8 +137,15 @@ export class VoiceoversController {
   }
 
   @Patch(':id')
-  @ApiOperation({ summary: 'Edit a voiceover (label, source link, and/or slug → moves its folder)' })
-  rename(@Param('id') id: string, @Body() body: { name?: string; slug?: string; sourceUrl?: string | null }) {
+  @ApiOperation({
+    summary: 'Edit a voiceover (label, source link, bleed profile, and/or slug → moves its folder)',
+    description: 'artifactProfile opts this voice into leading-bleed trimming: "pon" | "sha", '
+              + 'or null/"" for a voice that does not bleed (the default — trimming stays off).',
+  })
+  rename(
+    @Param('id') id: string,
+    @Body() body: { name?: string; slug?: string; sourceUrl?: string | null; artifactProfile?: string | null },
+  ) {
     return this.svc.rename(id, body ?? {});
   }
 

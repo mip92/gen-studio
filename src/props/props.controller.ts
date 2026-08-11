@@ -64,7 +64,7 @@ export class PropsController {
   @ApiOperation({ summary: 'List props (object anchors) for a project' })
   async listForProject(@Param('projectId') projectId: string) {
     return this.prisma.$queryRaw<Array<any>>`
-      SELECT id, "projectId", code, name, description, "anchorPath", "createdAt", "updatedAt"
+      SELECT id, "projectId", code, name, description, "anchorPath", "anchorApprovedAt", "createdAt", "updatedAt"
       FROM props WHERE "projectId" = ${projectId} ORDER BY code ASC
     `;
   }
@@ -75,7 +75,7 @@ export class PropsController {
     const rows = await this.prisma.$queryRaw<Array<any>>`
       INSERT INTO props (id, "projectId", code, name, description, "anchorPath", "createdAt", "updatedAt")
       VALUES (gen_random_uuid()::text, ${projectId}, ${dto.code}, ${dto.name}, ${dto.description}, ${dto.anchorPath ?? null}, now(), now())
-      RETURNING id, "projectId", code, name, description, "anchorPath", "createdAt", "updatedAt"
+      RETURNING id, "projectId", code, name, description, "anchorPath", "anchorApprovedAt", "createdAt", "updatedAt"
     `;
     return rows[0];
   }
@@ -84,7 +84,7 @@ export class PropsController {
   @ApiOperation({ summary: 'Get a prop by id' })
   async getOne(@Param('id') id: string) {
     const rows = await this.prisma.$queryRaw<Array<any>>`
-      SELECT id, "projectId", code, name, description, "anchorPath", "createdAt", "updatedAt"
+      SELECT id, "projectId", code, name, description, "anchorPath", "anchorApprovedAt", "createdAt", "updatedAt"
       FROM props WHERE id = ${id}
     `;
     if (rows.length === 0) throw new NotFoundException(`Prop ${id} not found`);
@@ -104,7 +104,7 @@ export class PropsController {
     if (sets.length === 0) return this.getOne(id);
     sets.push(`"updatedAt" = now()`);
     values.push(id);
-    const sql = `UPDATE props SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, "projectId", code, name, description, "anchorPath", "createdAt", "updatedAt"`;
+    const sql = `UPDATE props SET ${sets.join(', ')} WHERE id = $${i} RETURNING id, "projectId", code, name, description, "anchorPath", "anchorApprovedAt", "createdAt", "updatedAt"`;
     const rows = await this.prisma.$queryRawUnsafe<Array<any>>(sql, ...values);
     if (rows.length === 0) throw new NotFoundException(`Prop ${id} not found`);
     return rows[0];
@@ -166,9 +166,9 @@ export class PropsController {
     // Stored RELATIVE to APP_ROOT so the row survives a move of the install dir.
     const relPath = ['data', shot.projectSlug, 'reference', destName].join('/');
     const rows = await this.prisma.$queryRaw<Array<any>>`
-      UPDATE props SET "anchorPath" = ${relPath}, "updatedAt" = now()
+      UPDATE props SET "anchorPath" = ${relPath}, "anchorApprovedAt" = now(), "updatedAt" = now()
       WHERE id = ${id}
-      RETURNING id, "projectId", code, name, description, "anchorPath", "updatedAt"
+      RETURNING id, "projectId", code, name, description, "anchorPath", "anchorApprovedAt", "updatedAt"
     `;
     return rows[0];
   }
@@ -254,6 +254,18 @@ export class PropsController {
     return this.propAnchor.selectCandidate(id, body?.filename);
   }
 
+  @Post('props/:id/anchor/approve')
+  @ApiOperation({
+    summary: 'Approve the installed object anchor',
+    description:
+      'A completed render installs its FIRST candidate automatically, so an installed anchor is '
+      + 'not evidence anyone reviewed it. This is that review. Until it is called the prop shows '
+      + 'up on /actions as approve_prop_anchor, and any shot pointing at this prop refuses to render.',
+  })
+  approveAnchor(@Param('id') id: string) {
+    return this.propAnchor.approveAnchor(id);
+  }
+
   @Get('props/:id/anchor-jobs')
   @ApiOperation({ summary: 'List object-anchor render jobs for this prop (newest first, 50 max)' })
   listAnchorJobs(@Param('id') id: string) {
@@ -264,7 +276,7 @@ export class PropsController {
   @ApiOperation({ summary: "Clear a prop's anchor image (the object falls back to text-only)" })
   async clearAnchor(@Param('id') id: string) {
     const rows = await this.prisma.$queryRaw<Array<any>>`
-      UPDATE props SET "anchorPath" = NULL, "updatedAt" = now()
+      UPDATE props SET "anchorPath" = NULL, "anchorApprovedAt" = NULL, "updatedAt" = now()
       WHERE id = ${id}
       RETURNING id, code, "anchorPath"
     `;

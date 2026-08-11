@@ -40,7 +40,8 @@ from export_capcut import (
     _log, _cover_scale, _audio_duration_us, _wav_duration_us,
     rewrite_for_capcut_international, register_in_capcut,
 )
-from comic_pagebuild import render_page
+from comic_pagebuild import render_page, render_panel_frame
+from comic_page_style import render_desk_underlay
 
 KP = draft.KeyframeProperty
 
@@ -62,6 +63,11 @@ PANEL_INSET     = 0.0      # gap between the inked frame and the content (0 = ti
 # (first frame at the head, last frame at the tail).
 SPEED_FLOOR     = 0.5
 TURN_US         = 700_000  # pseudo-3D page-turn duration at each spread boundary
+# Per-panel frame-overlay raster cap, px per side. Surplus raster never reaches
+# the screen and only gets mushed by CapCut's own minification (A/B 2026-07-26);
+# 4096 also stays inside common GPU-texture comfort. A panel's own hold zoom
+# (contain-fit ≤ ~0.93 of the frame) always fits under this cap.
+FRAME_PNG_CAP   = 4096.0
 
 # ── organic camera (user 2026-07-22: «не линейно, покачивания, не по прямой») ──
 HOLD_KF_PER_SEC = 2        # sample holds so the parked camera gently breathes/sways
@@ -91,6 +97,20 @@ def _sway(t_us: int) -> Tuple[float, float, float]:
     return sx, sy, sz
 
 
+# ── desk underlay (camera-overrun protection) ─────────────────────────────────
+# The sheet PNG is exactly canvas-sized in camera space, but the camera routinely
+# looks PAST it: the mid-travel ZOOM_DIP (×0.72), the 3.5° roll, and any hold on
+# an EDGE panel (view half-width 1/(2z) beyond its cx) all push the frame off the
+# sheet, where CapCut shows black (user 2026-08-06: «стол очень короткий, по бокам
+# чёрные края»). Fix: a desk-only layer UNDER the sheet, k× the sheet in each
+# dimension, cut from the SAME wood as the sheet's own desk (see
+# render_desk_underlay) and placed at scale z·k. Coverage math for k = 2.0: the
+# worst case is a travel between two edge panels (cx 0.85, z 1.5) — view edge
+# 0.85 + 1/(2·1.5·0.72) ≈ 1.31 page-units plus the roll's ~0.06 → 1.38, and the
+# underlay reaches 1.5. Overridable per manifest via `bg_overscan` (0 disables).
+BG_OVERSCAN = 0.5
+
+
 # ── camera composition ────────────────────────────────────────────────────────
 # The sheet is rendered at canvas aspect: at scale 1, transform 0 the WHOLE sheet
 # fills the frame. Screen position (half-canvas units) of a sheet point (px,py)
@@ -100,16 +120,39 @@ def _placer_bg(cx: float, cy: float, z: float) -> Tuple[float, float, float]:
     return (z, z * (1.0 - 2.0 * cx), z * (2.0 * cy - 1.0))
 
 
-def _make_panel_placer(rect: dict) -> Callable[[float, float, float], Tuple[float, float, float]]:
+def _make_placer_desk(k: float) -> Callable[[float, float, float], Tuple[float, float, float]]:
+    """Transform for the oversized desk underlay: same page-space mapping as the
+    sheet (their centres coincide), only the material spans k page-widths, so it
+    needs scale z·k to show the sheet region at exactly sheet size."""
+    def f(cx: float, cy: float, z: float) -> Tuple[float, float, float]:
+        return (z * k, z * (1.0 - 2.0 * cx), z * (2.0 * cy - 1.0))
+    return f
+
+
+def _make_panel_placer(rect: dict, content_aspect: float | None = None
+                       ) -> Callable[[float, float, float], Tuple[float, float, float]]:
     """Transform for a panel layer occupying page-rect `rect`, composed with the
     camera. Uses CONTAIN scale (uniform_scale 1.0 = fit-to-canvas), so the material
-    is fit INSIDE the rect — never overflowing the frame, never cropped. For a 16:9
-    rect (square in normalized coords) + 16:9 content this fills the frame exactly."""
+    is fit INSIDE the rect — never overflowing the frame, never cropped.
+
+    `content_aspect` — pixel aspect (w/h) of the material. At uniform_scale=1
+    CapCut fits the material INSIDE the 16:9 canvas, so its normalized footprint
+    is (1, (16/9)/A) for A≥16/9 and (A/(16/9), 1) otherwise. The scale that fills
+    the rect is min(rw/cw, rh/ch). For 16:9 content (cw=ch=1 — every legacy
+    manifest, which omits the key) this reduces to the historical min(rw, rh).
+    Template-mode panels carry their shape's aspect so a 2.35:1 strip or a 1:1
+    square fills its rect exactly instead of underfilling it."""
     rw = rect["w"] - 2 * PANEL_INSET
     rh = rect["h"] - 2 * PANEL_INSET
     pcx = rect["x"] + rect["w"] / 2.0
     pcy = rect["y"] + rect["h"] / 2.0
-    fit = min(rw, rh)
+    canvas = 16.0 / 9.0
+    a = float(content_aspect or canvas)
+    if a >= canvas:
+        cw, ch = 1.0, canvas / a
+    else:
+        cw, ch = a / canvas, 1.0
+    fit = min(rw / cw, rh / ch)
 
     def f(cx: float, cy: float, z: float) -> Tuple[float, float, float]:
         return (z * fit, 2.0 * z * (pcx - cx), 2.0 * z * (cy - pcy))
@@ -364,7 +407,8 @@ def _outgoing_panels(page: dict, frames_dir: Path) -> List[dict]:
 
 def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
                     width, height, ss, style, texture, frames_dir: Path,
-                    tail_page=None, page_total: int = 0) -> int:
+                    tail_page=None, page_total: int = 0, desk_props=None,
+                    desk_color=None) -> int:
     """At each spread boundary, overlay a wide book (opaque) + a leaf that flips
     across the spine. The leaf carries baked panel content (stills). The spine is
     the canvas centre, and scale_x scales about the centre, so animating scale_x
@@ -415,7 +459,8 @@ def _add_page_turns(script, pages, spread_bounds, pages_dir, *,
     def _bake_bg(panels_subset, seed, out: Path, prog=None) -> str:  # opaque full book (static)
         render_page(width=width, height=height, panels=panels_subset, style_name=style,
                     texture_path=texture, supersample=tss, seed=seed,
-                    bake_content=True, draw_frames=True, progress=prog).save(out)
+                    bake_content=True, draw_frames=True, progress=prog,
+                    desk_props=desk_props, desk_color=desk_color).save(out)
         return str(out).replace("\\", "/")
 
     def _bake_leaf(all_panels, seed, out: Path, right: bool) -> str:  # ONE page only
@@ -509,6 +554,11 @@ def build_comic_draft(manifest: dict) -> Path:
     # the highest global pageIndex present.
     page_total = int(manifest.get("page_total") or 0) \
         or (max((int(p.get("pageIndex", 0)) for p in pages), default=0) + 1)
+    # objects on the desk around the book (comic_desk_props) — same list for
+    # every spread; chunk manifests inherit it from the full one. Ditto the
+    # per-project desk colour.
+    desk_props = manifest.get("desk_props") or None
+    desk_color = manifest.get("desk_color") or None
 
     drafts_root = Path(manifest.get("capcut_drafts_root") or manifest["output_root"])
     drafts_root.mkdir(parents=True, exist_ok=True)
@@ -517,8 +567,15 @@ def build_comic_draft(manifest: dict) -> Path:
     pages_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = pages_dir.parent / "frames"          # last-frame cache
 
+    # Desk underlay k-factor: material spans k page-widths (see BG_OVERSCAN above).
+    overscan = float(manifest.get("bg_overscan", BG_OVERSCAN))
+    K = 1.0 + 2.0 * overscan
+    placer_desk = _make_placer_desk(K)
+
     script = draft.ScriptFile(width=width, height=height, fps=fps, maintrack_adsorb=False)
-    script.add_track(draft.TrackType.video, "comic_page", relative_index=0)
+    # BOTTOM: the oversized desk the camera can never look past; the sheet above it.
+    script.add_track(draft.TrackType.video, "comic_desk", relative_index=0)
+    script.add_track(draft.TrackType.video, "comic_page", relative_index=1)
     max_slots = int(manifest.get("max_panel_slots")
                     or max((len(p.get("panels") or []) for p in pages), default=1))
     # BASE lanes (below): the panel's WHOLE-SPREAD poster — a static shot's still, or
@@ -527,14 +584,19 @@ def build_comic_draft(manifest: dict) -> Path:
     # the slowed video clip, covering only [0, video_end]; after the video ends the
     # slot is empty and the base poster shows through.
     for i in range(max_slots):
-        script.add_track(draft.TrackType.video, f"base_{i}", relative_index=i + 1)
+        script.add_track(draft.TrackType.video, f"base_{i}", relative_index=i + 2)
     for i in range(max_slots):
-        script.add_track(draft.TrackType.video, f"slot_{i}", relative_index=max_slots + 1 + i)
-    # TOP track: the marker frames ride ABOVE every panel (borders visible / lap on)
-    script.add_track(draft.TrackType.video, "comic_frames", relative_index=2 * max_slots + 1)
+        script.add_track(draft.TrackType.video, f"slot_{i}", relative_index=max_slots + 2 + i)
+    # TOP tracks: the marker frames ride ABOVE every panel (borders visible / lap
+    # on). One lane PER SLOT — each panel's border is its own small PNG (see the
+    # frames block below) and they all span the whole spread, so they overlap in
+    # time and cannot share a track.
+    for i in range(max_slots):
+        script.add_track(draft.TrackType.video, f"frames_{i}",
+                         relative_index=2 * max_slots + 2 + i)
     # ABOVE everything: the page-turn overlay (opaque wide book + the flipping leaf)
-    script.add_track(draft.TrackType.video, "comic_turn_bg",   relative_index=2 * max_slots + 2)
-    script.add_track(draft.TrackType.video, "comic_turn_leaf", relative_index=2 * max_slots + 3)
+    script.add_track(draft.TrackType.video, "comic_turn_bg",   relative_index=3 * max_slots + 2)
+    script.add_track(draft.TrackType.video, "comic_turn_leaf", relative_index=3 * max_slots + 3)
     script.add_track(draft.TrackType.audio, "narration")
 
     subtitle_cues: List[tuple] = []
@@ -543,6 +605,10 @@ def build_comic_draft(manifest: dict) -> Path:
     spread_bounds: List[int] = []
     total_pages = total_panels = total_clips = total_kf = total_tts = 0
     timeline_end_us = 0
+
+    def _slot(panel: dict) -> int:
+        """Panel's lane index, clamped into the allocated per-slot tracks."""
+        return min(int(panel.get("slot", 0)), max_slots - 1)
 
     def matdims(path: str) -> Tuple[int, int]:
         try:
@@ -563,13 +629,31 @@ def build_comic_draft(manifest: dict) -> Path:
         cam, grid = _build_camera(states, width, height)
 
         pidx = int(page.get("pageIndex", 0))
+        # 0) DESK UNDERLAY: one continuous wood k× the sheet; the sheet's own desk
+        #    below is the centre crop of this very image, so the layer boundary is
+        #    invisible and camera overruns land on desk instead of black.
+        underlay, sheet_desk = render_desk_underlay(
+            style, width=width, height=height, k=K, seed=pidx + 1,
+            desk_color=desk_color, sheet_supersample=ss)
+        if underlay is not None:
+            dpng = pages_dir / f'desk_{pidx:03d}.png'
+            underlay.save(dpng)
+            desk_seg = draft.VideoSegment(
+                draft.VideoMaterial(str(dpng).replace("\\", "/"),
+                                    material_name=f'desk_{page.get("pageKey")}'),
+                target_timerange=draft.Timerange(start=p_start, duration=p_dur))
+            total_kf += _bake_layer(desk_seg, cam, grid, placer_desk, 0, p_dur, 0)
+            script.add_segment(desk_seg, track_name="comic_desk")
+
         # 1) SHEET background (desk + book + EMPTY holes; NO borders — those go on
         #    the TOP overlay so they sit ABOVE the live video, not hidden under it)
         sheet = render_page(width=width, height=height, panels=panels,
                             style_name=style, texture_path=texture,
                             supersample=ss, seed=pidx + 1,
                             bake_content=False, draw_frames=False,
-                            progress=(pidx / (page_total - 1)) if page_total > 1 else 0.0)
+                            progress=(pidx / (page_total - 1)) if page_total > 1 else 0.0,
+                            desk_props=desk_props, desk_color=desk_color,
+                            desk_img=sheet_desk)
         png = pages_dir / f'spread_{pidx:03d}.png'
         sheet.save(png)
         bg_seg = draft.VideoSegment(
@@ -580,33 +664,49 @@ def build_comic_draft(manifest: dict) -> Path:
         page_segments.append(bg_seg)
         total_pages += 1
 
-        # 1b) FRAMES overlay (transparent PNG, only the marker borders) on the TOP
-        #     track, carrying the SAME camera path as the sheet → the borders ride
-        #     on top of every panel and lap slightly onto the footage.
-        fpng = pages_dir / f'frames_{pidx:03d}.png'
-        # Render the frames overlay at the SAME resolution as the paper sheet. The
-        # old rule (`min(8, ss + 2)`) assumed thin geometry wants extra pixels; a
-        # controlled A/B on this very overlay says the opposite — screen sharpness at
-        # max zoom fell monotonically as the raster grew (ss4 218.5 / ss6 192.5 /
-        # ss8 173.6, Laplacian variance of the 1920×1080 the camera actually sees).
-        # Past ~1920×max_zoom the surplus pixels cannot reach the frame; they only
-        # get averaged away by the downscale, which is what softened the ink lines
-        # the rule existed to protect (user 2026-07-26).
-        frame_ss = ss
-        render_page(width=width, height=height, panels=panels, style_name=style,
-                    texture_path=texture, supersample=frame_ss, seed=pidx + 1,
-                    frames_only=True).save(fpng)
-        fr_seg = draft.VideoSegment(
-            draft.VideoMaterial(str(fpng).replace("\\", "/"), material_name=f'frames_{page.get("pageKey")}'),
-            target_timerange=draft.Timerange(start=p_start, duration=p_dur))
-        total_kf += _bake_layer(fr_seg, cam, grid, _placer_bg, 0, p_dur, 0)
-        script.add_segment(fr_seg, track_name="comic_frames")
-        frame_segments.append(fr_seg)
+        # 1b) FRAMES overlays: each panel's marker border is its OWN small
+        #     transparent PNG on a per-slot TOP lane, carrying the SAME camera path
+        #     as the sheet → the borders ride on top of every panel and lap
+        #     slightly onto the footage. Decoupling the border raster from the
+        #     sheet is what keeps it crisp: the single full-sheet overlay needed
+        #     1920×max_zoom of width to be 1:1 at the hold, and past ~ss4 CapCut's
+        #     own minification softened the ink monotonically (A/B 2026-07-26:
+        #     ss4 218.5 / ss6 192.5 / ss8 173.6 Laplacian) — template pages zoom
+        #     to 7×, so that ceiling showed as «мыльные рамки» (user 2026-08-07).
+        #     A lone border at (page max zoom)× canvas raster is displayed ≈1:1 at
+        #     the deepest hold and stays a tiny file (bars on transparency).
+        z_max = max((float(s.get("zoom") or 1.0) for s in states), default=1.0)
+        for pi, panel in enumerate(panels):
+            slot = _slot(panel)
+            r = panel["rect"]
+            fscale = z_max * 1.05                      # sway/breathing headroom
+            # cap the raster at FRAME_PNG_CAP px per side — bigger only feeds
+            # CapCut's minification mush; the panel's OWN hold zoom always fits.
+            fscale = min(fscale,
+                         FRAME_PNG_CAP / max(1.0, (r["w"] + 0.02) * width),
+                         FRAME_PNG_CAP / max(1.0, (r["h"] + 0.02) * height))
+            fscale = max(1.0, fscale)
+            fimg, frect = render_panel_frame(
+                width=width, height=height, panels=panels, index=pi,
+                style_name=style, seed=pidx + 1, scale=fscale)
+            if fimg is None:
+                continue
+            fpng = pages_dir / f'frame_{pidx:03d}_{pi:02d}.png'
+            fimg.save(fpng)
+            fr_seg = draft.VideoSegment(
+                draft.VideoMaterial(str(fpng).replace("\\", "/"),
+                                    material_name=f'frame_{page.get("pageKey")}_{panel.get("shotCode", pi)}'),
+                target_timerange=draft.Timerange(start=p_start, duration=p_dur))
+            total_kf += _bake_layer(fr_seg, cam, grid,
+                                    _make_panel_placer(frect, fimg.width / fimg.height),
+                                    0, p_dur, 0)
+            script.add_segment(fr_seg, track_name=f"frames_{slot}")
+            frame_segments.append(fr_seg)
 
         # 2) LIVE panel layers
         for panel in panels:
             total_panels += 1
-            slot = min(int(panel.get("slot", 0)), max_slots - 1)
+            slot = _slot(panel)
             lane = f"slot_{slot}"
             rect = panel["rect"]
             still = panel.get("still_path")
@@ -616,7 +716,7 @@ def build_comic_draft(manifest: dict) -> Path:
             depart  = int(panel.get("depart_us") or (arrival + hold))
             zoom_focus = float(panel.get("zoom") or 1.5)
 
-            placer_still = _make_panel_placer(rect)
+            placer_still = _make_panel_placer(rect, panel.get("content_aspect"))
 
             if media and media.get("path"):
                 vpath = str(media["path"]).replace("\\", "/")
@@ -720,7 +820,8 @@ def build_comic_draft(manifest: dict) -> Path:
         total_kf += _add_page_turns(
             script, pages, spread_bounds, pages_dir,
             width=width, height=height, ss=ss, style=style, texture=texture,
-            frames_dir=frames_dir, tail_page=tail_page, page_total=page_total)
+            frames_dir=frames_dir, tail_page=tail_page, page_total=page_total,
+            desk_props=desk_props, desk_color=desk_color)
         if tail_page:
             timeline_end_us += TURN_US
 

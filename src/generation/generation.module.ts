@@ -11,9 +11,10 @@ import { VideosController } from './videos/videos.controller';
 import { VideoRenderService } from './videos/video-render.service';
 import { TrainingModule } from '../training/training.module';
 import { ValidationModule } from '../validation/validation.module';
+import { ComicModule } from '../comic/comic.module';
 
 @Module({
-  imports: [TrainingModule, ValidationModule],
+  imports: [TrainingModule, ValidationModule, ComicModule],
   controllers: [
     GenerationController,
     ScenesController,

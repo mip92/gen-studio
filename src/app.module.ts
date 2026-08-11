@@ -22,6 +22,8 @@ import { PropsModule } from './props/props.module';
 import { YoutubeModule } from './youtube/youtube.module';
 import { ThumbnailsModule } from './thumbnails/thumbnails.module';
 import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
+import { ComicModule } from './comic/comic.module';
+import { ReleasesModule } from './releases/releases.module';
 
 @Module({
   imports: [
@@ -51,6 +53,8 @@ import { TelegramBotModule } from './telegram-bot/telegram-bot.module';
     YoutubeModule,
     ThumbnailsModule,
     TelegramBotModule,
+    ComicModule,
+    ReleasesModule,
   ],
 })
 export class AppModule {}

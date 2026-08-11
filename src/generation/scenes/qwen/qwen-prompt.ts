@@ -50,6 +50,28 @@ export const REALCOMIC_T2I_STYLE =
   'realcomic style, hand-drawn comic illustration with a realistic touch, ' +
   'clean confident linework, painterly shading, muted cinematic color palette';
 
+/**
+ * RealComic styling for a YouTube COVER.
+ *
+ * Identical to REALCOMIC_T2I_STYLE in everything that carries the house look,
+ * and deliberately different in one clause: it must not end on "muted cinematic
+ * color palette".
+ *
+ * Measured 2026-08-11. `composeQwenInstruction` puts the style directive LAST,
+ * the strongest recency position in the instruction — so a cover was closing
+ * with a literal order to drain its colour. A shot render never does: with
+ * anchors attached it closes on REALCOMIC_TRIGGER ("changed the image into
+ * realcomic style"), where the word "muted" does not appear at all, and its
+ * positive ends with three explicit palette terms plus a hard light. That
+ * asymmetry — not the sampler — is why the films looked graded and the covers
+ * looked grey. A cover competes in a grid of bright thumbnails; it is the ONE
+ * frame in the system that needs its contrast pushed, not damped.
+ */
+export const REALCOMIC_COVER_STYLE =
+  'realcomic style, hand-drawn comic illustration with a realistic touch, ' +
+  'clean confident linework, painterly shading, rich saturated colour, ' +
+  'high-contrast cinematic lighting with deep shadows and a bright light source';
+
 /** Style directive for the dual-character OVERLAY on legacy cartoon styles:
  *  no Qwen style-LoRA there — the project style is carried by the anchor
  *  reference images themselves. */
@@ -250,6 +272,14 @@ export interface QwenInstructionOpts {
    * whole description, which belongs in the shot text.
    */
   objectReference?: { label: string };
+  /**
+   * Override for QWEN_WORD_BUDGET.scene. The scenes keep the measured 55; a
+   * thumbnail is one hero frame whose idea model is asked for 40-90 words of
+   * composition, so it passes ~90 — at 55 the cap ate exactly the trailing
+   * clauses that matter most on a cover (the palette and the quiet lower third
+   * the caption is drawn on).
+   */
+  sceneBudget?: number;
 }
 
 export function composeQwenInstruction(o: QwenInstructionOpts): string {
@@ -298,7 +328,7 @@ export function composeQwenInstruction(o: QwenInstructionOpts): string {
   // The shot's own text IS the target-image description (rule 1). When a shot
   // has no positive at all, fall back to naming the cast — never to "draw a
   // new scene showing…", which is an instruction about the edit, not a result.
-  const action = capClauses(stripCameraMoveClause(scene), QWEN_WORD_BUDGET.scene);
+  const action = capClauses(stripCameraMoveClause(scene), o.sceneBudget ?? QWEN_WORD_BUDGET.scene);
   const target = action ? sentence(action) : `${names} together in one scene.`;
   const place = capClauses(o.locationPrompt ?? '', QWEN_WORD_BUDGET.location);
   const where = place ? sentence(place) : '';

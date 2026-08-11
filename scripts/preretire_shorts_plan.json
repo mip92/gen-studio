@@ -1,0 +1,34 @@
+{
+  "project": "preretire",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ЗАЗОР В ДВЕ СОТКИ 🔧",
+      "shots": [
+        "A0_SH01",
+        "A0_SH03",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH06",
+        "A0_SH08"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ПРЕДПЕНСИОННИКА НЕЛЬЗЯ УВОЛИТЬ. МОЖНО УГОВОРИТЬ 🖊️",
+      "shots": [
+        "A3_SH01",
+        "A3_SH02",
+        "A3_SH03",
+        "A3_SH05",
+        "A3_SH06",
+        "A3_SH07",
+        "A3_SH14"
+      ]
+    }
+  ]
+}

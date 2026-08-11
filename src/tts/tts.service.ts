@@ -1,9 +1,13 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { spawn } from 'child_process';
+import {
+  ARTIFACT_PROFILE_KEYS, isArtifactProfile, type ArtifactProfileKey,
+} from './artifact-profiles';
 import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueueLedgerService } from '../pipeline/queue-ledger.service';
+import { voGateBlocksApprove } from '../validation/vo-validation-gate';
 import { probeWavDurationMs } from './wav-duration';
 
 const APP_ROOT      = process.env.APP_ROOT      ?? path.resolve(__dirname, '..', '..', '..');
@@ -22,6 +26,13 @@ const TTS_QWEN3_SCRIPT = path.join(APP_ROOT, 'scripts', 'tts_qwen3.py');
 // TTS_QWEN3_PYTHON if a different env is preferred.
 const QWEN3_PYTHON_BIN = process.env.TTS_QWEN3_PYTHON
                        ?? path.join(APP_ROOT, '.venv-qwen3', 'Scripts', 'python.exe');
+const TTS_FISH_SCRIPT = path.join(APP_ROOT, 'scripts', 'tts_fish_s2.py');
+// Fish S2-pro synthesises on a persistent local api_server (9GB VRAM, ~5 min
+// model load — the worker autostarts it and the server self-terminates after
+// idling, see tts_fish_s2.py). The worker itself is a thin HTTP client living
+// in the fish-speech venv. Override with TTS_FISH_PYTHON if relocated.
+const FISH_PYTHON_BIN = process.env.TTS_FISH_PYTHON
+                      ?? 'W:\\Programs\\fish-speech-int4-patch\\.venv\\Scripts\\python.exe';
 const SILERO_CACHE  = process.env.SILERO_CACHE_DIR
                     ?? path.join(APP_ROOT, '.silero_cache');
 // Leading reference-bleed ("понь") trimmer — detects + cuts the artifact, keeps
@@ -34,11 +45,48 @@ function artifactBackupPath(slug: string, kind: 'shots' | 'scenes', code: string
   return path.join(APP_ROOT, 'data', slug, '_pon_backup', kind, code, filename);
 }
 
+/**
+ * The trim profile is a property of the VOICE, stored on
+ * Voiceover.artifactProfile — see src/tts/artifact-profiles.ts for why it is
+ * opt-in per voice and never a default.
+ */
+function artifactProfileOf(
+  voice: { slug: string; name: string; artifactProfile: string | null } | null | undefined,
+): { profile: ArtifactProfileKey } | { refusal: string } {
+  if (!voice) {
+    return { refusal: 'у проекта не назначен закадровый голос — обрезать нечего' };
+  }
+  if (!voice.artifactProfile) {
+    return {
+      refusal: `голос «${voice.name}» (${voice.slug}) не помечен как дающий призвук в начале — `
+             + 'обрезка для него выключена. Замеры показали, что такой призвук есть только у '
+             + '«Кошатницы» и «агента Смита»; на чистом голосе детектор принял бы за призвук '
+             + 'тихий предлог в начале фразы и срезал бы слово. Если призвук всё же появился, '
+             + 'выберите профиль на странице голоса.',
+    };
+  }
+  if (!isArtifactProfile(voice.artifactProfile)) {
+    return {
+      refusal: `у голоса «${voice.slug}» стоит неизвестный профиль обрезки `
+             + `«${voice.artifactProfile}» — допустимы: ${ARTIFACT_PROFILE_KEYS.join(', ')}`,
+    };
+  }
+  return { profile: voice.artifactProfile };
+}
+
 /** Engines the service knows how to dispatch. Source of truth is the
  *  Python worker scripts; this constant exists to validate the
  *  Project.ttsEngine column and the per-job engine snapshot. */
-export const TTS_ENGINES = ['silero', 'xtts2', 'f5', 'qwen3'] as const;
+export const TTS_ENGINES = ['silero', 'xtts2', 'f5', 'qwen3', 'fish_s2'] as const;
 export type TTSEngine = (typeof TTS_ENGINES)[number];
+
+/** Every engine except silero clones the project voice reference. Use this
+ *  instead of enumerating engines at call sites — a new engine added to
+ *  TTS_ENGINES is voice-clone by default and won't silently slip through
+ *  engine-list conditionals elsewhere (bit actions.service with fish_s2). */
+export function isVoiceCloneEngine(engine: TTSEngine | string | null | undefined): boolean {
+  return !!engine && engine !== 'silero' && (TTS_ENGINES as readonly string[]).includes(engine);
+}
 
 /** Emotion labels accepted on the per-job API. IMPORTANT: both voice-clone
  *  engines (xtts2, f5) IGNORE the categorical preset/intensity at inference —
@@ -92,6 +140,9 @@ const F5_DEFAULT_SENTENCE_PAUSE = 1.0;
  *  1.0 instead of a misleading 0.85 in the job row / UI history. */
 function defaultRateFor(engine: TTSEngine): number {
   if (engine === 'qwen3') return 1.0;
+  // fish_s2 reads at a natural pace (rate is applied as ffmpeg atempo
+  // post-processing when explicitly set) — honest 1.0 default.
+  if (engine === 'fish_s2') return 1.0;
   return engine === 'f5' ? F5_DEFAULT_RATE : DEFAULT_RATE;
 }
 /** Default sentence pause (seconds) when not specified — engine-aware.
@@ -99,6 +150,8 @@ function defaultRateFor(engine: TTSEngine): number {
  *  one pass and runs sentences together (user feedback 2026-07-16 «одним
  *  забором»); chunked synthesis also resets prosody per sentence. */
 function defaultSentencePauseFor(engine: TTSEngine): number {
+  // fish_s2 deliberately defaults to 0: with no pause the whole shot goes to
+  // the model in ONE request and it shapes prosody/pauses from full context.
   return engine === 'f5' || engine === 'qwen3' ? F5_DEFAULT_SENTENCE_PAUSE : 0;
 }
 
@@ -372,11 +425,37 @@ export class TTSService {
   }
 
 
-  list(sceneId: string) {
-    return this.prisma.tTSJob.findMany({
+  /** Trimmed projection of a job's VO-QC verdict for list endpoints — enough
+   *  for the badge + tooltip without shipping the whole verdict row. The word
+   *  diff and flags ride along so the tooltip can say WHAT the check found —
+   *  a bare «pass 92» left the missing 8 points unexplained (user 2026-08-07). */
+  private voVerdictView(j: any) {
+    const v = j?.voVerdict;
+    if (!v) return null;
+    return {
+      status: v.status as string,
+      score:  v.score as number | null,
+      issues: (v.issues as string[] | null) ?? [],
+      riskyStressWords: (v.riskyStressWords as string[] | null) ?? [],
+      textSnapshotStale: v.textSnapshotStale === true,
+      wer:           (v.wer as number | null) ?? null,
+      missingWords:  (v.missingWords as string[] | null) ?? [],
+      extraWords:    (v.extraWords as string[] | null) ?? [],
+      repeatedWords: (v.repeatedWords as string[] | null) ?? [],
+      garbledWords:  (v.garbledWords as Array<{ expected: string; heard: string }> | null) ?? [],
+      prosodyFlags:  (v.prosodyFlags as string[] | null) ?? [],
+      techFlags:     (v.techFlags as string[] | null) ?? [],
+      transcript:    (v.transcript as string | null) ?? null,
+    };
+  }
+
+  async list(sceneId: string) {
+    const jobs = await this.prisma.tTSJob.findMany({
       where:   { sceneId },
       orderBy: { queuedAt: 'desc' },
+      include: { voVerdict: true } as any,
     });
+    return jobs.map((j) => ({ ...j, voVerdict: this.voVerdictView(j) }));
   }
 
   async listForShot(shotId: string) {
@@ -386,12 +465,14 @@ export class TTSService {
     const jobs = await this.prisma.tTSJob.findMany({
       where:   { shotId },
       orderBy: { queuedAt: 'desc' },
+      include: { voVerdict: true } as any,
     });
-    if (!shot) return jobs;
+    if (!shot) return jobs.map((j) => ({ ...j, voVerdict: this.voVerdictView(j) }));
     // Annotate each completed job with whether its leading "понь" artifact has
     // been trimmed (a pre-trim backup exists) — drives the trim/revert button.
     return jobs.map((j) => ({
       ...j,
+      voVerdict: this.voVerdictView(j),
       trimmedArtifact:
         j.status === 'completed' && !!j.outputFilename &&
         existsSync(artifactBackupPath(shot.project.slug, 'shots', shot.shotCode, j.outputFilename)),
@@ -455,10 +536,17 @@ export class TTSService {
    */
   private async resolveArtifactPaths(
     jobId: string,
-  ): Promise<{ jobId: string; wavPath: string; backupPath: string; isApproved: boolean }> {
+  ): Promise<{
+    jobId: string; wavPath: string; backupPath: string; isApproved: boolean;
+    /** Resolved profile, or the reason this voice must not be trimmed. */
+    voice: { profile: ArtifactProfileKey } | { refusal: string };
+  }> {
     const job = await this.prisma.tTSJob.findUnique({
       where:   { id: jobId },
-      include: { shot: { include: { project: true } }, scene: { include: { project: true } } },
+      include: {
+        shot:  { include: { project: { include: { ttsVoiceover: true } } } },
+        scene: { include: { project: { include: { ttsVoiceover: true } } } },
+      },
     });
     if (!job) throw new NotFoundException(`TTS job ${jobId} not found`);
     if (job.status !== 'completed' || !job.outputFilename) {
@@ -471,6 +559,7 @@ export class TTSService {
         wavPath:    path.join(APP_ROOT, 'data', slug, 'shots', job.shot.shotCode, job.outputFilename),
         backupPath: artifactBackupPath(slug, 'shots', job.shot.shotCode, job.outputFilename),
         isApproved: job.shot.approvedTTSJobId === job.id,
+        voice:      artifactProfileOf(job.shot.project.ttsVoiceover),
       };
     }
     if (job.sceneId && job.scene) {
@@ -480,6 +569,7 @@ export class TTSService {
         wavPath:    path.join(APP_ROOT, 'data', slug, 'scenes', job.scene.sceneKey, job.outputFilename),
         backupPath: artifactBackupPath(slug, 'scenes', job.scene.sceneKey, job.outputFilename),
         isApproved: job.scene.approvedTTSJobId === job.id,
+        voice:      artifactProfileOf(job.scene.project.ttsVoiceover),
       };
     }
     throw new BadRequestException(`TTS job ${jobId} has no owner — corrupt row`);
@@ -508,11 +598,14 @@ export class TTSService {
   async trimArtifact(
     jobId: string,
   ): Promise<{ trimmed: boolean; reason?: string; cutMs?: number; durationMs?: number | null }> {
-    const { wavPath, backupPath, isApproved } = await this.resolveArtifactPaths(jobId);
+    const { wavPath, backupPath, isApproved, voice } = await this.resolveArtifactPaths(jobId);
     // Only the approved take may be trimmed — never an unapproved/candidate one.
     if (!isApproved) {
       throw new BadRequestException(`TTS job ${jobId} is not the approved take — approve it before trimming «понь»`);
     }
+    // Opt-in per voice: a voice with no profile must never be trimmed.
+    if ('refusal' in voice) throw new BadRequestException(voice.refusal);
+    const profile = voice.profile;
     if (!existsSync(wavPath))               throw new BadRequestException(`narration wav missing on disk: ${wavPath}`);
     if (!existsSync(PYTHON_BIN))            throw new BadRequestException(`python bin missing: ${PYTHON_BIN}`);
     if (!existsSync(TRIM_ARTIFACT_SCRIPT))  throw new BadRequestException(`trim script missing: ${TRIM_ARTIFACT_SCRIPT}`);
@@ -520,6 +613,7 @@ export class TTSService {
     const { code, stdout, stderr } = await this.spawnCapture(PYTHON_BIN, [
       '-X', 'utf8', TRIM_ARTIFACT_SCRIPT,
       '--in', wavPath, '--backup', backupPath, '--ffmpeg', FFMPEG_BIN,
+      '--profile', profile,
     ]);
     const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop() ?? '';
     if (code !== 0) throw new BadRequestException(stderr.trim() || `trim worker exited ${code}`);
@@ -531,6 +625,7 @@ export class TTSService {
       const cutMs = Number(/cut_ms=(\d+)/.exec(line)?.[1] ?? NaN);
       const durationMs = probeWavDurationMs(wavPath);
       await this.prisma.tTSJob.update({ where: { id: jobId }, data: { durationMs } });
+      await this.invalidateVoVerdict(jobId, 'trim');
       this.logger.log(`trim artifact ${jobId}: cut ${cutMs}ms → duration ${durationMs ?? '?'}ms`);
       return { trimmed: true, cutMs: Number.isFinite(cutMs) ? cutMs : undefined, durationMs };
     }
@@ -553,8 +648,20 @@ export class TTSService {
     }
     const durationMs = probeWavDurationMs(wavPath);
     await this.prisma.tTSJob.update({ where: { id: jobId }, data: { durationMs } });
+    await this.invalidateVoVerdict(jobId, 'revert');
     this.logger.log(`revert artifact ${jobId}: restored → duration ${durationMs ?? '?'}ms`);
     return { reverted: true, durationMs };
+  }
+
+  /** Trim/revert change the wav's BYTES in place — the VO-QC verdict scored the
+   *  old audio and no longer describes reality. Delete it; the job re-enters
+   *  the next validation run's selection (or a spot re-check via
+   *  POST /tts/jobs/:id/revalidate for an already-approved take). */
+  private async invalidateVoVerdict(jobId: string, why: string): Promise<void> {
+    try {
+      const n = await (this.prisma as any).voValidationVerdict.deleteMany({ where: { ttsJobId: jobId } });
+      if (n?.count > 0) this.logger.log(`VO verdict for ${jobId} invalidated (${why})`);
+    } catch { /* best-effort — table may predate migration */ }
   }
 
   /**
@@ -576,16 +683,21 @@ export class TTSService {
     // Engine snapshot — null/unknown on legacy rows means 'silero'.
     const engine: TTSEngine = (TTS_ENGINES as readonly string[]).includes(job.engine ?? '')
       ? (job.engine as TTSEngine) : 'silero';
-    // qwen3 lives in its own venv; every other engine shares the kohya venv.
-    const pythonBin = engine === 'qwen3' ? QWEN3_PYTHON_BIN : PYTHON_BIN;
+    // qwen3 and fish_s2 live in their own venvs; every other engine shares
+    // the kohya venv.
+    const pythonBin = engine === 'qwen3'   ? QWEN3_PYTHON_BIN
+                    : engine === 'fish_s2' ? FISH_PYTHON_BIN
+                    :                        PYTHON_BIN;
     if (!existsSync(pythonBin)) {
-      await this.fail(job.id, `python bin missing: ${pythonBin} (set ${engine === 'qwen3' ? 'TTS_QWEN3_PYTHON' : 'TTS_PYTHON'} env)`);
+      const envHint = engine === 'qwen3' ? 'TTS_QWEN3_PYTHON' : engine === 'fish_s2' ? 'TTS_FISH_PYTHON' : 'TTS_PYTHON';
+      await this.fail(job.id, `python bin missing: ${pythonBin} (set ${envHint} env)`);
       return;
     }
-    const script = engine === 'f5'    ? TTS_F5_SCRIPT
-                 : engine === 'qwen3' ? TTS_QWEN3_SCRIPT
-                 : engine === 'xtts2' ? TTS_XTTS2_SCRIPT
-                 :                      TTS_SCRIPT;
+    const script = engine === 'f5'      ? TTS_F5_SCRIPT
+                 : engine === 'qwen3'   ? TTS_QWEN3_SCRIPT
+                 : engine === 'fish_s2' ? TTS_FISH_SCRIPT
+                 : engine === 'xtts2'   ? TTS_XTTS2_SCRIPT
+                 :                        TTS_SCRIPT;
     if (!existsSync(script)) {
       await this.fail(job.id, `worker script missing: ${script}`);
       return;
@@ -668,12 +780,13 @@ export class TTSService {
         '--emotion-preset',    job.emotionPreset ?? 'neutral',
         '--emotion-intensity', String(job.emotionIntensity ?? 0.5),
       ];
-      // f5 honours the silero-style speed knob; qwen3 has no speed knob but
-      // shares f5's sentence-pause behaviour. xtts2 defines neither flag.
-      if (engine === 'f5') {
+      // f5 honours the silero-style speed knob; fish_s2 applies it as ffmpeg
+      // atempo. qwen3 has no speed knob but shares f5's sentence-pause
+      // behaviour. xtts2 defines neither flag.
+      if (engine === 'f5' || engine === 'fish_s2') {
         argv.push('--speed', String(job.rate ?? 1.0));
       }
-      if ((engine === 'f5' || engine === 'qwen3') && (job.sentencePauseSec ?? 0) > 0) {
+      if ((engine === 'f5' || engine === 'qwen3' || engine === 'fish_s2') && (job.sentencePauseSec ?? 0) > 0) {
         argv.push('--sentence-pause-sec', String(job.sentencePauseSec));
       }
       if (job.emotionRefName) {
@@ -899,10 +1012,24 @@ export class TTSService {
     if (job.status !== 'completed') {
       throw new BadRequestException(`Only completed jobs can be approved (got: ${job.status})`);
     }
+    const scene = await this.prisma.scene.findUnique({ where: { id: sceneId }, select: { projectId: true } });
+    if (scene) await this.assertVoGateOpen(scene.projectId);
     return this.prisma.scene.update({
       where: { id: sceneId },
       data:  { approvedTTSJobId: jobId },
     });
+  }
+
+  /** Opt-in approve-gate: when Project.voValidationGateEnabled is on, approving
+   *  any take is blocked until the project has ≥1 COMPLETED VO validation run.
+   *  Individual flagged verdicts never block — this is only "QC ran at least once". */
+  private async assertVoGateOpen(projectId: string): Promise<void> {
+    if (await voGateBlocksApprove(this.prisma, projectId)) {
+      throw new BadRequestException(
+        'В проекте включён гейт проверки озвучки: запустите VO-валидацию хотя бы один раз ' +
+        '(страница «Озвучка QC»), прежде чем утверждать дубли.',
+      );
+    }
   }
 
   /**
@@ -1061,6 +1188,8 @@ export class TTSService {
    * count of newly-approved shots.
    */
   async approveAllCompletedForScene(sceneId: string): Promise<{ approved: number; skipped: number; total: number }> {
+    const scene = await this.prisma.scene.findUnique({ where: { id: sceneId }, select: { projectId: true } });
+    if (scene) await this.assertVoGateOpen(scene.projectId);
     const shots = await this.prisma.shot.findMany({
       where:   { sceneId },
       include: { ttsJobs: { orderBy: { queuedAt: 'desc' } } },
@@ -1113,6 +1242,8 @@ export class TTSService {
     if (job.status !== 'completed') {
       throw new BadRequestException(`Only completed jobs can be approved (got: ${job.status})`);
     }
+    const shot = await this.prisma.shot.findUnique({ where: { id: shotId }, select: { projectId: true } });
+    if (shot) await this.assertVoGateOpen(shot.projectId);
     return this.prisma.shot.update({
       where: { id: shotId },
       data:  { approvedTTSJobId: jobId },

@@ -20,6 +20,7 @@ import { ComfyService } from '../../comfy/comfy.service';
 import { StartVideoInput } from './video-job.types';
 import { stripPromptWeights } from '../scenes/scene-render.service';
 import { QueueLedgerService } from '../../pipeline/queue-ledger.service';
+import { PageTemplateRegistryService } from '../../comic/page-template-registry.service';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
@@ -109,7 +110,21 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     private readonly prisma: PrismaService,
     private readonly comfy:  ComfyService,
     private readonly ledger: QueueLedgerService,
+    private readonly comicRegistry: PageTemplateRegistryService,
   ) {}
+
+  /**
+   * The shot's comic panel shape (template-layout mode), or null on every
+   * legacy shot. $queryRaw because the column may predate the generated
+   * Prisma client (documented repo pattern).
+   */
+  private async resolveComicPanelShape(shotId: string): Promise<string | null> {
+    const rows = await this.prisma.$queryRaw<Array<{ shape: string | null }>>`
+      SELECT "comicPanelShape" AS shape FROM shots WHERE id = ${shotId}
+    `;
+    const shape = rows[0]?.shape ?? null;
+    return shape && shape.trim().length > 0 ? shape : null;
+  }
 
   onModuleInit() {
     this.poller = setInterval(() => void this.safePoll(), POLL_MS);
@@ -159,6 +174,15 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     const count = Math.max(1, Math.min(8, input.count ?? 1));
     const workflowFilename = this.resolveWorkflowFilename(input.mode);
 
+    // Comic panel shape (template-layout mode): the shot's Wan render size
+    // comes from its shape's `wan` row. The shape is BAKED into
+    // VideoRender.params at creation (like TTSJob.engine) so the later
+    // upscale+RIFE pass patches its output node from the same decision instead
+    // of re-resolving a plan that may have moved on. null shape = legacy path,
+    // params identical to before.
+    const panelShape = await this.resolveComicPanelShape(shot.id);
+    const wanSize = panelShape ? this.comicRegistry.getShape(panelShape).wan : undefined;
+
     // Create N pending rows and put each in the queue. Actual ComfyUI dispatch
     // happens in PipelineQueueService.tick(), which serialises every job type
     // through the single GPU slot in queue order.
@@ -169,10 +193,11 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         : Math.floor(Math.random() * 2 ** 32);
       const params = {
         seed,
-        width:  input.width  ?? DEFAULT_WIDTH,
-        height: input.height ?? DEFAULT_HEIGHT,
+        width:  input.width  ?? wanSize?.[0] ?? DEFAULT_WIDTH,
+        height: input.height ?? wanSize?.[1] ?? DEFAULT_HEIGHT,
         length: input.length ?? DEFAULT_LENGTH,
         fps:    input.fps    ?? DEFAULT_FPS,
+        ...(panelShape ? { panelShape } : {}),
       };
       const row = await this.prisma.videoRender.create({
         data: {
@@ -665,7 +690,16 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     if (v.status !== 'completed' || !v.outputFilename) {
       throw new BadRequestException(`Video ${videoId} is not completed yet`);
     }
-    if (v.upscaleStatus === 'running' || v.upscaleStatus === 'pending') return v;
+    // `running` is owned by pollRunning, which scans the row itself and needs no
+    // queue entry to find it — leave it alone.
+    if (v.upscaleStatus === 'running') return v;
+    // `pending`, on the other hand, is dispatched ONLY from the ledger. A pending
+    // row with no live entry is therefore unreachable: nothing will ever pick it
+    // up, /actions counts it as in-flight and hides the gate, and this method used
+    // to return here, so even asking again was a silent no-op. Fall through and
+    // re-file it instead. (trucker A9_SH08 sat in that hole from 2026-07-27 until
+    // 2026-08-10, invisible in the queue and on /actions alike.)
+    if (v.upscaleStatus === 'pending' && await this.ledger.findLive('video_post', v.id)) return v;
     if (v.upscaleStatus === 'completed' && v.upscaledFilename && !opts.force) return v;
 
     const srcMp4 = path.join(
@@ -747,13 +781,21 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         return;
       }
       const mult   = v.interpMultiplier ?? DEFAULT_INTERP_MULTIPLIER;
-      const params = (v.params ?? {}) as { fps?: number };
+      const params = (v.params ?? {}) as { fps?: number; panelShape?: string };
+      // Comic-panel clip: scale node 5 to the shape's smooth target instead of
+      // the template's hardcoded 1920×1080 (crop:"disabled" there would STRETCH
+      // a square/tall clip into 16:9). Shape was baked into params at start().
+      const smooth = params.panelShape
+        ? this.comicRegistry.getShape(params.panelShape).smooth
+        : undefined;
       const workflow = this.patchCombined(combined, {
         sourceVideo:  inputBasename,
         fhdPrefix:    `video_fhd/${v.shot.shotCode}/${v.id}`,
         smoothPrefix: `video_smooth/${v.shot.shotCode}/${v.id}`,
         multiplier:   mult,
         fps:          (params.fps ?? DEFAULT_FPS) * mult,
+        smoothWidth:  smooth?.[0],
+        smoothHeight: smooth?.[1],
       });
       const { promptId } = await this.comfy.queuePrompt(workflow);
       await this.prisma.videoRender.update({
@@ -794,9 +836,17 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     smoothPrefix: string;
     multiplier:   number;
     fps:          number;
+    /** Comic-panel target for node 5 (ImageScale). Absent = template default
+     *  (1920×1080) — the legacy workflow stays byte-identical. */
+    smoothWidth?:  number;
+    smoothHeight?: number;
   }): Record<string, any> {
     const wf = structuredClone(template);
     if (wf['1'])  wf['1'].inputs.file             = p.sourceVideo;      // LoadVideo
+    if (p.smoothWidth && p.smoothHeight && wf['5']) {                   // ImageScale
+      wf['5'].inputs.width  = p.smoothWidth;
+      wf['5'].inputs.height = p.smoothHeight;
+    }
     if (wf['7'])  wf['7'].inputs.filename_prefix  = p.fhdPrefix;        // SaveVideo (FHD)
     if (wf['8'])  wf['8'].inputs.model_name       = INTERP_MODEL_NAME;  // FrameInterpolationModelLoader
     if (wf['9'])  wf['9'].inputs.multiplier       = p.multiplier;       // FrameInterpolate

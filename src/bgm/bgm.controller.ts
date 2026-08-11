@@ -57,7 +57,7 @@ export class BgmController {
   // ── Blocks ────────────────────────────────────────────────────────────────
 
   @Post('projects/:projectId/blocks')
-  @ApiOperation({ summary: 'Create a NarrativeBlock for a project (chapter / mood section)' })
+  @ApiOperation({ summary: 'Create a NarrativeBlock for a project (a music act — mirrors one Scene/act)' })
   createBlock(@Param('projectId') projectId: string, @Body() body: Omit<CreateBlockInput, 'projectId'>) {
     return this.bgm.createBlock({ projectId, ...body });
   }
@@ -142,6 +142,19 @@ export class BgmController {
   @ApiOperation({ summary: 'Hard-delete a segment (cascades to its audio jobs)' })
   deleteSegment(@Param('segmentId') segmentId: string) {
     return this.bgm.deleteSegment(segmentId);
+  }
+
+  @Post('segments/:segmentId/move')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Move a tile one step up/down within its act (exporter placement order)',
+    description:
+      'Swaps the tile with its neighbour in the combined main+spare order. The spare flag '
+      + 'follows the position — promoting a spare demotes the displaced main tile. Takes and '
+      + 'approvals travel with the tile. Returns the refreshed block.',
+  })
+  moveSegment(@Param('segmentId') segmentId: string, @Body() body: { direction: 'up' | 'down' }) {
+    return this.bgm.moveSegment(segmentId, body?.direction);
   }
 
   @Post('segments/:segmentId/approve/:jobId')

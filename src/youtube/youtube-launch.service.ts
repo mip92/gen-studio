@@ -56,6 +56,11 @@ export interface LaunchView {
   items:           LaunchItemView[];
   linkedConfirmed: boolean;
   allTranscribed:  boolean;
+  /**
+   * The gate the stepper actually uses: subtitles ready on everything that NEEDS
+   * them. Shorts do not — see SUBTITLES_REQUIRED_KINDS.
+   */
+  subtitlesReady:  boolean;
   allUploaded:     boolean;
   /** True when the bundle contains shorts — the linking step only applies then. */
   hasShorts:       boolean;
@@ -72,7 +77,8 @@ export interface LaunchView {
  * Orchestrates the «Связка-запуск» stepper: main + all shorts of a project go out
  * together, cross-linked. Flow (each step gates the next):
  *   1. files      — operator picks mp4 + thumbnail for main and every short
- *   2. subtitles  — transcribe every LOCAL mp4 (whisper) → .srt (gate: all done)
+ *   2. subtitles  — transcribe the main mp4 (whisper) → .srt (gate: main only;
+ *                   shorts are exempt, see SUBTITLES_REQUIRED_KINDS)
  *   3. upload     — upload all as UNLISTED, attaching the pre-made .srt
  *   4. link       — operator links shorts→main in Studio (manual; API can't) and
  *                   confirms (server verifies uploads+subs, NOT the links)
@@ -82,6 +88,26 @@ export interface LaunchView {
 @Injectable()
 export class YoutubeLaunchService {
   private readonly logger = new Logger(YoutubeLaunchService.name);
+
+  /**
+   * Which items must have an .srt before the bundle may go out.
+   *
+   * The main video: yes. A 25-40 minute narrated film is watched with the sound
+   * off often enough that a real subtitle track earns its whisper run, and it is
+   * the only asset whose captions get indexed in a way that matters.
+   *
+   * A short: NO (user, 2026-08-11). There is no room for them in a 9:16 frame
+   * that already carries a burned-in caption band, and YouTube shows its own
+   * auto-captions on Shorts anyway, so our uploaded track is a second layer of
+   * text competing with the first. It stays POSSIBLE on demand — `POST
+   * /youtube/captions` still transcribes any file the operator points at — it is
+   * simply no longer generated automatically and no longer blocks the launch.
+   */
+  private static readonly SUBTITLES_REQUIRED_KINDS: ReadonlyArray<LaunchItem['kind']> = ['main'];
+
+  private static needsSubtitles(item: Pick<LaunchItem, 'kind'>): boolean {
+    return YoutubeLaunchService.SUBTITLES_REQUIRED_KINDS.includes(item.kind);
+  }
 
   constructor(
     private readonly prisma:   PrismaService,
@@ -157,14 +183,19 @@ export class YoutubeLaunchService {
 
     const hasShorts      = items.some((i) => i.kind === 'short');
     const allTranscribed = items.length > 0 && items.every((i) => i.transcribeStatus === 'completed');
+    // Shorts are excluded: their subtitles are optional, so a short without an
+    // .srt must not hold the main video's launch. See SUBTITLES_REQUIRED_KINDS.
+    const subtitlesReady = items.length > 0
+      && items.filter((i) => YoutubeLaunchService.needsSubtitles(i))
+              .every((i) => i.transcribeStatus === 'completed');
     const allUploaded    = items.length > 0 && items.every((i) => i.uploaded);
     let step = 1;
     if (items.length > 0)  step = 2;
-    if (allTranscribed)    step = 3;
+    if (subtitlesReady)    step = 3;
     if (allUploaded)       step = hasShorts ? 4 : 5;               // no shorts → skip linking
     if (allUploaded && (!hasShorts || state.linkedConfirmed)) step = 5;
     return {
-      items, linkedConfirmed: state.linkedConfirmed, allTranscribed, allUploaded, hasShorts, step,
+      items, linkedConfirmed: state.linkedConfirmed, allTranscribed, subtitlesReady, allUploaded, hasShorts, step,
       published:       Boolean(state.published),
       publishMode:     state.publishMode ?? null,
       mainPublishAt:   state.mainPublishAt ?? null,
@@ -189,8 +220,11 @@ export class YoutubeLaunchService {
       linkedConfirmed: false,
     };
     await this.writeState(project.id, state);
-    // transcribe every mp4 (whisper queue), unless a completed SRT job already exists
+    // Transcribe what needs subtitles (whisper queue), unless a completed SRT job
+    // already exists. Shorts are skipped — optional subtitles should not spend
+    // whisper time by default; `POST /youtube/captions` makes one on demand.
     for (const it of state.items) {
+      if (!YoutubeLaunchService.needsSubtitles(it)) continue;
       const existing = await this.captions.latestForVideoPath(it.videoPath);
       if (existing?.status === 'completed') continue;
       await this.captions.enqueueTranscribe(idOrSlug, it.videoPath, LANG);
@@ -221,19 +255,50 @@ export class YoutubeLaunchService {
       state.items.push({ key: item.key, kind: item.kind, slug: item.slug, videoPath, thumbPath: thumbPath ?? '' });
     }
     await this.writeState(project.id, state);
-    const cap = await this.captions.latestForVideoPath(videoPath);
-    if (cap?.status !== 'completed') await this.captions.enqueueTranscribe(idOrSlug, videoPath, LANG);
+    if (YoutubeLaunchService.needsSubtitles(item)) {
+      const cap = await this.captions.latestForVideoPath(videoPath);
+      if (cap?.status !== 'completed') await this.captions.enqueueTranscribe(idOrSlug, videoPath, LANG);
+    }
     return this.get(idOrSlug);
   }
 
-  /** Upload ONE item as Unlisted (gated on its subtitles being ready). */
-  async uploadItem(idOrSlug: string, key: string): Promise<LaunchView> {
+  /**
+   * Put ONE item on transcription by hand.
+   *
+   * The main video gets this automatically at `prepare`. A short does not, because
+   * its subtitles are optional — but "optional" has to mean CHOOSABLE, not
+   * unavailable, so this is the operator's way to ask for a short's .srt. It lands
+   * next to the mp4 and `attachExisting` picks it up at upload if it is ready by
+   * then; if it is not, the upload goes ahead without it.
+   *
+   * Idempotent: a job already queued, running or completed is left alone rather
+   * than duplicated onto the render queue.
+   */
+  async transcribeItem(idOrSlug: string, key: string): Promise<LaunchView> {
     const project = await this.project(idOrSlug);
     const state   = this.readState(project);
     const it = state.items.find((i) => i.key === key);
     if (!it) throw new NotFoundException(`Launch item "${key}" not found`);
     const cap = await this.captions.latestForVideoPath(it.videoPath);
-    if (cap?.status !== 'completed') throw new BadRequestException('Субтитры ещё не готовы');
+    if (cap && ['completed', 'pending', 'running'].includes(String(cap.status))) {
+      return this.get(idOrSlug);
+    }
+    await this.captions.enqueueTranscribe(idOrSlug, it.videoPath, LANG);
+    this.logger.log(`launch: subtitles requested by hand for ${key} (${it.videoPath})`);
+    return this.get(idOrSlug);
+  }
+
+  /** Upload ONE item as Unlisted (gated on its subtitles being ready; shorts exempt). */
+  async uploadItem(idOrSlug: string, key: string): Promise<LaunchView> {
+    const project = await this.project(idOrSlug);
+    const state   = this.readState(project);
+    const it = state.items.find((i) => i.key === key);
+    if (!it) throw new NotFoundException(`Launch item "${key}" not found`);
+    // Only the main video is held back for its .srt — a short uploads without one.
+    if (YoutubeLaunchService.needsSubtitles(it)) {
+      const cap = await this.captions.latestForVideoPath(it.videoPath);
+      if (cap?.status !== 'completed') throw new BadRequestException('Субтитры ещё не готовы');
+    }
     if (!it.videoId && !it.uploadJobId) {
       const { jobId } = this.upload.beginUpload(idOrSlug, it.kind, it.slug, {
         videoPath: it.videoPath, thumbnailPath: it.thumbPath, privacyStatus: 'unlisted',
@@ -300,7 +365,7 @@ export class YoutubeLaunchService {
     const state   = this.readState(project);
     if (!state.items.length) throw new BadRequestException('Nothing prepared');
     const view = await this.get(idOrSlug);
-    if (!view.allTranscribed) throw new BadRequestException('Субтитры ещё не готовы на всех файлах');
+    if (!view.subtitlesReady) throw new BadRequestException('Субтитры основного видео ещё не готовы');
 
     for (const it of state.items) {
       if (it.videoId || it.uploadJobId) continue;   // already uploading / done
@@ -318,7 +383,7 @@ export class YoutubeLaunchService {
     const project = await this.project(idOrSlug);
     const view = await this.get(idOrSlug);
     if (!view.allUploaded)    throw new BadRequestException('Не все видео залиты');
-    if (!view.allTranscribed) throw new BadRequestException('Субтитры не готовы');
+    if (!view.subtitlesReady) throw new BadRequestException('Субтитры основного видео не готовы');
     const state = this.readState(project);
     state.linkedConfirmed = true;
     await this.writeState(project.id, state);
@@ -331,7 +396,7 @@ export class YoutubeLaunchService {
     const view = await this.get(idOrSlug);
     if (view.published)        throw new BadRequestException('Связка уже опубликована');
     if (!view.allUploaded)     throw new BadRequestException('Не все видео залиты');
-    if (!view.allTranscribed)  throw new BadRequestException('Нельзя публиковать без субтитров');
+    if (!view.subtitlesReady)  throw new BadRequestException('Нельзя публиковать без субтитров основного видео');
     if (view.hasShorts && !view.linkedConfirmed) throw new BadRequestException('Сначала подтверди связывание в Studio');
 
     // main → next Tue/Thu 16:00; shorts → same day 16:05
@@ -364,7 +429,7 @@ export class YoutubeLaunchService {
     const view = await this.get(idOrSlug);
     if (view.published)        throw new BadRequestException('Связка уже опубликована');
     if (!view.allUploaded)     throw new BadRequestException('Не все видео залиты');
-    if (!view.allTranscribed)  throw new BadRequestException('Нельзя публиковать без субтитров');
+    if (!view.subtitlesReady)  throw new BadRequestException('Нельзя публиковать без субтитров основного видео');
     if (view.hasShorts && !view.linkedConfirmed) throw new BadRequestException('Сначала подтверди связывание в Studio');
     for (const it of view.items) {
       if (!it.videoId) continue;

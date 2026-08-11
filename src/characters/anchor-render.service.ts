@@ -1,17 +1,26 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
-import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, unlinkSync, rmSync, readdirSync, statSync } from 'fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, unlinkSync, readdirSync, statSync } from 'fs';
 import { createHash } from 'crypto';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { ComfyService } from '../comfy/comfy.service';
-import { normalizeStyleLora, normalizeAnchorStyleLora } from '../generation/scenes/scene-render.service';
+import { normalizeStyleLora, normalizeAnchorStyleLora, normalizeQwenReferenceLatents } from '../generation/scenes/scene-render.service';
 import { QwenSceneGraphBuilder } from '../generation/scenes/qwen/qwen-scene-graph.builder';
-import { composeQwenInstruction, REALCOMIC_T2I_STYLE } from '../generation/scenes/qwen/qwen-prompt';
+import {
+  composeQwenInstruction,
+  REALCOMIC_T2I_STYLE,
+  KEEP_REFERENCE_STYLE,
+  QWEN_WORD_BUDGET,
+  capClauses,
+  stripIdentityBoilerplate,
+} from '../generation/scenes/qwen/qwen-prompt';
 import { AnchorValidationService, anchorCandidateDir } from '../validation/anchor-validation.service';
+import { buildChain, wouldCycle } from './profile-chain';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? 'E:\\ComfyUI\\gen-studio';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
+const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
 
 /** How many anchor candidates to render per job so the vision model has a pool
  *  to pick the best clean, on-model, non-anime portrait from (best-of-N). */
@@ -69,6 +78,18 @@ const QWEN_PORTRAIT_COMPOSITION =
   'a three-quarter portrait of a single person facing the camera, waist-up framing, ' +
   'neutral pale grey backdrop, soft window light, clean character reference sheet look';
 
+// Scene-donor composition — the default whenever the project consumes its
+// anchors as PIXELS (settings.qwenReferenceLatents = true): the studio-sheet
+// compositions above are the worst possible donor for the reference_latents
+// channel (their flat grey backdrop and frontal pose paste into every shot).
+// Keeps: single person, three-quarter, facing camera, waist-up (the outfit
+// must stay visible). Drops: the flat grey backdrop and every "reference
+// sheet" cue. Explicit settings.anchorComposition still wins over this.
+const SCENE_DONOR_COMPOSITION =
+  'three-quarter portrait facing camera, waist-up framing, ' +
+  'standing in a softly blurred muted interior with natural depth, ' +
+  'gentle directional daylight, soft natural shadows';
+
 const QWEN_ANCHOR_NEGATIVE =
   'photograph, photorealistic, 3D render, plastic skin, anime, manga, chibi, ' +
   'deformed hands, extra fingers, two heads, multiple people, watermark, text overlay, blurry, low quality';
@@ -79,6 +100,38 @@ export const ANCHOR_NEGATIVE =
   'two heads, watermark, text overlay, blurry, low quality, anime, manga, ' +
   'chibi, kawaii, oversaturated color, glamour photography, fashion shoot, ' +
   'full body, multiple people, group photo, profile only, back view';
+
+/**
+ * Read `project.settings.anchorComposition` — a per-project override of the
+ * composition clause baked into the anchor positive (framing + backdrop +
+ * light). The pipeline defaults above describe a studio character sheet on a
+ * flat grey backdrop; that is the right donor while anchors feed scenes
+ * through semantic channels only, but a project whose scenes consume the
+ * anchor as PIXELS (settings.qwenReferenceLatents = true) wants a
+ * scene-friendlier donor instead — the sheet's flat backdrop and frontal pose
+ * bleed into every shot via reference_latents. Returns null when unset so the
+ * caller falls back to the pipeline default.
+ */
+export function normalizeAnchorComposition(settings: unknown): string | null {
+  const v = (settings as { anchorComposition?: unknown } | null | undefined)?.anchorComposition;
+  if (typeof v !== 'string') return null;
+  const s = v.trim();
+  return s.length > 0 ? s : null;
+}
+
+/**
+ * The composition clause for a project's anchors: explicit
+ * settings.anchorComposition wins; otherwise projects that consume anchors as
+ * pixels (settings.qwenReferenceLatents = true) auto-default to the
+ * scene-donor composition, and everything else keeps the pipeline's studio
+ * default. Started projects that must keep the OLD default despite
+ * refLatents=true (approved anchors) pin it via an explicit
+ * settings.anchorComposition instead of a code branch.
+ */
+function resolveAnchorComposition(settings: unknown, pipelineDefault: string): string {
+  return normalizeAnchorComposition(settings)
+    ?? (normalizeQwenReferenceLatents(settings) === true ? SCENE_DONOR_COMPOSITION : pipelineDefault);
+}
 
 export type AnchorPipeline = 'qwen' | 'flux_comic' | 'sdxl_comic';
 const ANCHOR_PIPELINES: readonly string[] = ['qwen', 'flux_comic', 'sdxl_comic'];
@@ -133,6 +186,24 @@ export class AnchorRenderService {
       throw new BadRequestException(
         `Character ${profile.character.code} is not attached to any project. Attach it first.`,
       );
+    }
+
+    // Derived profile: the base anchor must be APPROVED (installed) before the
+    // derived render makes sense — it is the donor image. The normal flow needs
+    // no manual enqueue at all: approving the base queues this automatically
+    // (enqueueDerivedChildren).
+    const baseProfileId = await this.getBaseProfileId(profileId);
+    if (baseProfileId) {
+      const base = await this.prisma.characterProfile.findUnique({ where: { id: baseProfileId } });
+      // Approval, not presence — see approveAnchor(). Before 2026-08-11 this
+      // read the file off disk and called that "approved", which it never was.
+      if (!base?.anchorApprovedAt || !(await this.getAnchorPath(baseProfileId))) {
+        throw new BadRequestException(
+          `Profile ${profile.profileCode} derives from ${base?.profileCode ?? baseProfileId}, `
+          + 'which has no approved anchor yet — approve the base anchor first '
+          + '(the derived render then queues automatically).',
+        );
+      }
     }
 
     // If a pending or running job already exists, return it (don't duplicate).
@@ -214,6 +285,15 @@ export class AnchorRenderService {
       ?? (visualStyle === 'realcomic_qwen' ? 'qwen'
         : visualStyle === 'graphic_novel_flux' ? 'flux_comic'
         : 'sdxl_comic');
+
+    // A profile with a base link renders as an EDIT of the base profile's
+    // anchor (same person, different age/state) — its own branch, on the Qwen
+    // edit graph regardless of anchorPipeline.
+    const baseProfileId = await this.getBaseProfileId(profile.id);
+    if (baseProfileId) {
+      await this.dispatchDerived(jobId, profile, project, baseProfileId);
+      return;
+    }
     // Anchor workflow per pipeline. The SDXL and Flux comic graphs share the
     // node layout the patches below target (2=LoraLoader, 3/4=text, 5=latent,
     // 6=KSampler, 8=SaveImage); the Qwen graph does not (separate branch).
@@ -244,9 +324,10 @@ export class AnchorRenderService {
       // the real prompt as "PLACEHOLDER" (garbage anchor, no error). Delegate
       // to the shared Qwen builder instead.
       const styleLora = normalizeStyleLora((project as any).settings);
+      const composition = resolveAnchorComposition((project as any).settings, QWEN_PORTRAIT_COMPOSITION);
       const instruction = composeQwenInstruction({
         participants:   [],
-        scenePrompt:    [QWEN_PORTRAIT_COMPOSITION, profile.promptBase].join(', '),
+        scenePrompt:    [composition, profile.promptBase].join(', '),
         styleDirective: REALCOMIC_T2I_STYLE,
         withReferences: false,
       });
@@ -299,7 +380,8 @@ export class AnchorRenderService {
     // The Flux graph needs the western/realistic anti-anime prefix; the SDXL
     // comic prefix ("cell-shaded …") sends Flux portraits to anime.
     const stylePrefix = anchorPipeline === 'flux_comic' ? FLUX_COMIC_STYLE : STYLE_PREFIX;
-    const positive = [stylePrefix, PORTRAIT_COMPOSITION, profile.promptBase].join(', ');
+    const composition = resolveAnchorComposition((project as any).settings, PORTRAIT_COMPOSITION);
+    const positive = [stylePrefix, composition, profile.promptBase].join(', ');
     const negative = (profile.negative && profile.negative.trim().length > 0)
       ? profile.negative
       : ANCHOR_NEGATIVE;
@@ -312,6 +394,390 @@ export class AnchorRenderService {
     if (wf['5']?.inputs) wf['5'].inputs.batch_size = ANCHOR_CANDIDATES;
 
     await this.submitAndMarkRunning(jobId, profile.profileCode, wf);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // DERIVED profiles — anchor inheritance (the same person, aged / changed).
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Derived-profile anchor: a Qwen-Image-Edit-2511 EDIT of the base profile's
+   * installed anchor — "the same person, matching this profile's promptBase" —
+   * so an age/state variant keeps the face instead of reinventing it from
+   * text. Runs on the Qwen anchor graph REGARDLESS of the project's
+   * anchorPipeline: editing an existing picture is exactly what 2511 is for,
+   * and the donor itself carries the project's art style (referenceLatents ON,
+   * no style LoRA — the dual-character-overlay recipe).
+   *
+   * No queue automation here by design (user 2026-08-03): the derived render
+   * is enqueued at the moment the user APPROVES the base anchor (candidate
+   * select / upload — see enqueueDerivedChildren), so by the time this
+   * dispatches the base anchor is already on disk.
+   */
+  private async dispatchDerived(jobId: string, profile: any, project: any, baseProfileId: string): Promise<void> {
+    const baseProfile = await this.prisma.characterProfile.findUnique({ where: { id: baseProfileId } });
+    if (!baseProfile) {
+      await this.failJob(jobId, `Base profile ${baseProfileId} no longer exists — clear the base link and re-render`);
+      return;
+    }
+    const baseAnchor = await this.getAnchorPath(baseProfileId);
+    if (!baseAnchor || !baseProfile.anchorApprovedAt) {
+      await this.failJob(
+        jobId,
+        `Base profile ${baseProfile.profileCode} has no approved anchor — approve it first; `
+        + 'the derived render is queued automatically on approve',
+      );
+      return;
+    }
+
+    const workflowFilename = 'gen_anchor_portrait_realcomic_qwen_api.json';
+    const perProject   = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
+    const shared       = path.join(APP_ROOT, 'data', '_templates', 'comfy', workflowFilename);
+    const workflowPath = existsSync(perProject) ? perProject : shared;
+    if (!existsSync(workflowPath)) {
+      await this.failJob(jobId, `Qwen anchor workflow not found at ${perProject} (and no shared template at ${shared})`);
+      return;
+    }
+
+    // Stage the donor into ComfyUI's input dir (LoadImage reads relative names).
+    const staged = `anchor_base_${profile.profileCode}.png`;
+    mkdirSync(COMFY_INPUT, { recursive: true });
+    copyFileSync(baseAnchor, path.join(COMFY_INPUT, staged));
+
+    const name = ((profile.character?.displayName ?? '') as string).trim() || profile.profileCode;
+    const identity = capClauses(stripIdentityBoilerplate(profile.promptBase ?? ''), QWEN_WORD_BUDGET.identity);
+    const composition = resolveAnchorComposition((project as any).settings, QWEN_PORTRAIT_COMPOSITION);
+    // Qwen skill rules: describe the RESULT (the target identity IS the change —
+    // older, bruised, richer), no negations, short. The keep-clause pins what
+    // must survive the edit: facial identity — deliberately NOT age or clothes.
+    const instruction = [
+      `Picture 1 is ${name}.`,
+      identity ? `${name} is ${identity}.` : '',
+      'The same person as in the reference picture, with the same facial identity, bone structure and eye colour.',
+      `${composition}.`,
+      `${KEEP_REFERENCE_STYLE}.`,
+    ].filter((s) => s.length > 0).join(' ');
+
+    const wfTemplate = JSON.parse(readFileSync(workflowPath, 'utf-8')) as Record<string, any>;
+    const wf = new QwenSceneGraphBuilder().build(wfTemplate as any, {
+      instruction,
+      negative:       (profile.negative && profile.negative.trim().length > 0) ? profile.negative : QWEN_ANCHOR_NEGATIVE,
+      width:          832,
+      height:         1216,
+      batchSize:      ANCHOR_CANDIDATES,
+      seed:           Math.floor(Math.random() * 2 ** 31),
+      steps:          8,           // more room to redraw the age than Lightning's default 4
+      filenamePrefix: `anchor_${profile.profileCode}`,
+      anchors:        [staged],
+      referenceLatents: true,      // portrait→portrait: max identity, no donor-vs-scene conflict
+      // no styleLora — the donor carries the project's art style (overlay recipe)
+    }) as Record<string, any>;
+    await this.submitAndMarkRunning(jobId, profile.profileCode, wf);
+  }
+
+  /** `character_profiles.baseProfileId` — adopted into schema.prisma by the
+   *  20260810210000_profile_base_link migration, so no more raw SQL. */
+  private async getBaseProfileId(profileId: string): Promise<string | null> {
+    const row = await this.prisma.characterProfile.findUnique({
+      where:  { id: profileId },
+      select: { baseProfileId: true },
+    });
+    return row?.baseProfileId ?? null;
+  }
+
+  /**
+   * The approve-time trigger (user 2026-08-03: «запускать в момент апрува
+   * предка»): when the user installs an anchor for a profile — by picking a
+   * candidate or uploading a file — queue the anchor render for every profile
+   * that DERIVES from it and has no anchor of its own yet. Chains propagate
+   * one approve at a time: approving X_YOUNG queues X_MID; approving X_MID
+   * queues X_OLD. Children that already have an anchor are never touched
+   * (re-approving a base must not invalidate approved descendants).
+   * Best-effort: a child failure must never fail the approve itself.
+   */
+  private async enqueueDerivedChildren(profileId: string): Promise<void> {
+    const children = await this.prisma.characterProfile.findMany({
+      where:  { baseProfileId: profileId },
+      select: { id: true, profileCode: true },
+    });
+    for (const child of children) {
+      try {
+        if (await this.getAnchorPath(child.id) !== null) continue;
+        await this.enqueue(child.id);
+        this.logger.log(`Base anchor approved → queued derived anchor for ${child.profileCode}`);
+      } catch (e: any) {
+        this.logger.warn(`Auto-enqueue of derived anchor ${child.profileCode} failed: ${e?.message ?? e}`);
+      }
+    }
+  }
+
+  /** Base-link info + selectable sibling profiles for the UI dropdown.
+   *  `baseAnchorReady` is what the render gate keys on: a derived profile cannot
+   *  be rendered before its donor exists, so the UI disables the button with a
+   *  reason instead of letting enqueue() throw on click. */
+  async getBaseProfileInfo(profileId: string) {
+    const profile = await this.prisma.characterProfile.findUnique({
+      where:   { id: profileId },
+      include: { character: { include: { profiles: true } } },
+    });
+    if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
+    const baseProfileId = profile.baseProfileId;
+    const siblings = profile.character.profiles.filter((p) => p.id !== profileId);
+    const options = await Promise.all(siblings.map(async (p) => ({
+      id:           p.id,
+      profileCode:  p.profileCode,
+      ageLabel:     p.ageLabel ?? null,
+      anchorExists: (await this.getAnchorPath(p.id)) !== null,
+    })));
+    const base = baseProfileId ? profile.character.profiles.find((p) => p.id === baseProfileId) ?? null : null;
+    return {
+      profileId,
+      profileCode: profile.profileCode,
+      baseProfileId,
+      baseProfileCode: base?.profileCode ?? null,
+      baseAnchorReady: baseProfileId ? (await this.getAnchorPath(baseProfileId)) !== null : true,
+      options,
+    };
+  }
+
+  /**
+   * The whole inheritance chain of a profile's character, in story-time order —
+   * what the «Состояния персонажа» block on the character page renders.
+   *
+   * Keyed by PROFILE id (not character id) because that is what the character
+   * routes carry (`/characters/<profileId>/description`). Reports, per state:
+   * age + where the age came from, the base link, whether the anchor is on disk,
+   * how many shots point at it, and whether an anchor render is allowed right
+   * now — the same gate `enqueue()` enforces.
+   */
+  async getProfileChain(profileId: string) {
+    const profile = await this.prisma.characterProfile.findUnique({
+      where:   { id: profileId },
+      include: { character: true },
+    });
+    if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
+    return this.chainForCharacter(profile.characterId, profileId);
+  }
+
+  /** Same payload as getProfileChain, addressed by character. */
+  async chainForCharacter(characterId: string, currentProfileId: string | null = null) {
+    const character = await this.prisma.character.findUnique({
+      where:   { id: characterId },
+      include: {
+        profiles: { include: { _count: { select: { shotParticipants: true } } } },
+      },
+    });
+    if (!character) throw new NotFoundException(`Character ${characterId} not found`);
+
+    const plan   = buildChain(character.profiles.map((p) => ({
+      id: p.id, profileCode: p.profileCode, ageLabel: p.ageLabel, baseProfileId: p.baseProfileId,
+    })));
+    const byId   = new Map(character.profiles.map((p) => [p.id, p]));
+    const anchor = new Map<string, boolean>();
+    for (const p of character.profiles) anchor.set(p.id, (await this.getAnchorPath(p.id)) !== null);
+    // Donor readiness is APPROVAL, not mere presence: a derived render is a Qwen
+    // edit OF the base portrait, so building a whole age chain on an image the
+    // user never endorsed just propagates the mistake downwards.
+    const approved = new Map<string, boolean>(
+      character.profiles.map((p) => [p.id, p.anchorApprovedAt !== null]),
+    );
+
+    // Always ordered by story time (ageLabel), never by the stored links: a
+    // hand-made chain that runs against the ages must LOOK wrong here — each row
+    // prints its own «← от X», so an arrow pointing back up the list is the
+    // signal that something needs fixing.
+    const states = plan.links.map((l) => {
+      const p    = byId.get(l.profile.id)!;
+      const base = p.baseProfileId ? byId.get(p.baseProfileId) ?? null : null;
+      const baseReady = p.baseProfileId ? (approved.get(p.baseProfileId) ?? false) : true;
+      return {
+        profileId:       p.id,
+        profileCode:     p.profileCode,
+        ageLabel:        p.ageLabel ?? null,
+        age:             l.age,
+        ageSource:       l.source,
+        baseProfileId:   p.baseProfileId,
+        baseProfileCode: base?.profileCode ?? null,
+        anchorExists:    anchor.get(p.id) ?? false,
+        /** Anchor on disk AND signed off by the user. Shots render only on these. */
+        anchorApproved:  approved.get(p.id) ?? false,
+        shotCount:       p._count.shotParticipants,
+        loraReady:       !!p.loraPath,
+        /** Proposed link if the chain were rebuilt from ageLabel now. */
+        suggestedBaseProfileId:   l.baseProfileId,
+        suggestedBaseProfileCode: l.baseProfileId ? byId.get(l.baseProfileId)?.profileCode ?? null : null,
+        /** Anchor render allowed right now? The donor must be installed first. */
+        canRenderAnchor: baseReady,
+        blockedReason:   baseReady ? null
+          : `сначала утвердите якорь ${base?.profileCode ?? 'базового профиля'}`,
+      };
+    });
+
+    return {
+      characterId,
+      characterCode: character.code,
+      displayName:   character.displayName,
+      currentProfileId,
+      /** True when every non-root state already derives from the previous one. */
+      chainLinked: states.length < 2 ? true : states.every((s, i) => (i === 0
+        ? s.baseProfileId === null
+        : s.baseProfileId === states[i - 1].profileId)),
+      states,
+      warnings: plan.warnings,
+    };
+  }
+
+  /**
+   * Link a character's profiles into an age-ordered inheritance chain
+   * (`X_KID → X_YOUNG → X_MID → X_OLD`) — the step that was missing from
+   * project seeding and left all 376 profiles unlinked.
+   *
+   * `dryRun` returns the plan without writing. `overwrite: false` (default)
+   * only fills links that are still null, so a hand-tuned chain is never
+   * clobbered; `true` rewrites the whole chain from ageLabel.
+   *
+   * Links ONLY — nothing is rendered or invalidated here. Existing anchors stay
+   * exactly as they are; a derived render happens later, when the user approves
+   * a base anchor for a descendant that has none.
+   */
+  async linkChainForCharacter(
+    characterId: string,
+    opts: { dryRun?: boolean; overwrite?: boolean } = {},
+  ) {
+    const dryRun    = opts.dryRun    ?? false;
+    const overwrite = opts.overwrite ?? false;
+
+    const character = await this.prisma.character.findUnique({
+      where:   { id: characterId },
+      include: { profiles: true },
+    });
+    if (!character) throw new NotFoundException(`Character ${characterId} not found`);
+
+    const plan  = buildChain(character.profiles.map((p) => ({
+      id: p.id, profileCode: p.profileCode, ageLabel: p.ageLabel, baseProfileId: p.baseProfileId,
+    })));
+    const byId  = new Map(character.profiles.map((p) => [p.id, p]));
+    const codeOf = (id: string | null) => (id ? byId.get(id)?.profileCode ?? id : '—');
+
+    const warnings = [...plan.warnings];
+    // The graph as it would stand after each accepted change, so a partial
+    // relink cannot close a loop (see wouldCycle — `A → B → A` would make every
+    // approve queue the other state forever).
+    const resulting = new Map(character.profiles.map((p) => [p.id, p.baseProfileId]));
+
+    const changes: Array<{
+      profileId: string; profileCode: string; from: string; to: string; baseProfileId: string | null;
+    }> = [];
+    for (const l of plan.links) {
+      if (!l.changed) continue;
+      // Without overwrite, an existing link is the user's decision — leave it.
+      if (!overwrite && l.profile.baseProfileId !== null) continue;
+      resulting.set(l.profile.id, l.baseProfileId);
+      if (wouldCycle(l.profile.id, resulting)) {
+        resulting.set(l.profile.id, l.profile.baseProfileId);
+        warnings.push(
+          `${l.profile.profileCode}: связь «← ${codeOf(l.baseProfileId)}» пропущена — замкнула бы цикл `
+          + 'с уже проставленной вручную связью; поправьте руками',
+        );
+        continue;
+      }
+      changes.push({
+        profileId:     l.profile.id,
+        profileCode:   l.profile.profileCode,
+        from:          codeOf(l.profile.baseProfileId),
+        to:            codeOf(l.baseProfileId),
+        baseProfileId: l.baseProfileId,
+      });
+    }
+
+    if (!dryRun) {
+      for (const c of changes) {
+        await this.prisma.characterProfile.update({
+          where: { id: c.profileId },
+          data:  { baseProfileId: c.baseProfileId },
+        });
+      }
+      if (changes.length > 0) {
+        this.logger.log(
+          `Chain linked for ${character.code}: `
+          + changes.map((c) => `${c.profileCode} ← ${c.to}`).join(', '),
+        );
+      }
+    }
+
+    return {
+      characterId,
+      characterCode: character.code,
+      dryRun,
+      overwrite,
+      /** Story-time order the chain was built in, for the report. */
+      order:    plan.links.map((l) => `${l.profile.profileCode}${l.age !== null ? ` [${l.age}]` : ''}`),
+      changes,
+      warnings,
+    };
+  }
+
+  /**
+   * Backfill: run linkChainForCharacter over every character that has more than
+   * one profile. Defaults to a dry run — 70 characters is exactly the scale
+   * where you want to read the plan (and its warnings) before writing.
+   */
+  async linkAllChains(opts: { dryRun?: boolean; overwrite?: boolean } = {}) {
+    const dryRun    = opts.dryRun    ?? true;
+    const overwrite = opts.overwrite ?? false;
+
+    const characters = await this.prisma.character.findMany({
+      where:   { profiles: { some: {} } },
+      include: { profiles: { select: { id: true } }, project: { select: { slug: true } } },
+      orderBy: { code: 'asc' },
+    });
+    const multi = characters.filter((c) => c.profiles.length > 1);
+
+    const results = [];
+    for (const c of multi) {
+      const r = await this.linkChainForCharacter(c.id, { dryRun, overwrite });
+      if (r.changes.length === 0 && r.warnings.length === 0) continue;
+      results.push({ projectSlug: c.project?.slug ?? null, ...r });
+    }
+    const linkedCount = results.reduce((n, r) => n + r.changes.length, 0);
+    this.logger.log(
+      `Chain backfill${dryRun ? ' (dry run)' : ''}: ${linkedCount} link(s) across `
+      + `${results.length} of ${multi.length} multi-profile characters`,
+    );
+    return {
+      dryRun,
+      overwrite,
+      charactersScanned:  multi.length,
+      charactersAffected: results.length,
+      linksTotal:         linkedCount,
+      results,
+    };
+  }
+
+  /** Set/clear the base-profile link. Same character only, no self, no cycles. */
+  async setBaseProfile(profileId: string, baseProfileId: string | null) {
+    const profile = await this.prisma.characterProfile.findUnique({ where: { id: profileId } });
+    if (!profile) throw new NotFoundException(`Profile ${profileId} not found`);
+    if (baseProfileId !== null) {
+      if (baseProfileId === profileId) throw new BadRequestException('A profile cannot derive from itself');
+      const base = await this.prisma.characterProfile.findUnique({ where: { id: baseProfileId } });
+      if (!base) throw new NotFoundException(`Base profile ${baseProfileId} not found`);
+      if (base.characterId !== profile.characterId) {
+        throw new BadRequestException('Base profile must belong to the same character (same person, different state)');
+      }
+      // No cycles: walking up from the proposed base must never reach us.
+      let cursor: string | null = baseProfileId;
+      for (let hops = 0; cursor && hops < 20; hops++) {
+        if (cursor === profileId) throw new BadRequestException('Cycle: that profile already derives from this one');
+        cursor = await this.getBaseProfileId(cursor);
+      }
+    }
+    await this.prisma.characterProfile.update({
+      where: { id: profileId },
+      data:  { baseProfileId },
+    });
+    this.logger.log(`Base profile for ${profile.profileCode}: ${baseProfileId ?? 'cleared'}`);
+    return this.getBaseProfileInfo(profileId);
   }
 
   /** Submit the assembled anchor workflow to ComfyUI and mark the job running.
@@ -369,15 +835,21 @@ export class AnchorRenderService {
           await this.failJob(j.id, 'Profile or attached project disappeared mid-render');
           continue;
         }
+        // ACCUMULATE candidates — a re-render adds to the pool, never wipes it
+        // (user 2026-08-03: «догенеривать, а не перезатирать существующие»).
+        // ComfyUI filename counters can restart if its output dir was cleaned,
+        // so a colliding name gets a timestamp prefix instead of overwriting.
         const candDir = anchorCandidateDir(project.slug, profile.profileCode);
-        try { rmSync(candDir, { recursive: true, force: true }); } catch { /* stale candidates */ }
         mkdirSync(candDir, { recursive: true });
         const candidates: string[] = [];
         for (const im of imgs) {
           const src = path.join(COMFY_OUTPUT, im.filename);
           if (!existsSync(src)) continue;
-          copyFileSync(src, path.join(candDir, im.filename));
-          candidates.push(im.filename);
+          const destName = existsSync(path.join(candDir, im.filename))
+            ? `${Date.now()}_${im.filename}`
+            : im.filename;
+          copyFileSync(src, path.join(candDir, destName));
+          candidates.push(destName);
         }
         if (candidates.length === 0) {
           await this.failJob(j.id, `ComfyUI outputs not found under ${COMFY_OUTPUT}`);
@@ -440,6 +912,9 @@ export class AnchorRenderService {
         }
       }
     }
+    // The approval described the file that just went away. Whatever gets
+    // installed next starts unapproved, exactly like a first-time render.
+    await this.clearApproval(profileId);
     if (deleted.length > 0) {
       this.logger.log(`Deleted anchor PNGs for ${profile.profileCode}: ${deleted.join(', ')}`);
     }
@@ -464,6 +939,8 @@ export class AnchorRenderService {
     mkdirSync(destDir, { recursive: true });
     writeFileSync(destPath, buffer);
     this.logger.log(`Uploaded anchor for ${profile.profileCode} → ${destPath} (${buffer.length} bytes)`);
+    // An upload is an approve too — the user hand-picked this exact file.
+    await this.approveAnchor(profileId);
     return destPath;
   }
 
@@ -511,13 +988,20 @@ export class AnchorRenderService {
     const valJobs = await (this.prisma as any).anchorValidationJob.findMany({
       where:   { profileId },
       orderBy: { queuedAt: 'desc' },
-      take:    10,
+      take:    20,
     });
     const lastCompleted = valJobs.find((v: any) => v.status === 'completed') ?? null;
     const valActive     = valJobs.some((v: any) => v.status === 'pending' || v.status === 'running');
-    const verdicts = new Map<string, any>(
-      (Array.isArray(lastCompleted?.result) ? lastCompleted.result : []).map((v: any) => [v.filename, v]),
-    );
+    // Candidates accumulate across renders and each validation pass scores only
+    // its own batch — so verdicts must merge across ALL completed passes
+    // (newest verdict wins per filename), or older batches would show unscored.
+    const verdicts = new Map<string, any>();
+    for (const j of valJobs) {
+      if (j.status !== 'completed') continue;
+      for (const v of (Array.isArray(j.result) ? j.result : [])) {
+        if (v?.filename && !verdicts.has(v.filename)) verdicts.set(v.filename, v);
+      }
+    }
 
     const anchorPath = await this.getAnchorPath(profileId);
     const anchorHash = anchorPath ? this.md5(anchorPath) : null;
@@ -575,7 +1059,49 @@ export class AnchorRenderService {
     mkdirSync(destDir, { recursive: true });
     copyFileSync(src, destPath);
     this.logger.log(`Anchor manually selected for ${profile.profileCode}: ${filename} → ${destPath}`);
+    // Picking a candidate IS the approve — the user looked at the gallery and
+    // chose this portrait.
+    await this.approveAnchor(profileId);
     return { anchorPath: destPath };
+  }
+
+  /**
+   * Mark the currently-installed anchor as approved by the user.
+   *
+   * This is the state that did not exist before 2026-08-11: the validator (and,
+   * for props, plain "first file wins") installs an anchor automatically the
+   * moment a render finishes, so the presence of an anchor.png never meant a
+   * human had seen it. Scene rendering now refuses to run on an unapproved
+   * anchor, and /actions surfaces `approve_anchor` until this is called.
+   *
+   * Approving is also what unblocks the inheritance chain — a derived profile's
+   * render is a Qwen edit of its base's anchor, so the base must be one the user
+   * actually endorsed before descendants are built on top of it.
+   */
+  async approveAnchor(profileId: string): Promise<{ approvedAt: Date }> {
+    const anchor = await this.getAnchorPath(profileId);
+    if (!anchor) {
+      throw new BadRequestException(
+        'No anchor portrait installed for this profile — generate or upload one before approving.',
+      );
+    }
+    const approvedAt = new Date();
+    await this.prisma.characterProfile.update({
+      where: { id: profileId },
+      data:  { anchorApprovedAt: approvedAt },
+    });
+    await this.enqueueDerivedChildren(profileId);
+    return { approvedAt };
+  }
+
+  /** Withdraw approval — used when a new render replaces the installed image,
+   *  and when the anchor is deleted outright. Approval always refers to the
+   *  exact portrait on disk, so a replacement must never inherit it. */
+  private async clearApproval(profileId: string): Promise<void> {
+    await this.prisma.characterProfile.update({
+      where: { id: profileId },
+      data:  { anchorApprovedAt: null },
+    });
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -617,7 +1143,12 @@ export class AnchorRenderService {
     for (const s of styles) {
       const isLoraStack   = s.identityStack === 'lora_face_lock';
       const isAnchorStack = s.identityStack === 'ip_adapter_only' || s.identityStack === 'ip_adapter_plus_style_lora';
-      const ready         = isLoraStack ? hasLora : isAnchorStack ? (anchorPath !== null) : false;
+      // For anchor stacks "ready" means APPROVED, not merely present: an
+      // unapproved anchor is refused by the render service, so calling it ready
+      // would promise something the pipeline then rejects.
+      const ready         = isLoraStack ? hasLora
+        : isAnchorStack ? (anchorPath !== null && profile.anchorApprovedAt !== null)
+        : false;
       readiness[s.id] = {
         ready,
         identityStack: s.identityStack,
@@ -633,6 +1164,8 @@ export class AnchorRenderService {
       profileId:     profile.id,
       profileCode:   profile.profileCode,
       characterCode: profile.character.code,
+      /** When the user signed off on the installed anchor; null = waiting. */
+      anchorApprovedAt: profile.anchorApprovedAt,
       attachedProjects: profile.character.projectLinks.map((l) => ({
         slug:        l.project.slug,
         visualStyle: (l.project as any).visualStyle ?? 'photoreal_cinematic',

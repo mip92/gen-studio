@@ -1,0 +1,34 @@
+{
+  "project": "trucker",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ЛИШНИХ РОВНО 60 КИЛОГРАММОВ ⚖️",
+      "shots": [
+        "C_SH01",
+        "C_SH02",
+        "C_SH03",
+        "C_SH04",
+        "C_SH05",
+        "C_SH06"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "СОРОК ТЫСЯЧ ЗА ОДНУ КОРОБКУ 📦",
+      "shots": [
+        "A4_SH01",
+        "A4_SH03",
+        "A4_SH05",
+        "A4_SH07",
+        "A4_SH08",
+        "A4_SH09",
+        "A4_SH10"
+      ]
+    }
+  ]
+}

@@ -145,7 +145,7 @@ export function registerActionsHandlers(bot: Bot): void {
     try {
       await enqueueSceneRender(shotId);
       await safeAnswer(ctx, { text: '🎨 render в очереди' });
-      await ctx.reply(`🎨 Сцена для шота добавлена в очередь.`, { parse_mode: 'HTML' });
+      await ctx.reply(`🎨 Рендер кадра добавлен в очередь.`, { parse_mode: 'HTML' });
     } catch (err) {
       await safeAnswer(ctx, { text: 'Ошибка' });
       await ctx.reply(`❌ <code>${escapeHtml(String(err).slice(0, 300))}</code>`, { parse_mode: 'HTML' });
@@ -379,7 +379,7 @@ async function openShotView(ctx: Context, shotId: string): Promise<void> {
     headerLines.push(`<i>«${escapeHtml(shot.narrationText.trim().slice(0, 200))}»</i>`);
   }
   headerLines.push(
-    `\n🖼 кадров: ${renders.length}${shot.chosenRender ? ` (✓ выбран)` : ''}`,
+    `\n🖼 картинок: ${renders.length}${shot.chosenRender ? ` (✓ выбрана)` : ''}`,
     `🎬 видео: ${videos.length}${shot.chosenVideoId ? ` (✓ выбрано)` : ''}`,
   );
   await ctx.reply(headerLines.join('\n'), { parse_mode: 'HTML' });
@@ -421,7 +421,7 @@ async function openShotView(ctx: Context, shotId: string): Promise<void> {
       parse_mode: 'HTML', reply_markup: kb,
     });
   } else {
-    const kb = new InlineKeyboard().text('🎨 Запустить рендер сцены', `a:r-scn:${shotId}`);
+    const kb = new InlineKeyboard().text('🎨 Запустить рендер кадра', `a:r-scn:${shotId}`);
     await ctx.reply(`<i>Картинок нет.</i>`, { parse_mode: 'HTML', reply_markup: kb });
   }
 

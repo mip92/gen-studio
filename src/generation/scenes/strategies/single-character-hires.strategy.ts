@@ -48,9 +48,11 @@ export class SingleCharacterHiresSceneStrategy implements SceneStrategy {
       : DEFAULT_NEGATIVE;
     this.set(wf, '4', 'text', negative);
 
-    // Base latent — SDXL native
-    this.set(wf, '5', 'width',      1344);
-    this.set(wf, '5', 'height',     768);
+    // Base latent — SDXL native on the legacy path; the panel shape's gen
+    // bucket (delivered via params) when the shot is planned into a comic
+    // panel. Without panelShape the numbers are the historical hardcodes.
+    this.set(wf, '5', 'width',      params.panelShape ? params.width  : 1344);
+    this.set(wf, '5', 'height',     params.panelShape ? params.height : 768);
     this.set(wf, '5', 'batch_size', params.batchSize ?? 1);
 
     // Base sampler
@@ -58,12 +60,18 @@ export class SingleCharacterHiresSceneStrategy implements SceneStrategy {
     if (params.steps !== undefined) this.set(wf, '6', 'steps', params.steps);
     if (params.cfg   !== undefined) this.set(wf, '6', 'cfg',   params.cfg);
 
-    // Upscale target — keep template's FHD default (1920×1088) unless caller
-    // explicitly requested a larger size. The scene-render service defaults
-    // params.width/height to the SDXL base (1344×768), which would make this
-    // upscale a no-op and defeat the whole point of the hires strategy.
-    if (params.width  && params.width  > 1344) this.set(wf, '20', 'width',  params.width);
-    if (params.height && params.height > 768)  this.set(wf, '20', 'height', params.height);
+    if (params.panelShape && params.hiresWidth && params.hiresHeight) {
+      // Comic panel: hires-fix straight to the shape's still target.
+      this.set(wf, '20', 'width',  params.hiresWidth);
+      this.set(wf, '20', 'height', params.hiresHeight);
+    } else {
+      // Upscale target — keep template's FHD default (1920×1088) unless caller
+      // explicitly requested a larger size. The scene-render service defaults
+      // params.width/height to the SDXL base (1344×768), which would make this
+      // upscale a no-op and defeat the whole point of the hires strategy.
+      if (params.width  && params.width  > 1344) this.set(wf, '20', 'width',  params.width);
+      if (params.height && params.height > 768)  this.set(wf, '20', 'height', params.height);
+    }
 
     // Refiner — same seed
     this.set(wf, '21', 'seed', params.seed);

@@ -78,6 +78,12 @@ export class PipelineBootService implements OnModuleInit {
     // the ledger have no queue entry to reconcile, so nothing above would ever
     // free them. Sweep them once here, using the same ComfyUI-survival test.
     await this.sweepLedgerlessRunningRows(reason);
+
+    // The mirror image of that: rows left `pending` with no queue entry. Those
+    // are worse than a corpse — they are invisible. The dispatcher only ever
+    // reads the ledger, so nothing picks them up, while every readiness gate
+    // reads the row and calls the stage "already in flight". Re-file them.
+    await this.refileLedgerlessPendingRows();
   }
 
   /** True when ComfyUI still has this prompt queued, running, or finished with outputs. */
@@ -106,6 +112,8 @@ export class PipelineBootService implements OnModuleInit {
       ['prop_anchor',       'propAnchorJob',       { status: 'running' }],
       ['validation',        'imageValidationJob',  { status: 'running' }],
       ['anchor_validation', 'anchorValidationJob', { status: 'running' }],
+      ['image_qc',          'imageQcRun',          { status: 'running' }],
+      ['video_qc',          'videoQcRun',          { status: 'running' }],
       ['caption',           'captionJob',          { status: 'running' }],
       ['dataset',           'datasetJob',          { status: 'running' }],
       ['training',          'trainingJob',         { status: { in: ['preparing', 'captioning', 'training'] } }],
@@ -124,5 +132,49 @@ export class PipelineBootService implements OnModuleInit {
       }
     }
     if (swept > 0) this.logger.warn(`Boot: resolved ${swept} pre-ledger running row(s)`);
+  }
+
+  /**
+   * Give a queue entry back to every job row that is `pending` without one.
+   *
+   * Such a row is unreachable in both directions: the dispatcher never sees it
+   * (it reads the ledger), and the readiness gates DO see it and read `pending`
+   * as "someone is already on it", so the work is never re-offered either. It
+   * simply stops existing while looking perfectly healthy in the database.
+   *
+   * Re-filing costs nothing when there is nothing to fix, and `enqueue` is
+   * idempotent per live stage, so this is safe to run on every boot. The
+   * dispatcher does the real work afterwards exactly as it would for a fresh
+   * request — including failing loudly if the stage's inputs are gone, which is
+   * still infinitely better than silence.
+   */
+  private async refileLedgerlessPendingRows(): Promise<void> {
+    const p = this.prisma as any;
+    // Only stages the dispatcher pulls from the ledger. `video_post` reads the
+    // upscale lifecycle of a VideoRender, mirroring queue-source's mapping — and
+    // it runs its own combined graph, so the row's own `workflowFilename` (the
+    // i2v one that produced the clip) would put it in the wrong batch group.
+    const scans: Array<{ jobType: string; delegate: string; where: Record<string, unknown>; workflow?: string }> = [
+      { jobType: 'scene',      delegate: 'sceneRenderJob',  where: { status: 'pending' } },
+      { jobType: 'video',      delegate: 'videoRender',     where: { status: 'pending' } },
+      { jobType: 'video_post', delegate: 'videoRender',     where: { upscaleStatus: 'pending' }, workflow: 'video_upscale_interp_api.json' },
+      { jobType: 'tts',        delegate: 'tTSJob',          where: { status: 'pending' } },
+      { jobType: 'bgm',        delegate: 'audioRenderJob',  where: { status: 'pending' } },
+      { jobType: 'anchor',     delegate: 'anchorRenderJob', where: { status: 'pending' } },
+    ];
+
+    let refiled = 0;
+    for (const { jobType, delegate, where, workflow } of scans) {
+      const rows = await p[delegate].findMany({ where }).catch(() => []);
+      for (const row of rows) {
+        if (await this.ledger.findLive(jobType as any, row.id)) continue;
+        await this.ledger.enqueue(jobType as any, row.id, {
+          workflowFilename: workflow ?? (typeof row.workflowFilename === 'string' ? row.workflowFilename : undefined),
+        });
+        this.logger.warn(`Boot: re-filed ledgerless ${jobType} row ${row.id}`);
+        refiled++;
+      }
+    }
+    if (refiled > 0) this.logger.warn(`Boot: re-filed ${refiled} invisible pending row(s) into the queue`);
   }
 }

@@ -15,14 +15,18 @@ interface QueueRowDto {
   jobId:         string;
   attemptNumber: number;
   status:        string;
-  /** What is being worked on ("SH014B ↑FHD⏩FPS", "🎵 act_03"). */
+  /** What is being worked on ("SH014B ↑FHD⏩FPS", "🎵 bgm_finale" — for bgm the label is the block slug). */
   label:         string;
-  /** Where it sits — scene title, character code, music block. */
+  /** Where it sits — act key (Scene.sceneKey), character code, or music block slug. */
   context:       string | null;
   projectSlug:   string | null;
   projectId:     string | null;
   shotId:        string | null;
   profileCode:   string | null;
+  /** Music block slug for bgm rows — the deep-link target of the track page. */
+  blockSlug:     string | null;
+  /** MusicSegment UUID for bgm rows — anchors the link to the exact tile. */
+  segmentId:     string | null;
   /** Batching group (workflow/model identity) this job belongs to. */
   groupKey:      string;
   rank:          number;
@@ -269,6 +273,8 @@ export class PipelineController {
       projectId:     e.projectId,
       shotId:        e.shotId,
       profileCode:   e.profileCode,
+      blockSlug:     e.blockSlug,
+      segmentId:     e.segmentId,
       groupKey:      e.groupKey,
       rank:          Number(e.rank),
       position:      positions.get(e.id) ?? null,

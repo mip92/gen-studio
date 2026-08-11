@@ -63,6 +63,67 @@ export class ProfilesController {
     return this.chars.deleteLora(profileId, filename);
   }
 
+  // ── Anchor inheritance (derived profiles: same person, aged/changed) ───────
+
+  @Get(':profileId/base-profile')
+  @ApiOperation({
+    summary: 'Base-profile link of this profile + selectable sibling profiles',
+    description: 'A profile with a base link renders its anchor as a Qwen-Image-Edit of the base profile\'s '
+      + 'anchor ("the same person, matching this profile\'s promptBase") so age/state variants keep the face. '
+      + 'Options list the character\'s other profiles with their anchor status.',
+  })
+  getBaseProfile(@Param('profileId') profileId: string) {
+    return this.anchor.getBaseProfileInfo(profileId);
+  }
+
+  @Get(':profileId/chain')
+  @ApiOperation({
+    summary: 'Anchor-inheritance chain of this profile\'s character, in story-time order',
+    description: 'One entry per state: age (+ where the age came from), base link, whether the anchor is '
+      + 'installed, how many shots reference it, and whether an anchor render is allowed right now '
+      + '(canRenderAnchor / blockedReason — a derived state cannot render before its donor is approved). '
+      + '`chainLinked: false` means the states are still unlinked and would render as unrelated faces.',
+  })
+  getChain(@Param('profileId') profileId: string) {
+    return this.anchor.getProfileChain(profileId);
+  }
+
+  @Post(':profileId/link-chain')
+  @ApiOperation({
+    summary: 'Link this profile\'s character into an age-ordered inheritance chain',
+    description: 'Orders the character\'s profiles by ageLabel (first integer; code suffix only when the '
+      + 'label has no digits) and points each state at the previous one. `dryRun` returns the plan; '
+      + '`overwrite: false` (default) fills only empty links so a hand-tuned chain survives. '
+      + 'Links ONLY — nothing is rendered, no existing anchor is invalidated.',
+  })
+  async linkChain(
+    @Param('profileId') profileId: string,
+    @Body() body: { dryRun?: boolean; overwrite?: boolean },
+  ) {
+    const profile = await this.chars.findProfileById(profileId);
+    return this.anchor.linkChainForCharacter(profile.characterId, {
+      dryRun:    body?.dryRun    === true,
+      overwrite: body?.overwrite === true,
+    });
+  }
+
+  @Patch(':profileId/base-profile')
+  @ApiOperation({
+    summary: 'Set or clear the base-profile link (baseProfileId: uuid | null)',
+    description: 'Base must be another profile of the SAME character; self-links and cycles are rejected. '
+      + 'Clearing (null) returns the profile to independent text-to-image anchor rendering.',
+  })
+  setBaseProfile(
+    @Param('profileId') profileId: string,
+    @Body() body: { baseProfileId?: string | null },
+  ) {
+    const v = body?.baseProfileId;
+    if (v !== null && v !== undefined && typeof v !== 'string') {
+      throw new BadRequestException('baseProfileId must be a profile uuid or null');
+    }
+    return this.anchor.setBaseProfile(profileId, (v ?? null) as string | null);
+  }
+
   // ── Anchor portrait (cartoon-style identity) ───────────────────────────────
 
   @Post(':profileId/generate-anchor')
@@ -187,6 +248,20 @@ export class ProfilesController {
     const filename = (body?.filename ?? '').trim();
     if (!filename) throw new BadRequestException('filename is required');
     return this.anchor.selectCandidate(profileId, filename);
+  }
+
+  @Post(':profileId/anchor/approve')
+  @ApiOperation({
+    summary: 'Approve the installed anchor portrait',
+    description:
+      "The vision validator installs its own pick as soon as a render finishes, so an installed "
+      + 'anchor.png only means the machine produced one. This is the user signing off on it. '
+      + 'Until it is called the profile shows up on /actions as approve_anchor, every shot the '
+      + 'character appears in refuses to render, and derived age-states stay blocked. '
+      + 'Picking a candidate via /anchor/select or uploading a file approves implicitly.',
+  })
+  approveAnchor(@Param('profileId') profileId: string) {
+    return this.anchor.approveAnchor(profileId);
   }
 
   @Delete(':profileId/anchor')

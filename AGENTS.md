@@ -33,7 +33,7 @@ projects.
    - Project-wide → new column on `Project` (e.g. `defaultVideoNegative`)
      or a key in `Project.settings` JSON
    - Per shot → new key in `Shot.promptFields` JSON (e.g. `motionNegative`)
-   - Per scene/act → new column on `Scene` (e.g. `lightingMood`)
+   - Per act → new column on `Scene` (a Scene row = one act; e.g. `lightingMood`)
 2. The render service reads the DB value and calls
    `set('<nodeId>', 'text', value)` on the workflow clone at render time —
    exactly like `set('9', 'text', motionPrompt)` already does for the
@@ -53,8 +53,10 @@ projects.
   overrides, all editable from the UI.
 - `Location.description` (added 2026-05-24) → prepended to positive by
   `SceneRenderService` via `$queryRaw` lookup.
-- `Scene.lightingMood`, `Scene.defaultPaletteKey`, `Scene.defaultTimeOfDay` →
-  act-level defaults that shots inherit when their per-shot field is null.
+- ~~`Scene.lightingMood`, `Scene.defaultPaletteKey`, `Scene.defaultTimeOfDay`~~ —
+  NO LONGER data-driven: the composer that read them was removed 2026-07-04
+  (renderer uses `pf.positive` verbatim). The columns remain as seeded planning
+  metadata with zero backend readers.
 - `CharacterProfile.promptBase`, `promptAngles`, `promptVariety`, `negative`,
   `triggerToken` → dataset-generator inputs, fully editable.
 
@@ -131,16 +133,15 @@ template from the first attached project — see Phase 2 path-helper in
 
 ## 6. Render-pipeline conventions
 
-### 6.1 SDXL scene rendering — `SceneRenderService.renderShot`
+### 6.1 Shot image rendering — `SceneRenderService.renderShot`
+(the service is named "Scene*" for historical reasons; it renders ONE SHOT)
 
 Resolves positive in this order:
-1. `Shot.promptFields.positive` (verbatim if non-empty)
-2. Otherwise composes from `pf.narrativeBeat`, `pf.frameDescription`,
-   `pf.positiveEnvironment`, `pf.positiveCharacterLocks`, `Scene.lightingMood`
-3. Prepends `Location.description` (looked up via `$queryRaw` on
+1. `Shot.promptFields.positive` (verbatim; empty → `BadRequestException` —
+   the multi-field composer (`narrativeBeat`/`frameDescription`/`lightingMood`)
+   was removed 2026-07-04).
+2. Prepends `Location.description` (looked up via `$queryRaw` on
    `Shot.locationId`).
-4. Prepends a camera framing directive translated from `pf.camera.framing`
-   when the prompt has no shot size baked in.
 
 Negative resolution: `pf.negative || project.defaultNegative`, then
 `sanitizeNegative` (strips dangerous tokens like `motion blur`,
@@ -182,8 +183,9 @@ hints) — not to numeric pipeline parameters.
 
 ## 7. Strategy / workflow selection
 
-`SceneFactory.pickByParticipantCount(n)` picks a workflow strategy based on
-how many characters are in the shot:
+`SceneFactory.pickByStyleAndParticipantCount(style, n)` (the old
+`pickByParticipantCount(n)` is `@deprecated`) picks a workflow strategy based
+on the project's visual style and how many characters are in the shot:
 
 - 0 → environment workflow (no LoRA)
 - 1 → single-character workflow
@@ -249,7 +251,7 @@ must be English.
 ```
 src/
   projects/          REST + service for Project rows
-  scenes/            Scene rows (acts) — owns lightingMood, defaultPalette
+  scenes/            Scene rows (acts) — CRUD; lightingMood/defaultPalette are dead metadata
   shots/             Shot rows + the standalone /shots controller
   characters/        Character + CharacterProfile + library endpoints
   locations/         Location CRUD (added 2026-05-24)

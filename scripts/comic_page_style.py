@@ -30,6 +30,24 @@ from PIL import Image, ImageDraw, ImageFilter, ImageChops
 RectPx = Tuple[int, int, int, int]  # (x, y, w, h)
 
 
+def parse_color(value) -> Optional[Tuple[int, int, int]]:
+    """'#rrggbb' / (r,g,b) → (r,g,b), None on anything malformed — a bad value
+    stored in project settings must never crash a render."""
+    if isinstance(value, (tuple, list)) and len(value) == 3:
+        try:
+            return tuple(max(0, min(255, int(c))) for c in value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, str):
+        s = value.strip().lstrip("#")
+        if len(s) == 6:
+            try:
+                return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                return None
+    return None
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _radial_vignette(size: Tuple[int, int], strength: float) -> Image.Image:
     """L-mode mask: ~255 centre → darker toward the corners. `strength` 0..1 =
@@ -112,10 +130,25 @@ class PageStyle(ABC):
     @abstractmethod
     def render_background(self, size: Tuple[int, int], texture_path: Optional[str],
                           seed: int, panels_px: Optional[List[RectPx]] = None,
-                          progress: Optional[float] = None) -> Image.Image: ...
+                          progress: Optional[float] = None,
+                          desk_props: Optional[List[dict]] = None,
+                          desk_color=None,
+                          desk_img: Optional[Image.Image] = None) -> Image.Image: ...
 
     @abstractmethod
-    def draw_frame(self, draw: "ImageDraw.ImageDraw", rect_px: RectPx, seed: int) -> None: ...
+    def draw_frame(self, draw: "ImageDraw.ImageDraw", rect_px: RectPx, seed: int,
+                   canvas_w: Optional[int] = None,
+                   out_limits: Optional[Tuple[int, int, int, int]] = None) -> None: ...
+
+    def frame_geometry(self, rect_px: RectPx, seed: int,
+                       canvas_w: Optional[int] = None,
+                       out_limits: Optional[Tuple[int, int, int, int]] = None
+                       ) -> Optional[List[Tuple[int, int, int, int]]]:
+        """The panel border as a list of FILLED bars [(x0,y0,x1,y1), ...] in the
+        same pixel space as `rect_px`, or None for styles that only know how to
+        draw. Lets comic_pagebuild.render_panel_frame paint the exact same frame
+        into a small stand-alone canvas at an arbitrary raster."""
+        return None
 
     def overlay(self, size: Tuple[int, int], panels_px: List[RectPx],
                 seed: int) -> Optional[Image.Image]:
@@ -128,29 +161,49 @@ class OldComicPageStyle(PageStyle):
 
     PAPER = (238, 226, 196)     # warm aged-paper base
     INK   = (24, 20, 16)        # not pure black — sooty ink
-    DESK  = (34, 28, 22)        # dark wood/desk the open book lies on
+    # Default desk wood. Was near-black (34,28,22) — «выглядит максимально плохо»
+    # (user 2026-08-01); now a readable mid-brown, overridable per project via
+    # settings.comicDeskColor → manifest desk_color.
+    DESK  = (104, 78, 52)
     EDGE  = (206, 190, 156)     # cut page-block edge (a touch darker than PAPER)
     EDGE_LINE = (120, 104, 78)  # crisp page-boundary line against the desk
 
-    def _wood(self, size, seed):
-        """Dark wooden desk the open book lies on: long horizontal grain fibres +
-        a few plank seams, kept dark so the pages pop off it."""
+    def _wood(self, size, seed, desk=None, metric_h=None, y0=0):
+        """Wooden desk the open book lies on: long horizontal grain fibres +
+        a few plank seams, kept darker than the paper so the pages pop off it.
+
+        `metric_h`/`y0` exist for the OVERSCAN desk underlay (render_desk_underlay):
+        the underlay is generated k× larger than the sheet, so plank width and
+        spacing must be sized from the SHEET height (`metric_h`) and the plank
+        pattern anchored at the sheet's top edge inside the big canvas (`y0`) —
+        the DOWNWARD rng sequence then reproduces exactly the planks a plain
+        sheet-sized render would draw, and extra planks are filled in upward with
+        FRESH rng draws (positions a sheet render never consumed). Defaults render
+        bit-identically to the historical output."""
         w, h = size
-        base = Image.new("RGB", (w, h), self.DESK)
+        mh = int(metric_h or h)
+        desk = tuple(desk) if desk else self.DESK
+        base = Image.new("RGB", (w, h), desk)
         # grain fibres: thin vertical noise stretched wide → long horizontal streaks
         small = Image.effect_noise((max(1, w // 8), h), 30).convert("L")
         fib = small.resize((w, h)).filter(ImageFilter.GaussianBlur(1))
         wood = Image.merge("RGB", [
-            fib.point(lambda v, i=i: max(0, min(255, int(self.DESK[i] + (v - 128) * 0.5))))
+            fib.point(lambda v, i=i: max(0, min(255, int(desk[i] + (v - 128) * 0.5))))
             for i in range(3)])
         base = Image.blend(base, wood, 0.6)
         # plank seams: horizontal darker lines at jittered intervals
         d = ImageDraw.Draw(base); rng = _Rng(seed or 7)
-        seam = (max(0, self.DESK[0] - 16), max(0, self.DESK[1] - 13), max(0, self.DESK[2] - 10))
-        y = int(h * rng.rf(0.05, 0.15))
+        seam = (max(0, desk[0] - 16), max(0, desk[1] - 13), max(0, desk[2] - 10))
+        lw = max(2, mh // 500)
+        y = y0 + int(mh * rng.rf(0.05, 0.15))
         while y < h:
-            d.line([(0, y), (w, y)], fill=seam, width=max(2, h // 500))
-            y += int(h * rng.rf(0.16, 0.26))
+            d.line([(0, y), (w, y)], fill=seam, width=lw)
+            y += int(mh * rng.rf(0.16, 0.26))
+        # continue the pattern ABOVE the sheet region (underlay only: y0 > 0)
+        y = y0 - int(mh * rng.rf(0.16, 0.26))
+        while y > 0:
+            d.line([(0, y), (w, y)], fill=seam, width=lw)
+            y -= int(mh * rng.rf(0.16, 0.26))
         return base
 
     def _paper_fill(self, size, texture_path, seed):
@@ -168,20 +221,38 @@ class OldComicPageStyle(PageStyle):
         pg = Image.blend(pg, Image.new("RGB", (w, h), self.PAPER), 0.25)
         return pg
 
-    def render_background(self, size, texture_path, seed, panels_px=None, progress=None):
+    def render_background(self, size, texture_path, seed, panels_px=None, progress=None,
+                          desk_props=None, desk_color=None, desk_img=None):
         """Open-book spread: dark desk, two near-full-sheet paper pages with a
         VISIBLE cut edge (thickness) + drop shadow + crisp boundary line, and a
         SOFT central binding shadow (smooth bell — never a hard black bar).
 
+        `desk_img` (optional) — a pre-rendered desk to lay the book on instead of
+        a fresh `_wood()`. The overscan underlay flow passes the CENTRE CROP of
+        the big desk here, so the sheet's own desk is literally a window into the
+        underlay layer below it and the boundary between the two is invisible.
+
         `progress` (0..1, optional) = how far through the book this spread sits.
         It redistributes the side stacks — read sheets pile up on the LEFT, unread
         ones shrink on the RIGHT — so the book no longer looks permanently opened
-        at its middle. None keeps the legacy symmetric mid-book look."""
+        at its middle. None keeps the legacy symmetric mid-book look.
+
+        `desk_props` (optional) — objects lying on the desk around the book (see
+        comic_desk_props). Drawn right after the wood so the pages, fans and
+        shadows overlap them — they read as tucked under the journal."""
         w, h = size
         boxes, mid = _page_boxes(panels_px, w, h)
         paper = self._paper_fill((w, h), texture_path, seed)
 
-        bg = self._wood((w, h), seed)                 # wooden desk under the book
+        if desk_img is not None:                     # desk under the book
+            bg = desk_img if desk_img.size == (w, h) \
+                else desk_img.resize((w, h), Image.LANCZOS)
+            bg = bg.convert("RGB")
+        else:
+            bg = self._wood((w, h), seed, desk=parse_color(desk_color))
+        if desk_props:
+            from comic_desk_props import paste_props
+            paste_props(bg, (w, h), desk_props, seed)
         thick = max(5, int(min(w, h) * 0.009))       # page-block thickness
         go = max(4, int(min(w, h) * 0.012))          # drop-shadow spread
 
@@ -241,22 +312,26 @@ class OldComicPageStyle(PageStyle):
             K = 7                                  # one fewer stacked leaf (user 2026-07-24)
             Nb = 26
             # REAL PAGE COUNT (user 2026-08-01): split a fixed total of 2K visible
-            # sheets between the stacks by `progress` — first spread ≈ 1 left / 13
-            # right, last ≈ the reverse. Legacy (progress=None) stays 7/7.
+            # sheets between the stacks by `progress` — the FIRST spread has NO
+            # left stack (the open page IS page one — with even one sheet under it
+            # the film read as starting on page two, user), the last has no right
+            # stack. Legacy (progress=None) stays 7/7.
             if progress is None:
                 kL = kR = K
             else:
                 p01 = max(0.0, min(1.0, float(progress)))
                 tot = 2 * K
-                kL = max(1, min(tot - 1, 1 + int(round((tot - 2) * p01))))
+                kL = max(0, min(tot, int(round(tot * p01))))
                 kR = tot - kL
             room_R = max(0, (w - dm) - xR)
             room_L = max(0, xL - dm)
             fL, fR = kL / K, kR / K                # 1.0 = the legacy mid-book stack
             oR = xR + int(room_R * min(0.9, 0.55 * fR))   # outermost sheet x (right / left)
             oL = xL - int(room_L * min(0.9, 0.55 * fL))
-            footL = max(3, int(foot * min(1.0, max(0.3, fL))))  # per-stack fore-edge depth
-            footR = max(3, int(foot * min(1.0, max(0.3, fR))))
+            # per-stack fore-edge depth; an EMPTY stack has none — the open page
+            # lies flat on the desk there.
+            footL = max(3, int(foot * min(1.0, max(0.3, fL)))) if kL else 0
+            footR = max(3, int(foot * min(1.0, max(0.3, fR)))) if kR else 0
 
             # bottom band drop-shadow + paper fill: thick under each stack in
             # proportion to ITS sheet count, pinching to the spine. Drawn first so
@@ -287,7 +362,7 @@ class OldComicPageStyle(PageStyle):
             # (spine). Paper, not wood.
             for (edge_x, sign, room, kS, footS, oS) in (
                     (xR, +1, room_R, kR, footR, oR), (xL, -1, room_L, kL, footL, oL)):
-                if room <= 8:
+                if kS <= 0 or room <= 8:
                     continue
                 riseS = int(footS * 1.15)          # staircase drop below this corner
                 extent = abs(oS - edge_x)          # this stack's horizontal spread
@@ -314,27 +389,52 @@ class OldComicPageStyle(PageStyle):
                     d.line(path, fill=PAGE_LINE, width=lwl)
         return bg
 
-    def draw_frame(self, draw, rect_px, seed):
+    def draw_frame(self, draw, rect_px, seed, canvas_w=None, out_limits=None):
         """CRISP marker-style panel border: each side is a FILLED rectangle
         straddling the panel edge (hard edges — no anti-alias fuzz, no curve-joint
         blur), so it stays sharp when the camera zooms in and laps slightly onto
         the video. Slight per-side thickness variance keeps a felt-tip feel without
-        looking soft or wobbly."""
+        looking soft or wobbly.
+
+        Thickness is CONSTANT per sheet (canvas_w * 0.005 ≈ the classic grid's
+        historical nib) — sizing it from the panel made small panels get thin
+        frames on mixed-size template pages (user 2026-08-01: «рамка всегда
+        должна быть одной ширины»). canvas_w=None keeps the legacy per-panel
+        formula for any caller that doesn't pass the sheet width.
+
+        `out_limits` (top, bottom, left, right, px) caps how far each side may
+        stick OUTWARD past the panel edge — half the clear gutter to the nearest
+        neighbour (user 2026-08-06: «рамки залазят друг на друга»). The bar keeps
+        its full thickness by lapping further INWARD onto its own footage instead,
+        so two frames meeting in a tight gutter butt at the middle and never cover
+        the neighbour's picture. None = legacy behaviour (half in, half out)."""
+        for bar in self.frame_geometry(rect_px, seed, canvas_w, out_limits):
+            draw.rectangle(list(bar), fill=self.INK)
+
+    def frame_geometry(self, rect_px, seed, canvas_w=None, out_limits=None):
         x, y, w, h = rect_px
         rng = _Rng(seed ^ (x * 73856093) ^ (y * 19349663))
-        t = max(4, int(min(w, h) * 0.024))        # bold nib
-        def bar(x0, y0, x1, y1):
-            draw.rectangle([x0, y0, x1, y1], fill=self.INK)
+        t = max(4, int(canvas_w * 0.005)) if canvas_w else max(4, int(min(w, h) * 0.024))
         tt = int(t * rng.rf(0.9, 1.1)); tb = int(t * rng.rf(0.9, 1.1))
         tl = int(t * rng.rf(0.9, 1.1)); tr = int(t * rng.rf(0.9, 1.1))
-        bar(x - tl // 2, y - tt // 2, x + w + tr // 2, y + tt - tt // 2)          # top
-        bar(x - tl // 2, y + h - tb // 2, x + w + tr // 2, y + h + tb - tb // 2)  # bottom
-        bar(x - tl // 2, y - tt // 2, x + tl - tl // 2, y + h + tb - tb // 2)     # left
-        bar(x + w - tr // 2, y - tt // 2, x + w + tr - tr // 2, y + h + tb - tb // 2)  # right
+        # outward halves (legacy: half the bar), clamped by the gutter allowance
+        ot = tt // 2; ob = tb - tb // 2; ol = tl // 2; orr = tr - tr // 2
+        if out_limits is not None:
+            lt, lb, ll, lr = out_limits
+            ot = min(ot, max(0, lt)); ob = min(ob, max(0, lb))
+            ol = min(ol, max(0, ll)); orr = min(orr, max(0, lr))
+        return [
+            (x - ol, y - ot, x + w + orr, y - ot + tt),            # top
+            (x - ol, y + h + ob - tb, x + w + orr, y + h + ob),    # bottom
+            (x - ol, y - ot, x - ol + tl, y + h + ob),             # left
+            (x + w + orr - tr, y - ot, x + w + orr, y + h + ob),   # right
+        ]
+
+    VIGNETTE = 0.42   # sheet corner darkening; render_desk_underlay continues it
 
     def overlay(self, size, panels_px, seed):
         w, h = size
-        vig = _radial_vignette((w, h), strength=0.42)
+        vig = _radial_vignette((w, h), strength=self.VIGNETTE)
         # RGBA where alpha darkens toward the corners (multiply-like feel)
         ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         alpha = vig.point(lambda v: 255 - v)          # bright centre → 0 alpha
@@ -342,16 +442,78 @@ class OldComicPageStyle(PageStyle):
         return ov
 
 
+# ── overscan desk underlay ─────────────────────────────────────────────────────
+def render_desk_underlay(style_name: str, *, width: int, height: int, k: float,
+                         seed: int, desk_color=None, sheet_supersample: int = 3,
+                         density: int = 2) -> Tuple[Optional[Image.Image], Optional[Image.Image]]:
+    """(underlay, sheet_desk) for the camera-overrun protection layer.
+
+    The camera regularly looks PAST the sheet — mid-travel zoom-dip, the 3.5° roll,
+    and any hold on an edge panel (view half-width 1/(2z) beyond cx) — and beyond
+    the sheet PNG there is only black (user 2026-08-06: «стол очень короткий, по
+    бокам чёрные края»). This renders ONE continuous wooden desk k× the sheet in
+    each dimension and returns:
+
+      - `underlay`  — the full big desk (at `density`× canvas resolution, i.e.
+        deliberately below sheet quality: it is only ever seen as out-of-focus desk
+        far from the book), with the sheet's radial vignette CONTINUED outward, to
+        be placed on its own CapCut track BELOW the sheet at scale z·k;
+      - `sheet_desk` — the centre crop of the SAME wood, upscaled to the sheet
+        raster, to be passed to render_page(desk_img=…) so the sheet's own desk is
+        a literal window into the underlay: grain and plank seams line up and the
+        layer boundary is invisible.
+
+    Returns (None, None) for styles without a desk (plain)."""
+    style = get_style(style_name)
+    if not isinstance(style, OldComicPageStyle) or k <= 1.001:
+        return None, None
+    cw, ch = width * density, height * density            # sheet region, underlay raster
+    W, H = int(round(cw * k)), int(round(ch * k))
+    x0, y0 = (W - cw) // 2, (H - ch) // 2
+    # plank metric + phase anchored to the sheet region so the crop reproduces the
+    # exact planks a plain sheet render would draw (page turns render their own
+    # sheet-sized desks with the same seed and must not visibly jump).
+    wood = style._wood((W, H), seed, desk=parse_color(desk_color),
+                       metric_h=ch, y0=y0)
+    sheet_desk = wood.crop((x0, y0, x0 + cw, y0 + ch))
+    if sheet_supersample != density:
+        sheet_desk = sheet_desk.resize(
+            (width * sheet_supersample, height * sheet_supersample), Image.LANCZOS)
+    # Continue the sheet's vignette outward. PIL's radial gradient is ~linear in
+    # radius and normalised to ITS OWN corners; multiplying the value by k
+    # re-normalises the radius to the SHEET's corners, so at the sheet boundary the
+    # underlay is exactly as dark as the sheet's own overlay() and keeps falling
+    # beyond it — no brightness step at the layer edge.
+    dark = int(255 * (1.0 - style.VIGNETTE))
+    grad = Image.radial_gradient("L").resize((W, H)).point(
+        lambda v: min(255, int(v * k)))
+    alpha = grad.point(lambda v: int(v * (255 - dark) / 255))
+    shade = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    shade.putalpha(alpha)
+    under = wood.convert("RGBA")
+    under.alpha_composite(shade)
+    return under.convert("RGB"), sheet_desk
+
+
 # ── minimal fallback (used by the Phase-0 skeleton / tests) ────────────────────
 class PlainPageStyle(PageStyle):
     key = "plain"
 
-    def render_background(self, size, texture_path, seed, panels_px=None, progress=None):
+    def render_background(self, size, texture_path, seed, panels_px=None, progress=None,
+                          desk_props=None, desk_color=None, desk_img=None):
         return Image.new("RGB", size, (210, 210, 210))
 
-    def draw_frame(self, draw, rect_px, seed):
+    def draw_frame(self, draw, rect_px, seed, canvas_w=None, out_limits=None):
         x, y, w, h = rect_px
         draw.rectangle([x, y, x + w, y + h], outline=(20, 20, 20), width=8)
+
+    INK = (20, 20, 20)
+
+    def frame_geometry(self, rect_px, seed, canvas_w=None, out_limits=None):
+        x, y, w, h = rect_px
+        t = 8  # matches draw_frame's outline width (drawn inward from the edge)
+        return [(x, y, x + w, y + t), (x, y + h - t, x + w, y + h),
+                (x, y, x + t, y + h), (x + w - t, y, x + w, y + h)]
 
 
 class _Rng:

@@ -15,6 +15,18 @@ const COMFY_LAUNCH_ARGS = (process.env.COMFY_LAUNCH_ARGS ?? '--fast --enable-man
 const COMFY_START_TIMEOUT_MS = 120_000;   // cold start ~ 30-60s; allow 2 min buffer
 const COMFY_START_POLL_MS    = 2_000;
 
+const OLLAMA_BASE = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
+// Absolute by default rather than relying on PATH: `ollama` does resolve in an
+// interactive shell here, but a service spawned by the backend does not
+// necessarily inherit the same PATH, and this is the one place where getting it
+// wrong is silent.
+const OLLAMA_BIN  = process.env.OLLAMA_BIN ?? 'W:\\Programs\\Ollama\\app\\ollama.exe';
+// Serving the API is quick (the slow part is loading a model, which happens on
+// the first request, not here), but the Windows app adds a few seconds of
+// indirection before it binds the port.
+const OLLAMA_START_TIMEOUT_MS = 60_000;
+const OLLAMA_START_POLL_MS    = 1_000;
+
 /**
  * Single point of control for OS-level process lifecycle of GPU consumers:
  *   - ComfyUI (python main.py …, port 8188)
@@ -135,6 +147,51 @@ export class EngineService {
   }
 
   // ── Ollama (vision validation) ──────────────────────────────────────────────
+
+  /** True when the local Ollama server answers its API. */
+  async isOllamaAlive(): Promise<boolean> {
+    try {
+      const res = await fetch(`${OLLAMA_BASE}/api/tags`, { signal: AbortSignal.timeout(5_000) });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Bring the Ollama server up, mirroring {@link startComfy}.
+   *
+   * Until 2026-08-10 nothing ever started it: `prepareEngine` dutifully stopped
+   * ComfyUI for an `ollama`-class job and then called the API on faith. With the
+   * server down that is an instant `fetch failed`, and the job died without ever
+   * touching the GPU — six thumbnail-idea jobs went that way in one minute, and
+   * the same failure is in the ledger from 03.08 and 08.08. ComfyUI had this
+   * lifecycle from the start; Ollama simply never got its half.
+   *
+   * No-op when already alive. Launching the binary on Windows wakes the Ollama
+   * app, which binds the port itself — so a "port already in use" exit from our
+   * spawn is success, not failure, and we decide purely on the health check.
+   */
+  async startOllama(): Promise<{ alreadyAlive: boolean }> {
+    if (await this.isOllamaAlive()) return { alreadyAlive: true };
+    if (!existsSync(OLLAMA_BIN)) {
+      throw new Error(`startOllama: binary not found: ${OLLAMA_BIN} (set OLLAMA_BIN)`);
+    }
+
+    this.logger.log(`startOllama: spawning ${OLLAMA_BIN} serve`);
+    const proc = spawn(OLLAMA_BIN, ['serve'], { detached: true, stdio: 'ignore', windowsHide: true });
+    proc.unref();
+
+    const deadline = Date.now() + OLLAMA_START_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await sleep(OLLAMA_START_POLL_MS);
+      if (await this.isOllamaAlive()) {
+        this.logger.log('startOllama: alive');
+        return { alreadyAlive: false };
+      }
+    }
+    throw new Error(`startOllama: timeout — /api/tags did not respond within ${OLLAMA_START_TIMEOUT_MS}ms`);
+  }
 
   /**
    * Ask the local Ollama server to unload any resident model (keep_alive:0), so

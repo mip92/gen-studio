@@ -950,6 +950,48 @@ export class QueueLedgerService {
           label:       '💬 субтитры',
         };
       }
+      // Project-scoped like 'caption' — one video-QC batch per project run.
+      case 'video_qc': {
+        const j = await (this.prisma as any).videoQcRun.findUnique({ where: { id: jobId } });
+        const project = j?.projectId
+          ? await this.prisma.project.findUnique({ where: { id: j.projectId } })
+          : null;
+        return {
+          projectId:   project?.id   ?? j?.projectId ?? null,
+          projectSlug: project?.slug ?? null,
+          projectName: project?.name ?? null,
+          visualStyle: (project as any)?.visualStyle ?? null,
+          label:       `🎞✅ проверка видео ×${j?.totalClips ?? '?'}`,
+        };
+      }
+      // Project-scoped like 'caption' — one image-QC batch per project run.
+      case 'image_qc': {
+        const j = await (this.prisma as any).imageQcRun.findUnique({ where: { id: jobId } });
+        const project = j?.projectId
+          ? await this.prisma.project.findUnique({ where: { id: j.projectId } })
+          : null;
+        return {
+          projectId:   project?.id   ?? j?.projectId ?? null,
+          projectSlug: project?.slug ?? null,
+          projectName: project?.name ?? null,
+          visualStyle: (project as any)?.visualStyle ?? null,
+          label:       `🖼✅ проверка кадров ×${j?.totalImages ?? '?'}`,
+        };
+      }
+      // Project-scoped like 'caption' — one VO-QC batch per project run.
+      case 'vo_validation': {
+        const j = await (this.prisma as any).voValidationRun.findUnique({ where: { id: jobId } });
+        const project = j?.projectId
+          ? await this.prisma.project.findUnique({ where: { id: j.projectId } })
+          : null;
+        return {
+          projectId:   project?.id   ?? j?.projectId ?? null,
+          projectSlug: project?.slug ?? null,
+          projectName: project?.name ?? null,
+          visualStyle: (project as any)?.visualStyle ?? null,
+          label:       `🎙✅ проверка озвучки ×${j?.totalJobs ?? '?'}`,
+        };
+      }
       // Project-scoped like 'caption'; the idea text is the only useful label.
       case 'thumbnail': {
         const j = await (this.prisma as any).thumbnailJob.findUnique({ where: { id: jobId } });

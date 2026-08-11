@@ -93,6 +93,20 @@ model Project {
   /// (no more render/upscale/FPS/TTS nagging — the deliverable already shipped).
   /// Null = still in production. Set/cleared from the project overview page.
   youtubeUrl                String?
+  /// Release calendar instant (naive column = UTC, DB-wide convention).
+  /// youtubeUrl set  → FACTUAL publish time, owned by the YouTube backfill sync
+  ///                   (ReleaseBackfillService) and locked from hand edits.
+  /// youtubeUrl null → PLANNED slot (Tue/Thu 13:00 channel wall clock default).
+  /// Null = not scheduled. NEVER feeds queuePriorityTier — the calendar is
+  /// informational only; render priority stays a manual queue decision.
+  releaseAt                 DateTime?
+  /// Opt-in gate for VO validation (audio QC of rendered narration): when true,
+  /// approving ANY TTS take in this project is blocked until the project has at
+  /// least one COMPLETED VoValidationRun. Default false so existing in-flight
+  /// projects keep approving without ever running QC (same opt-in discipline as
+  /// comic_pages / Wan guard mode). Individual flagged verdicts never block —
+  /// the gate is only "QC has run at least once".
+  voValidationGateEnabled   Boolean   @default(false)
   /// Queue priority tier for "render this film first". 0 = normal. Higher wins,
   /// evaluated BEFORE QueueEntry.rank, so raising it moves the project's whole
   /// backlog — present AND future jobs — ahead of every lower-tier project
@@ -118,6 +132,10 @@ model Project {
   thumbnailJobs     ThumbnailJob[]
   props             Prop[]
   thumbnailIdeaJobs ThumbnailIdeaJob[]
+  comicPages        ComicPage[]
+  voValidationRuns  VoValidationRun[]
+  imageQcRuns       ImageQcRun[]
+  videoQcRuns       VideoQcRun[]
   ttsVoiceover      Voiceover?             @relation(fields: [ttsVoiceoverId], references: [id], onDelete: SetNull)
 
   @@index([ttsVoiceoverId])
@@ -195,6 +213,21 @@ model CharacterProfile {
   /// person is uneconomical. The reference image lives in ReferenceAsset
   /// for this profileCode (sortOrder = 0 is the FaceID anchor).
   useIpAdapter  Boolean  @default(false)
+  /// Anchor inheritance: the profile this one DERIVES from — the same person in
+  /// an earlier state (`X_MID.baseProfileId = X_YOUNG.id`). When set, the anchor
+  /// render is a Qwen-Image-Edit of the base profile's installed anchor instead
+  /// of an independent text-to-image, so age/state variants keep the face.
+  /// Must point at another profile of the SAME character; cycles are rejected
+  /// in AnchorRenderService.setBaseProfile. Chains follow story time, so aging
+  /// accumulates: X_KID → X_YOUNG → X_MID → X_OLD.
+  baseProfileId String?
+  /// When the USER approved the installed anchor portrait. NULL = an anchor may
+  /// well exist on disk, but only the machine has seen it: both the validator's
+  /// automatic pick and a fresh render land unapproved. Cleared again whenever a
+  /// new render replaces the image, so approval always refers to the exact
+  /// portrait currently installed. Scene rendering refuses to run for a
+  /// participant whose anchor is unapproved.
+  anchorApprovedAt DateTime?
   createdAt     DateTime @default(now())
 
   character            Character             @relation(fields: [characterId], references: [id], onDelete: Cascade)
@@ -203,8 +236,13 @@ model CharacterProfile {
   shotParticipants     ShotParticipant[]
   anchorRenderJobs     AnchorRenderJob[]
   anchorValidationJobs AnchorValidationJob[]
+  /// Self-relation for anchor inheritance. SetNull so deleting a base profile
+  /// degrades its descendants to independent t2i renders instead of cascading.
+  base                 CharacterProfile?     @relation("ProfileBase", fields: [baseProfileId], references: [id], onDelete: SetNull, onUpdate: NoAction)
+  derived              CharacterProfile[]    @relation("ProfileBase")
 
   @@unique([characterId, profileCode])
+  @@index([baseProfileId])
   @@map("character_profiles")
 }
 
@@ -232,7 +270,10 @@ model ReferenceAsset {
   @@map("reference_assets")
 }
 
-// ─── Scenes ──────────────────────────────────────────────────────────────────
+// ─── Scenes (= ACTS) ─────────────────────────────────────────────────────────
+// Terminology: a Scene row IS an act of the film («Акт N — …», sceneKey "A3" /
+// "act_03_*"). There is no separate "scene" level between act and shot — the
+// model/table name is historical. NarrativeBlock mirrors the same acts for BGM.
 
 model Scene {
   id                          String   @id @default(uuid())
@@ -241,8 +282,9 @@ model Scene {
   title                       String?
   sortOrder                   Int      @default(0)
   defaultReferenceProfileCode String?
-  /// Closed-caption / voiceover text for the scene. Plain Russian narrator
-  /// script — Silero V5 ru synthesises this to data/<slug>/scenes/<sceneKey>/narration.wav.
+  /// LEGACY whole-act voiceover text (used by night_courier-era projects only;
+  /// current projects narrate per shot via Shot.narrationText). TTS writes the
+  /// wav to data/<slug>/scenes/<sceneKey>/narration_<jobId>_<voice>_<rate>.wav.
   /// Edits don't retroactively change rendered TTSJob outputs — each job
   /// snapshots `text` at enqueue time.
   narrationText               String?
@@ -256,10 +298,10 @@ model Scene {
   /// "scene → source paragraphs" without duplicating ranges in code.
   scriptStartLine             Int?
   scriptEndLine               Int?
-  /// Dramaturgical role of this scene in the 5-act / Freytag structure.
-  /// Free-form per project — typical values: "setup" | "rising" | "midpoint"
-  /// | "climax" | "resolution". Used by shotlist tools to enforce beat
-  /// distribution across the project.
+  /// Dramaturgical role of this act in the project's act structure (projects
+  /// typically use 8-12 acts, not a strict 5-act Freytag). Free-form per
+  /// project — typical values: "setup" | "rising" | "midpoint" | "climax" |
+  /// "resolution". NOTE: seeded as planning metadata; no backend code reads it.
   actBeat                     String?
   /// Default palette key for shots in this scene. Project-specific token
   /// (e.g. "S01_sodium", "S04_dark_emerald"). Individual shots can override
@@ -270,11 +312,11 @@ model Scene {
   /// (e.g. "sunset_day1", "night_day2", "dawn_day2"). Shot.timeOfDay
   /// overrides this when set.
   defaultTimeOfDay            String?
-  /// Single canonical lighting-tokens string for every shot in this scene
+  /// Single canonical lighting-tokens string for every shot in this act
   /// (e.g. "warm tungsten corridor lamps, deep indigo night windows, soft
-  /// falloff, sleep silence"). Source of truth for atmosphere lighting —
-  /// `Shot.promptFields.lightingMood` is a per-shot override that the renderer
-  /// reads first and falls back to this scene-level value when absent.
+  /// falloff, sleep silence"). NOTE: planning metadata only — the prompt
+  /// composer that read it was removed 2026-07-04 (renderer uses pf.positive
+  /// verbatim); nothing in the backend reads this column anymore.
   lightingMood                String?
   createdAt                   DateTime @default(now())
 
@@ -374,17 +416,40 @@ model Shot {
   /// canonical "interior of cramped Soviet train kupe" description can be
   /// reused by 90% of shots without duplicating prose in every promptFields.
   locationId           String?
+  /// Prop displayed in this shot. Added to the LIVE DB by hand (2026-07,
+  /// props entity) before it ever appeared in this schema; declared here
+  /// 2026-08-01 so `prisma db push` stops trying to drop it. Matches the live
+  /// DDL: plain text, no FK (props.controller talks to props via $queryRaw).
+  /// The render path does not read it yet.
+  propId               String?
+  /// FK to the ComicPage this shot is planned into (template-layout mode).
+  /// Null = legacy/uniform mode — the shot renders at the default sizes and
+  /// the comic export uses the old row-major grid. Seeded by SQL during
+  /// project planning, BEFORE the script is written: the page-template plan
+  /// comes first, the story beat is then written to fit the panel's shape.
+  comicPageId          String?
+  /// Slot index inside comicPage's template (0-based; must exist in the
+  /// template and be unique within the page). Null when comicPageId is null.
+  comicSlot            Int?
+  /// Denormalized panel shape ("wide" | "landscape" | "square" | "tall") —
+  /// first-class column like storyBeat/vignetteSlug so SQL audits and the
+  /// render services read it without joining into the template registry.
+  /// Source of truth is template.slots[comicSlot].shape; the comic-plan gate
+  /// verifies this column agrees with it. Null = render at legacy sizes.
+  comicPanelShape      String?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
   project        Project              @relation(fields: [projectId], references: [id], onDelete: Cascade)
   scene          Scene                @relation(fields: [sceneId], references: [id], onDelete: Cascade)
   location       Location?            @relation(fields: [locationId], references: [id], onDelete: SetNull)
-  participants   ShotParticipant[]
-  renderJobs     SceneRenderJob[]
-  videoRenders   VideoRender[]
-  ttsJobs        TTSJob[]
-  validationJobs ImageValidationJob[]
+  comicPage      ComicPage?           @relation(fields: [comicPageId], references: [id], onDelete: SetNull)
+  participants     ShotParticipant[]
+  renderJobs       SceneRenderJob[]
+  videoRenders     VideoRender[]
+  ttsJobs          TTSJob[]
+  validationJobs   ImageValidationJob[]
+  imageQcVerdicts  ImageQcVerdict[]
 
   @@unique([projectId, shotCode])
   @@index([projectId, sceneId])
@@ -393,7 +458,37 @@ model Shot {
   @@index([projectId, isBroll])
   @@index([projectId, isIconic])
   @@index([locationId])
+  @@index([propId])
+  @@index([comicPageId])
+  @@index([projectId, comicPanelShape])
   @@map("shots")
+}
+
+/// One planned page of the comic book (template-layout mode). The PRESENCE of
+/// any row for a project is the single mode switch: comic_manifest.py counts
+/// rows and takes the template branch; zero rows = the untouched legacy
+/// uniform grid. The plan is seeded by SQL as the FIRST step of a comic
+/// project — before the script is written — and is then immutable by
+/// convention (the story adapts to the panel shapes, not the other way).
+/// A spread = the page pair (pageIndex 2k, 2k+1); an odd tail leaves the
+/// last spread's right page as empty paper, like a real book's last leaf.
+model ComicPage {
+  id          String   @id @default(uuid())
+  projectId   String
+  /// Position in the book, dense 0..N-1 per project (gate-validated).
+  pageIndex   Int
+  /// Id of the layout in scripts/comic_page_templates.json. Not an FK — the
+  /// registry is a file, same principle as settings.comicDeskProps items;
+  /// the comic-plan gate validates it against the registry.
+  templateId  String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  shots   Shot[]
+
+  @@unique([projectId, pageIndex])
+  @@map("comic_pages")
 }
 
 /// Reusable location description per project. One row per setting
@@ -514,13 +609,17 @@ model DatasetJob {
   @@map("dataset_jobs")
 }
 
+/// Renders the still image of ONE SHOT (the name is historical — there is no
+/// sceneId here, the only FK is shotId). Queue ledger jobType 'scene' maps to
+/// this table.
 model SceneRenderJob {
   id            String    @id @default(uuid())
   shotId        String
   status        String // pending | running | completed | failed | cancelled
   /// ComfyUI prompt_id once dispatched; used to poll history for outputs.
   comfyPromptId String?
-  /// Render parameters at enqueue time (seed, batchSize, scenePrompt override, …).
+  /// Render parameters at enqueue time (seed, batchSize, scenePrompt override —
+  /// despite the name that's the SHOT's positive prompt, …).
   /// Stored so the queue worker can rebuild the call after a backend restart.
   params        Json?
   errorMessage  String?
@@ -686,13 +785,89 @@ model VideoRender {
   interpCompletedAt  DateTime?
   interpErrorMessage String?
 
-  shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
+  shot      Shot            @relation(fields: [shotId], references: [id], onDelete: Cascade)
+  qcVerdict VideoQcVerdict?
 
   @@index([shotId])
   @@index([status, queuedAt])
   @@index([upscaleStatus, upscaleQueuedAt])
   @@index([interpStatus, interpQueuedAt])
   @@map("video_renders")
+}
+
+// ─── Video QC (клипы) ────────────────────────────────────────────────────────
+//
+// Same architecture as Image QC / VO QC: ONE queue job per project run over
+// every completed i2v BASE clip (videos/, pre-upscale). Layer A = deterministic
+// scanner (scripts/video_qc_batch.py: frame-diff motion energy, skin-hue drift
+// vs the source still, DWPose anatomy on the last sample, new-face detection,
+// cut spikes, identity drift) — layer B = anchored Qwen-VL classification of
+// the suspicious frames layer A extracted (аниме-пришелец). Advisory only: no
+// gate, никогда не трогает chosenVideoId. Verdict is 1:1 to a VideoRender row
+// via FK CASCADE — deleting the clip deletes the verdict; a re-render is a new
+// row and simply has no verdict yet.
+
+model VideoQcRun {
+  id              String    @id @default(uuid())
+  projectId       String
+  status          String    @default("pending") // pending | running | completed | failed | cancelled
+  /// 'full'|'incremental' — every completed clip without a verdict.
+  /// 'spot' — every clip of shotIdsOverride, verdicts overwritten.
+  mode            String
+  shotIdsOverride Json?
+  totalClips      Int       @default(0)
+  processedClips  Int       @default(0)
+  lastProgressAt  DateTime?
+  /// Rollup on completion: {pass, warn, fail, error, skippedMissingFile}.
+  summary         Json?
+  errorMessage    String?
+  queuedAt        DateTime  @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  project  Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  verdicts VideoQcVerdict[]
+
+  @@index([projectId, status])
+  @@index([status, queuedAt])
+  @@map("video_qc_runs")
+}
+
+model VideoQcVerdict {
+  id            String @id @default(uuid())
+  videoRenderId String @unique
+  /// Which run last (re)computed this verdict — audit only.
+  runId         String
+
+  /// 'pass' — глазами не смотреть. 'warn' — advisory (рывок, дрейф, новое лицо
+  /// без аниме). 'fail' — статичный клип, синие лица, расплав анатомии,
+  /// аниме-пришелец. 'error' — файл пропал / воркер упал.
+  status String
+
+  /// 'static_clip' | 'skin_hue_drift' | 'anatomy_melt' | 'two_heads_one_body' |
+  /// 'new_subject_mid_clip' | 'cut_spike' | 'identity_drift' | 'fused_bodies' |
+  /// 'anime_intruder' | 'style_drift' | 'vlm_uncertain' | informational flags
+  flags Json? // string[]
+  /// Raw numbers for threshold calibration: {motionEnergy, maxCutSpike,
+  /// hueDriftDeg, blueFraction, identityDist, samples:[{t, people, faces}]}
+  metrics Json?
+  /// Suspicious moments layer A flagged: [{timeSec, reason}]
+  suspicious Json?
+  /// Layer B (anchored Qwen-VL) exchange per suspicious frame.
+  vlmAnswers Json?
+  /// Flattened human-readable strings (Russian), one per finding.
+  issues Json? // string[]
+
+  errorMessage String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  run         VideoQcRun  @relation(fields: [runId], references: [id], onDelete: Cascade)
+  videoRender VideoRender @relation(fields: [videoRenderId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([status])
+  @@map("video_qc_verdicts")
 }
 
 model TrainingJob {
@@ -793,11 +968,218 @@ model TTSJob {
 
   scene Scene? @relation(fields: [sceneId], references: [id], onDelete: Cascade)
   shot  Shot?  @relation(fields: [shotId], references: [id], onDelete: Cascade)
+  /// Current VO-QC verdict for this job's wav (1:1, upserted in place). Null =
+  /// never validated, or invalidated because the wav's bytes changed
+  /// (trimArtifact / revertArtifact delete the verdict row).
+  voVerdict VoValidationVerdict?
 
   @@index([sceneId])
   @@index([shotId])
   @@index([status, queuedAt])
   @@map("tts_jobs")
+}
+
+// ─── VO validation (audio QC of rendered narration) ──────────────────────────
+//
+// One VoValidationRun row per "проверить озвучку проекта" click — a single
+// queue job (jobType 'vo_validation', engineClass 'whisper' → ComfyUI stopped)
+// that drives ONE faster-whisper batch process + ONE prosody batch process over
+// every wav due for checking, so each heavy runtime loads exactly once per run,
+// not once per shot. Verdicts stream in as NDJSON lines and are upserted onto
+// vo_validation_verdicts IMMEDIATELY per line — a killed run loses nothing, and
+// the next run's "no verdict yet" selection naturally resumes where it stopped.
+
+model VoValidationRun {
+  id             String    @id @default(uuid())
+  projectId      String
+  status         String    @default("pending") // pending | running | completed | failed | cancelled
+  /// 'full' = first-ever run for the project — validates EVERY completed TTSJob.
+  /// 'incremental' = re-run — only jobs without a verdict on shots/scenes
+  ///                 without an approved take.
+  /// 'spot' = explicit re-check of specific jobs (jobIdsOverride), e.g. after a
+  ///          trim invalidated the verdict of an already-approved take.
+  mode           String
+  /// Explicit TTSJob ids for mode='spot'. Null otherwise — full/incremental
+  /// recompute their job set at dispatch time, so a run queued behind other work
+  /// still picks up TTS jobs that completed meanwhile.
+  jobIdsOverride Json?
+  totalJobs      Int       @default(0)
+  processedJobs  Int       @default(0)
+  /// Bumped every time a verdict is persisted — live-progress signal for the
+  /// UI. Runaway protection itself is the per-stage hard timeout inside
+  /// VoValidationService.streamWorker (scaled to the batch size), not a
+  /// queue-level watcher.
+  lastProgressAt DateTime?
+  /// Rollup written on completion: {pass, warn, fail, error, skippedMissingFile}.
+  summary        Json?
+  errorMessage   String?
+  queuedAt       DateTime  @default(now())
+  startedAt      DateTime?
+  completedAt    DateTime?
+
+  project  Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  verdicts VoValidationVerdict[]
+
+  @@index([projectId, status])
+  @@index([status, queuedAt])
+  @@map("vo_validation_runs")
+}
+
+/// Current QC verdict for ONE TTSJob's wav — 1:1, upserted in place (never
+/// appended): the wav is a single immutable artifact, so there is exactly one
+/// true verdict for it at any time. Invalidated (deleted) by
+/// TTSService.trimArtifact/revertArtifact because those mutate the wav's bytes.
+/// A re-rendered take is a NEW TTSJob row, so stale verdicts cannot occur there.
+model VoValidationVerdict {
+  id       String @id @default(uuid())
+  ttsJobId String @unique
+  /// Which run last (re)computed this verdict — audit only.
+  runId    String
+
+  /// 'pass' — clean, no manual listening needed.
+  /// 'warn' — advisory findings (number mismatch, prosody heuristic) — listen.
+  /// 'fail' — word integrity broken (dropped/repeated/garbled words) — listen.
+  /// 'error' — could not be scored (missing file, ASR failure) — listen.
+  /// Per user 2026-08-03: manual review is ONLY for non-pass verdicts, so
+  /// riskyStressWords deliberately do NOT affect status (omographs are near-
+  /// universal in Russian text and would flag every shot).
+  status String
+  /// 0-100 composite, sorting/triage aid only — never gates anything.
+  score  Int?
+
+  // ── word integrity: TTSJob.text (frozen snapshot) vs whisper transcript ──
+  transcript    String?
+  wer           Float?
+  missingWords  Json? // string[]
+  extraWords    Json? // string[]
+  repeatedWords Json? // string[] — TTS stutter (consecutive duplicate not in text)
+  garbledWords  Json? // [{expected, heard}] aligned substitutions
+
+  /// Homographs/ambiguous-stress words present in the text (RUAccent
+  /// omographs.json.gz lookup). Advisory context on flagged jobs + a report
+  /// column; NEVER affects status (see above).
+  riskyStressWords Json? // string[]
+
+  /// 'monotone' | 'too_fast' | 'too_slow' | 'long_mid_silence' | 'clipping'
+  prosodyFlags Json? // string[]
+  /// 'truncated_end' | 'leading_garbage' | 'too_short' | 'too_long'
+  techFlags    Json? // string[]
+
+  /// Flattened human-readable strings (Russian), one per finding — built once
+  /// at persist time so the UI never re-derives prose from the fields above.
+  issues Json? // string[]
+
+  /// TTSJob.text (frozen at render time) no longer matches the shot's CURRENT
+  /// narrationText — the audio may not say what the script now says.
+  textSnapshotStale Boolean @default(false)
+
+  errorMessage String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  run    VoValidationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  ttsJob TTSJob          @relation(fields: [ttsJobId], references: [id], onDelete: Cascade)
+
+  @@index([runId])
+  @@index([status])
+  @@map("vo_validation_verdicts")
+}
+
+// ─── Image QC (кадры) ────────────────────────────────────────────────────────
+//
+// Deterministic-first QC of rendered shot candidates — the successor of the
+// retired LLM-judge ImageValidationJob flow (2026-08-07). Mirrors VO QC: ONE
+// queue job per project run drives ONE pose batch process (DWPose skeletons +
+// scrfd faces, no ComfyUI server) over every candidate due for checking, then a
+// targeted Qwen fact-checklist pass for shots with a key prop. Verdicts stream
+// in as NDJSON and are upserted per line — a killed run loses nothing. The QC
+// never chooses a frame (no chosenRender writes): pass = не смотреть глазами,
+// everything else lands in the worklist.
+
+model ImageQcRun {
+  id              String    @id @default(uuid())
+  projectId       String
+  status          String    @default("pending") // pending | running | completed | failed | cancelled
+  /// 'full' = first-ever run — every candidate without a verdict.
+  /// 'incremental' = re-run — only candidates without a verdict.
+  /// 'spot' = explicit re-check of specific shots (shotIdsOverride), verdicts
+  ///          overwritten.
+  mode            String
+  shotIdsOverride Json?
+  totalImages     Int       @default(0)
+  processedImages Int       @default(0)
+  /// Bumped on every persisted verdict — live-progress signal for the UI.
+  lastProgressAt  DateTime?
+  /// Rollup on completion: {pass, warn, fail, error, skippedMissingFile}.
+  summary         Json?
+  errorMessage    String?
+  queuedAt        DateTime  @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+
+  project  Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  verdicts ImageQcVerdict[]
+
+  @@index([projectId, status])
+  @@index([status, queuedAt])
+  @@map("image_qc_runs")
+}
+
+/// Current QC verdict for ONE candidate file of a shot — unique on
+/// (shotId, filename), upserted in place. A rendered PNG is immutable, so there
+/// is exactly one true verdict per file; deleting the file's verdict row is the
+/// invalidation path (renders are never edited in place — a re-render appends a
+/// NEW filename).
+model ImageQcVerdict {
+  id       String @id @default(uuid())
+  shotId   String
+  filename String
+  /// Which run last (re)computed this verdict — audit only.
+  runId    String
+
+  /// 'pass'  — clean by every layer that could judge it; не смотреть глазами.
+  /// 'warn'  — advisory: people-count mismatch, крупное бесхозное лицо,
+  ///           uncertain fact-check — look when convenient.
+  /// 'fail'  — deterministic defect: карликовые пропорции взрослого, two faces
+  ///           on one skeleton, prop fact-check contradiction — must review.
+  /// 'error' — could not be scored (file missing, worker exception).
+  status String
+
+  /// ShotParticipant rows at scoring time (expected people in frame).
+  peopleExpected  Int?
+  /// Skeletons the pose detector found (foreground-scale; background excluded).
+  peopleFound     Int?
+  /// Faces classified as background (much smaller than the primary face) —
+  /// informational only, never affects status.
+  backgroundFaces Int?
+
+  /// Deterministic layer findings:
+  /// 'dwarf_proportions' | 'two_heads_one_body' | 'extra_person' |
+  /// 'missing_person' | 'fused_bodies' | 'no_full_body' (informational)
+  poseFlags Json? // string[]
+  /// Per-person metrics for triage/threshold calibration:
+  /// [{headHeightRatio, fullBodyVisible, kpConfidence, isChildExpected}]
+  poseMetrics Json?
+  /// Qwen fact-checklist findings: 'prop_mismatch' | 'prop_uncertain'
+  factFlags Json? // string[]
+  /// Raw fact-check exchange for the UI:
+  /// {objectSeen, isPartOf, locationInFrame, matchesExpected, reason}
+  factAnswers Json?
+
+  /// Flattened human-readable strings (Russian), one per finding.
+  issues Json? // string[]
+
+  errorMessage String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  run  ImageQcRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  shot Shot       @relation(fields: [shotId], references: [id], onDelete: Cascade)
+
+  @@unique([shotId, filename])
+  @@index([runId])
+  @@index([status])
+  @@map("image_qc_verdicts")
 }
 
 // ─── Voice-clone emotion references (per-project library) ────────────────────
@@ -865,6 +1247,22 @@ model Voiceover {
   /// Persisted so the trim UI can reopen at the last selection and re-cut.
   trimStartMs    Int?
   trimEndMs      Int?
+  /// Which leading-bleed detection profile in scripts/trim_lead_artifact.py this
+  /// voice needs, or NULL when it needs none — and NULL is the norm.
+  ///
+  /// F5 prepends a short burst to every render for SOME voices only. Measured
+  /// 2026-08-03 over 14 sampled renders of each voice/engine pair: «Кошатница»
+  /// 14/14 (profile "pon", a loud burst) and «агента Смита» 13/14 (profile
+  /// "sha", a quiet one that needs the envelope method). Every other voice —
+  /// beauty, bio_plus, flat_earth, honeywagon, message, tiler, voice, voice-2,
+  /// voice-4, voice-5, wall, plus all qwen3/xtts2 renders — came back 0/14.
+  ///
+  /// This is a property of the VOICE, so the trimmer must be OFF unless a voice
+  /// opts in here: on a clean voice the detector's own shape ("quiet blob, then
+  /// a gap") fits a quiet leading preposition, and it would eat the word. That
+  /// is not hypothetical — sampling engineer/layoff/A3_SH55 and voice-5/trucker/
+  /// A8_SH03 it wanted to cut a real «В».
+  artifactProfile String?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
@@ -1099,6 +1497,16 @@ model ThumbnailJob {
   /// project's cast — anchors from other films are deliberately out of scope,
   /// since on non-Qwen projects the first reference also carries the style.
   refProfileCodes  String[]
+  /// Sampling tier for this render: 'scene' | 'balanced' | 'full'.
+  ///
+  /// The cover chain normally drops the Lightning speed LoRA and runs real steps
+  /// at cfg 3.0, which costs ~13× a scene frame — deliberate, since cfg > 1 is
+  /// what keeps a cover from reading grey and flat. That is not always worth the
+  /// wait, so the operator can pick: 'scene' reproduces the ordinary shot regime
+  /// (Lightning, 4 steps, cfg 1.0), 'balanced' is the middle, 'full' is the
+  /// original. Null = the service default, so every existing row keeps rendering
+  /// exactly as it did.
+  quality          String?
   /// Caption parameters for the overlay pass: lines, accent_word, accent_color,
   /// position, align, width_pct, font. Shape documented in render_caption.py.
   captionSpec      Json?
@@ -1340,6 +1748,11 @@ model Prop {
   /// (POST /props/:id/anchor/from-render) or by generating one
   /// (POST /props/:id/generate-anchor).
   anchorPath  String?
+  /// When the USER approved the installed object anchor. Same contract as
+  /// CharacterProfile.anchorApprovedAt: PropAnchorService installs the FIRST
+  /// rendered candidate automatically, so anchorPath alone proves nothing about
+  /// review. NULL = waiting for approval; a re-render clears it.
+  anchorApprovedAt DateTime?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @default(now())
 

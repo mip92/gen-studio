@@ -1,0 +1,33 @@
+{
+  "project": "teacher",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "А СВОИ ДЕТИ У ВАС ЕСТЬ? ✏️",
+      "shots": [
+        "C_SH02",
+        "C_SH04",
+        "C_SH05",
+        "C_SH07",
+        "C_SH08",
+        "C_SH09"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "У МЕНЯ ИХ ТЫСЯЧА ДВАДЦАТЬ 🖍️",
+      "shots": [
+        "A11_SH01",
+        "A11_SH02",
+        "A11_SH03",
+        "A11_SH13",
+        "A11_SH14",
+        "A11_SH15"
+      ]
+    }
+  ]
+}

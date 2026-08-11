@@ -20,6 +20,7 @@ import {
 import * as path from 'path';
 import youtubeDl from 'youtube-dl-exec';
 import { PrismaService } from '../prisma/prisma.service';
+import { ARTIFACT_PROFILE_KEYS, isArtifactProfile } from '../tts/artifact-profiles';
 
 const APP_ROOT      = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
 const VOICES_ROOT   = path.join(APP_ROOT, 'data', '_voices');
@@ -105,6 +106,7 @@ export class VoiceoversService {
     id: string; slug: string; name: string; filePath: string; ext: string;
     bytes: number; checksum: string; sourceUrl: string | null; createdAt: Date;
     sourceFilePath: string | null; trimStartMs: number | null; trimEndMs: number | null;
+    artifactProfile: string | null;
     projects: { id: string; slug: string; name: string }[];
   }) {
     return {
@@ -121,6 +123,8 @@ export class VoiceoversService {
       hasSource:     !!v.sourceFilePath,
       trimStartMs:   v.trimStartMs,
       trimEndMs:     v.trimEndMs,
+      // Which leading-bleed profile this voice needs; null = none, trimming off.
+      artifactProfile: v.artifactProfile,
       assignedCount: v.projects.length,
       projects:      v.projects,
       createdAt:     v.createdAt,
@@ -189,10 +193,29 @@ export class VoiceoversService {
     });
   }
 
-  /** Edit metadata (label, source link; slug move folder + repoint project mirrors). */
-  async rename(id: string, body: { name?: string; slug?: string; sourceUrl?: string | null }) {
+  /** Edit metadata (label, source link, bleed profile; slug moves the folder +
+   *  repoints project mirrors). */
+  async rename(
+    id: string,
+    body: { name?: string; slug?: string; sourceUrl?: string | null; artifactProfile?: string | null },
+  ) {
     const v = await this.get(id);
-    const data: { name?: string; slug?: string; filePath?: string; sourceUrl?: string | null } = {};
+    const data: {
+      name?: string; slug?: string; filePath?: string; sourceUrl?: string | null;
+      artifactProfile?: string | null;
+    } = {};
+
+    // Empty/absent = this voice does not bleed, so the trimmer stays off for it
+    // (the safe default — see src/tts/artifact-profiles.ts).
+    if (body.artifactProfile !== undefined) {
+      const p = body.artifactProfile?.trim() || null;
+      if (p !== null && !isArtifactProfile(p)) {
+        throw new BadRequestException(
+          `Unknown artifactProfile "${p}" — expected one of ${ARTIFACT_PROFILE_KEYS.join(', ')} or empty`,
+        );
+      }
+      data.artifactProfile = p;
+    }
 
     if (body.name !== undefined) {
       const name = body.name.trim();

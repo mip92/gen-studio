@@ -3,6 +3,7 @@ import { existsSync, unlinkSync } from 'fs';
 import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueueLedgerService } from '../pipeline/queue-ledger.service';
+import { narrationUsFromText } from '../exports/shot-timing';
 import { CreateShotDto } from './dto/create-shot.dto';
 import { UpdateShotDto } from './dto/update-shot.dto';
 
@@ -36,17 +37,14 @@ const SHOT_FULL_INCLUDE = {
       upscaleStatus: true, upscaledFilename: true,
     },
   },
-  // Latest image-validation verdict(s) for the render-picker UI: the vision
-  // model's per-candidate scores + issues and which filename it chose. Newest
-  // first; the UI reads validationJobs[0].
-  validationJobs: {
+  // Image-QC verdicts, one per candidate file — the ✓/⚠/✗ badges on the
+  // render-picker cards (see ImageQcService).
+  imageQcVerdicts: {
     select: {
-      id: true, status: true, result: true, chosenFilename: true,
-      suggestedPrompt: true, suggestedFields: true, judgeReason: true,
-      errorMessage: true, completedAt: true,
+      filename: true, status: true, issues: true, poseFlags: true,
+      factFlags: true, factAnswers: true, peopleExpected: true,
+      peopleFound: true, backgroundFaces: true, updatedAt: true,
     },
-    orderBy: { queuedAt: 'desc' as const },
-    take: 3,
   },
 };
 
@@ -101,15 +99,13 @@ export class ShotsService {
         },
         scene:   true,
         project: true,
-        // Latest image-validation verdict(s) for the render-picker UI.
-        validationJobs: {
+        // Image-QC verdicts per candidate file (badges on the render picker).
+        imageQcVerdicts: {
           select: {
-            id: true, status: true, result: true, chosenFilename: true,
-            suggestedPrompt: true, suggestedFields: true, judgeReason: true,
-            errorMessage: true, completedAt: true,
+            filename: true, status: true, issues: true, poseFlags: true,
+            factFlags: true, factAnswers: true, peopleExpected: true,
+            peopleFound: true, backgroundFaces: true, updatedAt: true,
           },
-          orderBy: { queuedAt: 'desc' as const },
-          take: 3,
         },
       },
     });
@@ -271,37 +267,17 @@ export class ShotsService {
       catch (e: any) { this.logger.warn(`removeRender: failed to unlink ${filePath}: ${e?.message}`); }
     }
 
+    // A verdict is 1:1 to the file's bytes — the file leaving the pool takes
+    // its QC verdict with it (same invalidation rule as VO trim/revert).
+    await (this.prisma as any).imageQcVerdict
+      .deleteMany({ where: { shotId, filename } }).catch(() => {});
+
     return this.prisma.shot.update({
       where: { id: shotId },
       data:  {
         renderedImages: next as object,
         chosenRender:   chosenStays ? shot.chosenRender : null,
       },
-      include: SHOT_FULL_INCLUDE,
-    });
-  }
-
-  /** Apply the vision model's structured suggestion — each part into its own
-   *  promptFields key (user 2026-07-04: negatives go to negative, positives to
-   *  positive). `positive` REPLACES promptFields.positive; `negative` tokens
-   *  are APPENDED (deduplicated) to the shot's negative. A shot that had no own
-   *  negative starts from the project default — appending to an empty string
-   *  would otherwise silently DROP the whole default at render time (renderer
-   *  uses pf.negative INSTEAD of the default when non-empty). */
-  async applySuggestedFields(shotId: string, fields: { positive?: string | null; negative?: string | null }) {
-    const shot = await this.findById(shotId);
-    const pf = { ...((shot.promptFields as Record<string, unknown> | null) ?? {}) };
-    const positive = fields.positive?.trim();
-    const negative = fields.negative?.trim();
-    if (positive) pf.positive = positive;
-    if (negative) {
-      const own  = typeof pf.negative === 'string' && pf.negative.trim() ? pf.negative.trim() : '';
-      const base = own || ((shot.project as { defaultNegative?: string } | null)?.defaultNegative ?? '').trim();
-      pf.negative = appendNegativeTokens(base, negative);
-    }
-    return this.prisma.shot.update({
-      where: { id: shotId },
-      data:  { promptFields: pf as object },
       include: SHOT_FULL_INCLUDE,
     });
   }
@@ -390,9 +366,10 @@ export class ShotsService {
         if (!boundaryShotCode) boundaryShotCode = s.shotCode;
       }
       const ms = s.approvedTTSJobId ? durById.get(s.approvedTTSJobId) ?? 0 : 0;
+      const estUs = narrationUsFromText(s.narrationText);
       const sec = ms > 0
         ? ms / 1000
-        : (s.narrationText ? Math.max(2.5, s.narrationText.length / 15) : 6);
+        : (estUs != null ? estUs / 1_000_000 : 6);
       acc += sec;
     }
 
@@ -418,13 +395,4 @@ export class ShotsService {
       include: { character: true },
     });
   }
-}
-
-/** Append comma-separated tokens to a negative prompt, skipping ones already
- *  present (case-insensitive). Keeps the base order; additions go to the end. */
-function appendNegativeTokens(base: string, additions: string): string {
-  const seen = new Set(base.split(',').map((t) => t.trim().toLowerCase()).filter(Boolean));
-  const fresh = additions.split(',').map((t) => t.trim()).filter((t) => t && !seen.has(t.toLowerCase()));
-  if (fresh.length === 0) return base;
-  return base ? `${base}, ${fresh.join(', ')}` : fresh.join(', ');
 }

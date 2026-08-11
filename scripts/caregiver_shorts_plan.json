@@ -1,0 +1,34 @@
+{
+  "project": "caregiver",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ДЕВЯТЬ ЛЕТ ЗА ОБЕЩАНИЕ 🛎️",
+      "shots": [
+        "A3_SH10",
+        "A3_SH11",
+        "A3_SH12",
+        "A3_SH21",
+        "A3_SH22",
+        "A3_SH25"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЧЕТЫРЕ ТАРЕЛКИ. ОДИН ПУСТОЙ СТУЛ 🎂",
+      "shots": [
+        "A4_SH02",
+        "A4_SH03",
+        "A4_SH05",
+        "A4_SH07",
+        "A4_SH08",
+        "A4_SH10",
+        "A4_SH28"
+      ]
+    }
+  ]
+}

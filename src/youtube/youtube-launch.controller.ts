@@ -32,9 +32,22 @@ export class YoutubeLaunchController {
   }
 
   @Post('upload-item/:key')
-  @ApiOperation({ summary: 'Per-asset — upload ONE item as Unlisted (gated on its subtitles)' })
+  @ApiOperation({ summary: 'Per-asset — upload ONE item as Unlisted (gated on its subtitles; shorts exempt)' })
   uploadItem(@Param('idOrSlug') idOrSlug: string, @Param('key') key: string) {
     return this.launch.uploadItem(idOrSlug, key);
+  }
+
+  @Post('transcribe-item/:key')
+  @ApiOperation({
+    summary: 'Per-asset — put ONE item on transcription by hand (whisper → .srt)',
+    description:
+      'The main video is transcribed automatically when its files are prepared. A '
+      + 'short is not, because its subtitles are optional — this is how an operator '
+      + 'asks for them anyway. The .srt lands next to the mp4 and is attached at '
+      + 'upload if it is ready by then.',
+  })
+  transcribeItem(@Param('idOrSlug') idOrSlug: string, @Param('key') key: string) {
+    return this.launch.transcribeItem(idOrSlug, key);
   }
 
   @Post('thumbnail-manual/:key')

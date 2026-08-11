@@ -1,0 +1,33 @@
+{
+  "project": "sailor_wife",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "46 ЛЕТ ТЫ ВСТАЁШЬ К ОКНУ НА ГУДОК 🌫️",
+      "shots": [
+        "C_SH01",
+        "C_SH02",
+        "C_SH03",
+        "C_SH04",
+        "C_SH07",
+        "C_SH10"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ИЗ 28 ЛЕТ БРАКА ВМЕСТЕ ТОЛЬКО 8 ⚓",
+      "shots": [
+        "A8_SH09",
+        "A8_SH11",
+        "A8_SH12",
+        "A8_SH13",
+        "A8_SH22",
+        "A8_SH23"
+      ]
+    }
+  ]
+}

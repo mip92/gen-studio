@@ -1,0 +1,34 @@
+{
+  "project": "best_thing",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "КОПЕЙКА НА 34 МИЛЛИОНАХ 🧾",
+      "shots": [
+        "A0_SH01",
+        "A0_SH02",
+        "A0_SH04",
+        "A0_SH05",
+        "A0_SH07",
+        "A0_SH09"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ЦВЕТАМ УВОЛЬНЕНИЕ НЕ ПОЛОЖЕНО 💐",
+      "shots": [
+        "A3_SH04",
+        "A3_SH05",
+        "A3_SH06",
+        "A3_SH08",
+        "A3_SH09",
+        "A3_SH11",
+        "A3_SH13"
+      ]
+    }
+  ]
+}

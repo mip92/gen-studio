@@ -1,9 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { existsSync, readdirSync, readFileSync } from 'fs';
+import { createHash } from 'crypto';
+import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { Outcome, OutcomeReason } from './queue-entry.types';
 
+const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..');
+
 /** Types whose output competes to be "the one that shipped". */
-const ARTIFACT_TYPES = ['scene', 'video', 'video_post', 'tts', 'bgm', 'anchor'] as const;
+const ARTIFACT_TYPES = ['scene', 'video', 'video_post', 'tts', 'bgm', 'anchor', 'prop_anchor'] as const;
 
 /**
  * Reasons that can still change. Everything else is sealed forever:
@@ -102,8 +107,8 @@ export class QueueOutcomeService {
       case 'video_post': return this.videoPostVerdict(e, ctx);
       case 'tts':        return this.ttsVerdict(e, ctx);
       case 'bgm':        return this.bgmVerdict(e, ctx);
-      case 'anchor':     return this.anchorVerdict(e, ctx);
-      case 'prop_anchor': return this.anchorVerdict(e, ctx);
+      case 'anchor':      return this.anchorVerdict(e, ctx);
+      case 'prop_anchor': return this.propAnchorVerdict(e, ctx);
       default:           return null;
     }
   }
@@ -189,17 +194,40 @@ export class QueueOutcomeService {
   }
 
   /**
-   * Anchor portraits are picked by the anchor-validation pass. Without a verdict
-   * from it there is no way to tell which candidate became the profile's anchor,
-   * so the entry stays unknown rather than being guessed into a bucket.
+   * Anchor portraits: the anchor-validation verdict is exact when it exists.
+   * Most anchors, though, are approved BY HAND (select/upload — the QC pass is
+   * being redesigned), which records nothing per candidate: batches share one
+   * accumulating candidates dir, so a manual pick can't be attributed to the
+   * job that rendered it. The decision itself IS recoverable from disk — the
+   * installed `<profileCode>_anchor.png` — so once it exists the work stops
+   * being "unresolved" (that bucket was 2.3 h of long-approved anchors on
+   * station, user 2026-08-07): the newest completed batch is billed as the one
+   * that delivered, older batches as superseded, and an installed anchor that
+   * matches NO candidate (hand-uploaded file) supersedes every batch.
    */
   private anchorVerdict(e: any, ctx: Context): Verdict | null {
     if (!e.profileId || !ctx.profiles.has(e.profileId)) return null;
     const pick = ctx.anchorPickByProfile.get(e.profileId);
-    if (pick === undefined) return UNKNOWN;
-    if (pick === null) return REJECTED;             // QC refused every candidate
-    if (!e.outputFilename) return UNKNOWN;
-    return basename(e.outputFilename) === basename(pick) ? CHOSEN : SUPERSEDED;
+    if (pick !== undefined) {
+      if (pick === null) return REJECTED;           // QC refused every candidate
+      if (!e.outputFilename) return UNKNOWN;
+      return basename(e.outputFilename) === basename(pick) ? CHOSEN : SUPERSEDED;
+    }
+    return this.decisionVerdict(e, ctx.anchorDecisionByProfile.get(e.profileId));
+  }
+
+  /** Same decision semantics for object anchors; the entry's jobId → prop link
+   *  replaces profileId (prop deletion cascades the job away → sealed stands). */
+  private propAnchorVerdict(e: any, ctx: Context): Verdict | null {
+    const propId = ctx.propIdByJobId.get(e.jobId);
+    if (!propId) return null;
+    return this.decisionVerdict(e, ctx.propDecisionByProp.get(propId));
+  }
+
+  private decisionVerdict(e: any, dec: AnchorDecision | undefined): Verdict {
+    if (!dec || dec.state === 'undecided') return UNKNOWN;
+    if (dec.state === 'external') return SUPERSEDED;
+    return e.id === dec.newestEntryId ? CHOSEN : SUPERSEDED;
   }
 
   // ── Context loading ───────────────────────────────────────────────────────
@@ -211,6 +239,7 @@ export class QueueOutcomeService {
     const segmentIds = ids(entries, 'segmentId');
     const profileIds = ids(entries, 'profileId');
     const postJobIds = entries.filter((e) => e.jobType === 'video_post').map((e) => e.jobId);
+    const propJobIds = entries.filter((e) => e.jobType === 'prop_anchor').map((e) => e.jobId);
 
     const [shots, scenes, segments, profiles, validations, anchorValidations, postAttempts] = await Promise.all([
       shotIds.length
@@ -229,7 +258,15 @@ export class QueueOutcomeService {
           })
         : [],
       profileIds.length
-        ? this.prisma.characterProfile.findMany({ where: { id: { in: profileIds } }, select: { id: true } })
+        ? this.prisma.characterProfile.findMany({
+            where:  { id: { in: profileIds } },
+            select: {
+              id: true, profileCode: true,
+              // Anchor + candidates live under a LINKED project's data dir — a
+              // cameo profile's files sit under its HOME project, so scan all.
+              character: { select: { projectLinks: { select: { project: { select: { slug: true } } } } } },
+            },
+          })
         : [],
       // Vision QC runs that refused everything they scored.
       shotIds.length
@@ -271,6 +308,54 @@ export class QueueOutcomeService {
       anchorPickByProfile.set(av.profileId, av.chosenFilename ?? null);
     }
 
+    // ── Manual anchor decisions (no QC verdict): recovered from disk ─────────
+    const md5cache = new Map<string, string>();
+    const newestAnchorEntry = this.newestByKey(entries, 'anchor', (e) => e.profileId);
+
+    const anchorDecisionByProfile = new Map<string, AnchorDecision>();
+    for (const p of profiles as any[]) {
+      if (anchorPickByProfile.has(p.id)) continue;      // QC path already decides
+      const slugs = (p.character?.projectLinks ?? [])
+        .map((l: any) => l?.project?.slug)
+        .filter((s: any): s is string => !!s);
+      const installed = slugs
+        .map((s: string) => path.join(APP_ROOT, 'data', s, 'reference', `${p.profileCode}_anchor.png`))
+        .find((f: string) => existsSync(f)) ?? null;
+      const candDirs = slugs.map((s: string) =>
+        path.join(APP_ROOT, 'data', s, 'reference', '_candidates', p.profileCode));
+      anchorDecisionByProfile.set(
+        p.id,
+        this.decideFromDisk(installed, candDirs, newestAnchorEntry.get(p.id) ?? null, md5cache),
+      );
+    }
+
+    // Object anchors: prop link comes through the job row (entry has no propId).
+    const propJobs = propJobIds.length
+      ? await (this.prisma as any).propAnchorJob.findMany({
+          where:  { id: { in: propJobIds } },
+          select: { id: true, propId: true,
+                    prop: { select: { id: true, code: true, anchorPath: true,
+                                      project: { select: { slug: true } } } } },
+        })
+      : [];
+    const propIdByJobId = new Map<string, string>(
+      (propJobs as any[]).filter((j) => j.prop).map((j) => [j.id, j.propId]));
+    const newestPropEntry = this.newestByKey(entries, 'prop_anchor',
+      (e) => propIdByJobId.get(e.jobId) ?? null);
+
+    const propDecisionByProp = new Map<string, AnchorDecision>();
+    for (const j of propJobs as any[]) {
+      if (!j.prop || propDecisionByProp.has(j.propId)) continue;
+      const installed = j.prop.anchorPath
+        ? [path.join(APP_ROOT, ...String(j.prop.anchorPath).split('/'))].find((f) => existsSync(f)) ?? null
+        : null;
+      const dir = path.join(APP_ROOT, 'data', j.prop.project.slug, 'reference', '_candidates', `OBJ_${j.prop.code}`);
+      propDecisionByProp.set(
+        j.propId,
+        this.decideFromDisk(installed, [dir], newestPropEntry.get(j.propId) ?? null, md5cache),
+      );
+    }
+
     return {
       shots:    new Map((shots as any[]).map((s) => [s.id, s])),
       scenes:   new Map((scenes as any[]).map((s) => [s.id, s])),
@@ -278,12 +363,72 @@ export class QueueOutcomeService {
       profiles: new Set((profiles as any[]).map((p) => p.id)),
       rejectedCandidatesByShot,
       anchorPickByProfile,
+      anchorDecisionByProfile,
+      propIdByJobId,
+      propDecisionByProp,
       newestPostAttempt: new Map(
         (postAttempts as any[]).map((g) => [g.jobId as string, (g._max?.attemptNumber as number) ?? 1]),
       ),
     };
   }
+
+  /** Newest completed entry id of `type`, keyed by an entry-derived id. */
+  private newestByKey(entries: any[], type: string, keyOf: (e: any) => string | null) {
+    const newest = new Map<string, { id: string; queuedAt: Date }>();
+    for (const e of entries) {
+      if (e.jobType !== type) continue;
+      const key = keyOf(e);
+      if (!key) continue;
+      const cur = newest.get(key);
+      if (!cur || e.queuedAt > cur.queuedAt) newest.set(key, { id: e.id, queuedAt: e.queuedAt });
+    }
+    return new Map([...newest.entries()].map(([k, v]) => [k, v.id]));
+  }
+
+  /**
+   * The manual-pick decision, from the filesystem: no installed anchor → still
+   * undecided; installed and byte-identical to some candidate → a render batch
+   * won; installed but matching nothing → hand-uploaded, every batch lost.
+   */
+  private decideFromDisk(
+    installed: string | null,
+    candDirs: string[],
+    newestEntryId: string | null,
+    md5cache: Map<string, string>,
+  ): AnchorDecision {
+    if (!installed || !newestEntryId) return { state: 'undecided' };
+    const hash = this.fileMd5(installed, md5cache);
+    if (!hash) return { state: 'undecided' };
+    for (const dir of candDirs) {
+      if (!existsSync(dir)) continue;
+      for (const f of readdirSync(dir)) {
+        if (!/\.(png|jpe?g|webp)$/i.test(f)) continue;
+        if (this.fileMd5(path.join(dir, f), md5cache) === hash) {
+          return { state: 'rendered', newestEntryId };
+        }
+      }
+    }
+    return { state: 'external' };
+  }
+
+  private fileMd5(file: string, cache: Map<string, string>): string | null {
+    const hit = cache.get(file);
+    if (hit) return hit;
+    try {
+      const h = createHash('md5').update(readFileSync(file)).digest('hex');
+      cache.set(file, h);
+      return h;
+    } catch {
+      return null;
+    }
+  }
 }
+
+/** How a manually-approved anchor decision reads from disk (see anchorVerdict). */
+type AnchorDecision =
+  | { state: 'undecided' }
+  | { state: 'external' }
+  | { state: 'rendered'; newestEntryId: string };
 
 interface Context {
   shots:    Map<string, any>;
@@ -294,6 +439,12 @@ interface Context {
   rejectedCandidatesByShot: Map<string, Set<string>>;
   /** profileId → chosen anchor filename, or null when QC refused every candidate. */
   anchorPickByProfile: Map<string, string | null>;
+  /** profileId → manual-pick decision recovered from disk (no QC verdict). */
+  anchorDecisionByProfile: Map<string, AnchorDecision>;
+  /** prop_anchor entry jobId → propId (via PropAnchorJob; gone = prop deleted). */
+  propIdByJobId: Map<string, string>;
+  /** propId → manual-pick decision recovered from disk. */
+  propDecisionByProp: Map<string, AnchorDecision>;
   /** VideoRender.id → highest completed video_post attempt number. */
   newestPostAttempt: Map<string, number>;
 }

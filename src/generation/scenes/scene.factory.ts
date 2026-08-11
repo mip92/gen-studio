@@ -128,14 +128,14 @@ export class SceneFactory {
     }
 
     throw new NotFoundException(
-      `No scene strategy registered for style="${style}" with ${count} participant(s). ` +
+      `No shot render strategy registered for style="${style}" with ${count} participant(s). ` +
       `Available: ${[...this.strategies.values()].map((s) => `${s.id}(style=${s.visualStyle ?? 'photoreal_cinematic'}, p=${s.participantCount})`).join('; ')}`,
     );
   }
 
   get(id: string): SceneStrategy {
     const s = this.strategies.get(id);
-    if (!s) throw new NotFoundException(`Unknown scene strategy "${id}"`);
+    if (!s) throw new NotFoundException(`Unknown shot render strategy "${id}"`);
     return s;
   }
 
@@ -154,7 +154,7 @@ export class SceneFactory {
     const shared     = path.join(APP_ROOT, 'data', '_templates', 'comfy', strategy.filename);
     const filePath   = existsSync(perProject) ? perProject : shared;
     if (!existsSync(filePath)) {
-      throw new NotFoundException(`Scene workflow not found: ${perProject} (and no shared template at ${shared})`);
+      throw new NotFoundException(`Shot render workflow not found: ${perProject} (and no shared template at ${shared})`);
     }
     return JSON.parse(readFileSync(filePath, 'utf-8')) as WorkflowTemplate;
   }

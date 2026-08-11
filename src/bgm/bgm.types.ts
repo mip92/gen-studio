@@ -155,10 +155,21 @@ export function captionMetaConflicts(prompt: string | null | undefined): string[
   const found: string[] = [];
   const bpm = prompt.match(/\b\d{2,3}\s?bpm\b/i);
   if (bpm) found.push(`tempo in caption ("${bpm[0]}") — move it to the bpm field`);
+  // Spelled-out tempi ("forty eight bpm") fight the metas exactly like digits do;
+  // the digit-only regex let these slip through the 2026-07 caption sweep.
+  const bpmWords = prompt.match(
+    /\b(?:twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)(?:[- ](?:one|two|three|four|five|six|seven|eight|nine))?\s?bpm\b/i,
+  );
+  if (bpmWords) found.push(`tempo in caption ("${bpmWords[0]}") — move it to the bpm field`);
   const key = prompt.match(/\b[A-G](?:\s?(?:#|b|sharp|flat))?\s+(?:major|minor)\b/);
   if (key) found.push(`key in caption ("${key[0]}") — move it to the keyscale field`);
   const ts = prompt.match(/\b[2-9]\s?\/\s?[248]\b/);
   if (ts) found.push(`time signature in caption ("${ts[0]}") — move it to the timesignature field`);
+  // Not a meta conflict but the top rhythm-breaker on the 8-step turbo: swung /
+  // syncopated grooves lose their micro-timing and read as «битый ритм». Ask
+  // for a straight pulse instead — see Skill(gen-studio-acestep) §3.
+  const swing = prompt.match(/\b(?:swing|swung|shuffle|bossa|syncopat\w*|off-?beat)\b/i);
+  if (swing) found.push(`swung/syncopated groove in caption ("${swing[0]}") — turbo can't hold it, use a straight pulse`);
   return found;
 }
 
@@ -241,7 +252,39 @@ export interface AudioRenderParams {
   cfg:         number;
   samplerName: string;
   scheduler:   string;
+  /** Audio-code LM sampling temperature for TextEncodeAceStepAudio1.5, resolved
+   *  by {@link pulseTemperature} from the caption at enqueue. Absent/null on
+   *  older rows = the workflow template's own value (0.85) stays in place. */
+  temperature?: number | null;
 }
+
+/**
+ * Audio-code LM temperature by caption content. Captions that ask for a
+ * percussive pulse get a more conservative temperature — the 8-step turbo
+ * distill loses rhythmic micro-timing first, and a cooler LM keeps the pulse
+ * steady. Pure ambient captions (`no percussion`, drones, pads) keep the
+ * template default: there is no beat to protect and variety between takes is
+ * a plus.
+ */
+export const TEMPERATURE_AMBIENT    = 0.85;
+export const TEMPERATURE_PERCUSSIVE = 0.7;
+
+const PERCUSSION_NEGATED_RE = /\bno\s+(?:busy\s+)?(?:drums?|percussion|beat)\b/gi;
+const PERCUSSION_RE =
+  /\b(?:drums?|drum\s?kit|snare|kick|percussion|woodblock|hi-?hats?|toms?|rimshot|shakers?|tambourine|cymbals?|rhythm\s?box|beat|groove)\b/i;
+
+export function pulseTemperature(caption: string): number {
+  const affirmative = caption.replace(PERCUSSION_NEGATED_RE, '');
+  return PERCUSSION_RE.test(affirmative) ? TEMPERATURE_PERCUSSIVE : TEMPERATURE_AMBIENT;
+}
+
+/**
+ * Lyrics field for every render. ACE-Step was trained with section markers in
+ * the lyrics channel; `[instrumental]` is the canonical no-vocals form and is
+ * stronger than the empty string the template ships (see
+ * Skill(gen-studio-acestep) §4). All our music is instrumental by policy.
+ */
+export const INSTRUMENTAL_LYRICS = '[instrumental]';
 
 /**
  * Render exactly what the caller asks for — no auto-padding. Earlier versions
@@ -257,7 +300,11 @@ export const RENDER_MAX_SECONDS = 240;
 /**
  * Music layout per act (= NarrativeBlock). The act is auto-tiled into
  * fixed-length tracks:
- *   - TILE_SECONDS      one track = 150 s (well under RENDER_MAX_SECONDS).
+ *   - TILE_SECONDS      one track = 120 s. ACE-Step's rhythm stays coherent up
+ *                         to ~120 s; 150 s sat on the edge of that window and
+ *                         percussive acts audibly drifted in the last third of
+ *                         a tile, so tiles now stay inside it. Tiles rendered
+ *                         at 150 s remain valid (durationSec is per-segment).
  *   - main tile count   = ceil(actLengthSeconds / TILE_SECONDS), laid
  *                         checkerboard on two lanes (a/b) that overlap by
  *                         CROSSFADE_SECONDS so one track fades out while the
@@ -267,7 +314,7 @@ export const RENDER_MAX_SECONDS = 240;
  *                         the editor uses them to trim silence / reshuffle by
  *                         hand. Per user spec: «плюс два запасных трека на акт».
  */
-export const TILE_SECONDS       = 150;
+export const TILE_SECONDS       = 120;
 export const CROSSFADE_SECONDS   = 3;
 export const SPARE_TRACK_COUNT   = 2;
 

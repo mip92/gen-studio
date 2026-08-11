@@ -4,11 +4,12 @@ import { spawn } from 'child_process';
 import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService, QueuePromptResult } from '../../comfy/comfy.service';
-import { ImageValidationService } from '../../validation/image-validation.service';
 import { QueueLedgerService } from '../../pipeline/queue-ledger.service';
 import { SceneFactory } from './scene.factory';
 import { SceneStrategy } from './scene-strategy';
 import { SceneJobParams, SceneParticipant } from './scene-job.types';
+import { PageTemplateRegistryService, ModelFamily } from '../../comic/page-template-registry.service';
+import { resolveShotRenderSize } from '../../comic/render-size';
 
 const APP_ROOT        = process.env.APP_ROOT        ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_OUTPUT    = process.env.COMFY_OUTPUT    ?? 'E:\\ComfyUI\\output';
@@ -48,7 +49,8 @@ const REALCOMIC_LORA_NAME      = process.env.REALCOMIC_LORA      ?? 'style\\Real
 
 export interface RenderShotInput {
   shotId:          string;
-  /** Override scene description from shot.promptFields if provided. */
+  /** Override for the SHOT's positive prompt (shot.promptFields.positive).
+   *  Named scenePrompt for historical/wire-compat reasons. */
   scenePrompt?:    string;
   negativeExtra?:  string;
   width?:          number;
@@ -74,10 +76,6 @@ export interface RenderShotInput {
    *  Default false: renders ACCUMULATE so the "+ ещё 5 вариантов" button adds
    *  to the candidate pool instead of replacing it. */
   replace?:        boolean;
-  /** If true, auto-enqueue an image-validation pass (vision QC) after this
-   *  batch is harvested. Default false — validation is strictly opt-in via the
-   *  checkbox next to the render buttons (user 2026-07-04: no auto-validation). */
-  validate?:       boolean;
 }
 
 export interface RenderResult {
@@ -99,9 +97,23 @@ export class SceneRenderService {
     private readonly prisma:  PrismaService,
     private readonly comfy:   ComfyService,
     private readonly scenes:  SceneFactory,
-    private readonly validation: ImageValidationService,
     private readonly ledger: QueueLedgerService,
+    private readonly comicRegistry: PageTemplateRegistryService,
   ) {}
+
+  /**
+   * The shot's comic panel shape (template-layout mode), or null on every
+   * legacy shot. Read via $queryRaw — the column was added by `db push` and
+   * the generated Prisma client may predate it (documented repo pattern, see
+   * locationId/propId reads in shots.service).
+   */
+  private async resolveComicPanelShape(shotId: string): Promise<string | null> {
+    const rows = await this.prisma.$queryRaw<Array<{ shape: string | null }>>`
+      SELECT "comicPanelShape" AS shape FROM shots WHERE id = ${shotId}
+    `;
+    const shape = rows[0]?.shape ?? null;
+    return shape && shape.trim().length > 0 ? shape : null;
+  }
 
   // ── Queue-aware API (used by PipelineQueueService) ──────────────────────────
 
@@ -121,6 +133,8 @@ export class SceneRenderService {
       include: { project: true },
     });
     if (!shot) throw new NotFoundException(`Shot ${input.shotId} not found`);
+
+    await this.assertAnchorsApproved(input.shotId);
 
     if (input.replace) await this.wipePreviousRenders(shot);
 
@@ -145,20 +159,102 @@ export class SceneRenderService {
   }
 
   /**
+   * Refuse to render a shot that leans on an anchor nobody approved.
+   *
+   * The anchor pipelines install a candidate BY THEMSELVES the moment a render
+   * finishes — the vision validator's pick for characters, literally the first
+   * file for props. So "an anchor exists" never meant a human had seen it, and
+   * an unreviewed portrait would otherwise get stamped across every shot the
+   * character appears in before anyone noticed (user 2026-08-11: «без якорей
+   * нельзя сцены рендерить»).
+   *
+   * Enforced here, at enqueue, rather than only in the /actions gate: the gate
+   * is a suggestion the UI can be talked out of, this is the wall. Photoreal
+   * projects are untouched — their identity is a trained LoRA, not an anchor.
+   */
+  private async assertAnchorsApproved(shotId: string): Promise<void> {
+    const shot = await this.prisma.shot.findUnique({
+      where:  { id: shotId },
+      select: {
+        shotCode: true,
+        propId:   true,
+        project:  { select: { visualStyle: true } },
+        participants: {
+          select: {
+            profile: { select: { id: true, profileCode: true, anchorApprovedAt: true } },
+          },
+        },
+      },
+    });
+    if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);
+
+    const blockers: string[] = [];
+
+    // Shot.propId is a bare scalar — there is no Prisma relation to traverse —
+    // so the prop is a second lookup rather than an include.
+    // A prop-hero shot is gated whatever the visual style: the object anchor is
+    // a plain reference image, not part of the identity stack.
+    if (shot.propId) {
+      const prop = await this.prisma.prop.findUnique({
+        where:  { id: shot.propId },
+        select: { code: true, anchorPath: true, anchorApprovedAt: true },
+      });
+      if (prop && !prop.anchorApprovedAt) {
+        blockers.push(prop.anchorPath
+          ? `предмет ${prop.code} — якорь не утверждён`
+          : `предмет ${prop.code} — якоря нет`);
+      }
+    }
+
+    const isCartoon = (shot.project?.visualStyle ?? 'photoreal_cinematic') !== 'photoreal_cinematic';
+    if (isCartoon) {
+      for (const p of shot.participants) {
+        if (!p.profile) continue;                       // text-only participant
+        if (p.profile.anchorApprovedAt) continue;
+        blockers.push(`${p.profile.profileCode} — якорь не утверждён`);
+      }
+    }
+
+    if (blockers.length > 0) {
+      throw new BadRequestException(
+        `Кадр ${shot.shotCode} не отрендерить: ${blockers.join('; ')}. `
+        + 'Утвердите якоря на вкладке «Действия» (или на странице персонажа / предмета) — '
+        + 'рендер по неутверждённому якорю растиражирует картинку, которую никто не смотрел.',
+      );
+    }
+  }
+
+  /**
    * Bulk-enqueue every shot in a project that has NOT been rendered yet and is
    * NOT already queued. ADDITIVE ONLY — never wipes, deletes, or re-queues
    * anything. Skips shots that already have renders (awaiting approval), are
    * approved (chosenRender set), or already have a pending/running job.
    */
-  async enqueuePendingForProject(projectOrSlug: string, opts?: { validate?: boolean }) {
+  async enqueuePendingForProject(projectOrSlug: string) {
     const project = await this.prisma.project.findFirst({
       where:  { OR: [{ id: projectOrSlug }, { slug: projectOrSlug }] },
-      select: { id: true },
+      select: { id: true, visualStyle: true },
     });
     if (!project) throw new NotFoundException(`Project ${projectOrSlug} not found`);
 
-    const eligible = await this.prisma.$queryRaw<Array<{ id: string }>>`
-      SELECT s.id
+    // Anchor approval is a hard precondition (see assertAnchorsApproved). In a
+    // bulk run an unapproved anchor SKIPS the shot rather than failing the batch
+    // — the skipped count is returned so the caller can say why the number is
+    // lower than expected instead of silently under-queueing.
+    const gateAnchors = (project.visualStyle ?? 'photoreal_cinematic') !== 'photoreal_cinematic';
+
+    const eligible = await this.prisma.$queryRaw<Array<{ id: string; anchorsOk: boolean }>>`
+      SELECT s.id,
+             (
+               (s."propId" IS NULL OR EXISTS (
+                  SELECT 1 FROM props p
+                   WHERE p.id = s."propId" AND p."anchorApprovedAt" IS NOT NULL))
+               AND (
+                 NOT ${gateAnchors}::boolean OR NOT EXISTS (
+                   SELECT 1 FROM shot_participants sp
+                     JOIN character_profiles cp ON cp.id = sp."profileId"
+                    WHERE sp."shotId" = s.id AND cp."anchorApprovedAt" IS NULL))
+             ) AS "anchorsOk"
       FROM shots s
       JOIN scenes sc ON sc.id = s."sceneId"
       WHERE s."projectId" = ${project.id}
@@ -170,19 +266,27 @@ export class SceneRenderService {
         )
       ORDER BY sc."sortOrder", s."shotCode"
     `;
-    if (eligible.length === 0) return { enqueued: 0 };
+    const blockedByAnchors = eligible.filter((e) => !e.anchorsOk).length;
+    if (blockedByAnchors > 0) {
+      this.logger.warn(
+        `enqueuePendingForProject(${projectOrSlug}): ${blockedByAnchors} shot(s) skipped — `
+        + 'their character or prop anchors are not approved yet',
+      );
+    }
+    const runnable = eligible.filter((e) => e.anchorsOk);
+    if (runnable.length === 0) return { enqueued: 0, blockedByAnchors };
     // One row at a time rather than createMany: every job has to be registered in
     // the queue, and the queue needs each row's id. A createMany here would insert
     // rows the dispatcher cannot see at all — it selects work exclusively from the
     // queue ledger — so the whole batch would sit `pending` forever, silently.
-    const params = (opts?.validate === true ? { validate: true } : {}) as any;
-    for (const e of eligible) {
+    const params = {} as any;
+    for (const e of runnable) {
       const job = await this.prisma.sceneRenderJob.create({
         data: { shotId: e.id, status: 'pending', params },
       });
       await this.ledger.enqueue('scene', job.id, { paramsSnapshot: params });
     }
-    return { enqueued: eligible.length };
+    return { enqueued: runnable.length, blockedByAnchors };
   }
 
   /** Delete previously-rendered files + clear renderedImages/chosenRender for a shot.
@@ -225,7 +329,7 @@ export class SceneRenderService {
   /** Dispatch one pending job: build workflow, submit to ComfyUI, mark running. */
   async dispatchPending(jobId: string): Promise<void> {
     const job = await this.prisma.sceneRenderJob.findUnique({ where: { id: jobId } });
-    if (!job) throw new Error(`Scene render job ${jobId} not found`);
+    if (!job) throw new Error(`Shot render job ${jobId} not found`);
     try {
       const params = (job.params ?? {}) as Record<string, unknown>;
       const result = await this.renderShot({
@@ -240,14 +344,14 @@ export class SceneRenderService {
           status:        'running',
           startedAt:     new Date(),
           comfyPromptId: result.job.promptId,
-          // Persist the resolved positive so pollRunning can seed the follow-up
-          // image-validation job with what the frame was asked to depict.
+          // Persist the resolved positive — the record of what this frame was
+          // actually asked to depict (diagnostics; QC reads the shot's canon).
           params:        { ...params, _resolvedPositive: result.positive } as any,
         },
       });
       await this.ledger.attachPrompt('scene', jobId, result.job.promptId);
     } catch (e: any) {
-      this.logger.error(`Scene dispatch ${jobId} failed: ${e.message}`);
+      this.logger.error(`Shot render dispatch ${jobId} failed: ${e.message}`);
       await this.prisma.sceneRenderJob.update({
         where: { id: jobId },
         data:  { status: 'failed', errorMessage: e.message, completedAt: new Date() },
@@ -280,14 +384,8 @@ export class SceneRenderService {
         // renumber filenames on collision, so we record the post-move names.
         const finalFilenames = await this.moveOutputsToShotDir(j.shotId, filenames);
         await this.appendShotRenders(j.shotId, finalFilenames, j.comfyPromptId);
-        // Vision QC is OPT-IN: only when the render was enqueued with
-        // `validate: true` (the checkbox next to the render buttons). No
-        // unconditional auto-validation (user 2026-07-04).
-        if (((j.params ?? {}) as any)?.validate === true) {
-          const resolvedPositive = ((j.params ?? {}) as any)?._resolvedPositive ?? null;
-          await this.validation.enqueue(j.shotId, resolvedPositive).catch((e: any) =>
-            this.logger.warn(`validation enqueue for shot ${j.shotId} failed: ${e?.message ?? e}`));
-        }
+        // Per-render QC is gone (2026-08-07): image QC is now ONE project-wide
+        // run started from the «Кадры QC» page, like the audio QC.
       }
       const failure = success && filenames.length > 0
         ? null
@@ -364,8 +462,14 @@ export class SceneRenderService {
     }
     if (pairs.length === 0) return finalNames;
 
-    // Upscale src → dest in one Python process (Pillow Lanczos to fit FHD).
-    const upscaled = await this.runUpscale(pairs);
+    // Upscale src → dest in one Python process (Pillow Lanczos). A comic-panel
+    // shot lands on its shape's still target instead of the 1920×1080 default —
+    // the legacy cover+crop to FHD would butcher a square/tall render.
+    const panelShape = await this.resolveComicPanelShape(shotId);
+    const target = panelShape
+      ? resolveShotRenderSize(panelShape, 'still_final', 'sdxl', this.comicRegistry)
+      : undefined;
+    const upscaled = await this.runUpscale(pairs, target);
 
     // For any file the upscaler skipped/failed on, fall back to a plain move so
     // we still capture the render (just at native bucket size).
@@ -397,13 +501,15 @@ export class SceneRenderService {
    * successfully upscaled files. Returns 0 on any subprocess error — caller
    * falls back to a plain move.
    */
-  private runUpscale(pairs: Array<[string, string]>): Promise<number> {
+  private runUpscale(pairs: Array<[string, string]>, target?: { width: number; height: number }): Promise<number> {
     return new Promise((resolve) => {
       if (!existsSync(KOHYA_PYTHON) || !existsSync(UPSCALE_SCRIPT)) {
         this.logger.warn('runUpscale: python or script missing — skipping');
         return resolve(0);
       }
       const flat: string[] = [UPSCALE_SCRIPT];
+      // Without --target the script keeps its historical 1920×1080 default.
+      if (target) { flat.push('--target', `${target.width}x${target.height}`); }
       for (const [s, d] of pairs) { flat.push(s); flat.push(d); }
       const proc = spawn(KOHYA_PYTHON, flat, { stdio: ['ignore', 'pipe', 'pipe'] });
       let okCount = 0;
@@ -681,7 +787,7 @@ export class SceneRenderService {
         const explicit = sp.profile ? ` (chose ${sp.profile.profileCode}: ${sp.profile.loraPath ? 'LoRA missing trigger' : 'no LoRA trained yet'})` : '';
         throw new BadRequestException(
           `Character "${sp.character.code}" (${sp.character.displayName ?? '?'}) has no trained LoRA${explicit}. ` +
-          `Train one via POST /training/profiles/:profileId/start before rendering scenes.`,
+          `Train one via POST /training/profiles/:profileId/start before rendering shots.`,
         );
       }
       participants.push({
@@ -779,6 +885,27 @@ export class SceneRenderService {
     // overrides in 4b/4c patch — those blocks must not touch them.
     const usingQwenGraph = visualStyle === QWEN_VISUAL_STYLE || anchorImagePaths !== undefined;
     const template = this.scenes.loadTemplate(strategy, shot.project.slug);
+
+    // ── 3b. Comic panel shape (template-layout mode) ─────────────────────────
+    // A shot planned into a comic page renders at its panel shape's gen bucket
+    // and hires-fixes straight to the shape's still target. panelShape=null on
+    // every legacy shot → genSize/stillSize stay undefined and the historical
+    // defaults below apply verbatim.
+    const panelShape = await this.resolveComicPanelShape(input.shotId);
+    if (panelShape && strategy.supportedShapes && !strategy.supportedShapes.includes(panelShape)) {
+      throw new BadRequestException(
+        `Shot ${shot.shotCode}: strategy ${strategy.id} cannot render panel shape "${panelShape}" ` +
+        `(supports: ${strategy.supportedShapes.join(', ')}). Move the shot to a supported slot ` +
+        `or change its participant count/style.`,
+      );
+    }
+    const modelFamily: ModelFamily =
+      usingQwenGraph ? 'qwen' : strategy.id.includes('flux') ? 'flux' : 'sdxl';
+    const genSize   = panelShape ? resolveShotRenderSize(panelShape, 'image_base',  modelFamily, this.comicRegistry) : undefined;
+    const stillSize = panelShape ? resolveShotRenderSize(panelShape, 'still_final', modelFamily, this.comicRegistry) : undefined;
+    if (panelShape) {
+      this.logger.log(`[${shot.shotCode}] comic panel shape "${panelShape}" → gen ${genSize!.width}x${genSize!.height}, still ${stillSize!.width}x${stillSize!.height}`);
+    }
 
     // ── 4. Build params ──────────────────────────────────────────────────────
     const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
@@ -887,8 +1014,12 @@ export class SceneRenderService {
       locationPrompt: qwenLocationPrompt,
       negativeExtra:  input.negativeExtra ?? negative ?? undefined,
       // SDXL native landscape bucket — 1 megapixel, ~16:9, clean output.
-      width:          input.width  ?? 1344,
-      height:         input.height ?? 768,
+      // A comic-panel shot overrides this with its shape's gen bucket.
+      width:          input.width  ?? genSize?.width  ?? 1344,
+      height:         input.height ?? genSize?.height ?? 768,
+      panelShape:     panelShape ?? undefined,
+      hiresWidth:     stillSize?.width,
+      hiresHeight:    stillSize?.height,
       seed:           input.seed   ?? Math.floor(Math.random() * 2 ** 32),
       steps:          input.steps  ?? normalizeSceneSteps((shot.project as any).settings),
       cfg:            input.cfg,

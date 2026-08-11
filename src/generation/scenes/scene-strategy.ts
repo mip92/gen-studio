@@ -38,6 +38,16 @@ export interface SceneStrategy {
    */
   readonly visualStyle?: string;
 
+  /**
+   * Comic panel shapes this strategy can render correctly (keys of
+   * comic_page_shapes.json). Undefined = no restriction (the graph is fully
+   * parameterized by width/height). Declare an explicit list only when the
+   * graph has geometric assumptions a foreign aspect would break — e.g. the
+   * dual-character regional split is hard-tied to a landscape canvas.
+   * Enforced by scene-render.service and by the comic-plan readiness gate.
+   */
+  readonly supportedShapes?: string[];
+
   /** Inject scene params into a deep-cloned template and return the ready prompt dict. */
   buildPrompt(template: WorkflowTemplate, params: SceneJobParams): WorkflowTemplate;
 }

@@ -1,0 +1,34 @@
+{
+  "project": "optimizer",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ШЕСТЬ МИНУТ. НОЛЬ РОЛИКОВ В СЕТИ 📋",
+      "shots": [
+        "A0_SH01",
+        "A0_SH03",
+        "A0_SH05",
+        "A0_SH06",
+        "A0_SH10",
+        "A0_SH13"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "А У ВАС ТАМ ТОЖЕ ТАК ДЕЛАЮТ? 📦",
+      "shots": [
+        "A5_SH02",
+        "A5_SH04",
+        "A5_SH05",
+        "A5_SH06",
+        "A5_SH09",
+        "A5_SH12",
+        "A5_SH14"
+      ]
+    }
+  ]
+}

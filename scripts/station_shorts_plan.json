@@ -1,0 +1,34 @@
+{
+  "project": "station",
+  "fill": "cover",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "shorts": [
+    {
+      "slug": "hook",
+      "title": "ДВЕ ОЧЕРЕДИ. ОБЕ К ТЕБЕ ⛽",
+      "shots": [
+        "A0_SH01",
+        "A0_SH02",
+        "A0_SH03",
+        "A0_SH05",
+        "A0_SH06",
+        "A0_SH10"
+      ]
+    },
+    {
+      "slug": "finale",
+      "title": "ОН ПРИГНАЛ КОМБАЙН ЗА 30 ЛИТРАМИ 🚜",
+      "shots": [
+        "A6_SH01",
+        "A6_SH04",
+        "A6_SH05",
+        "A6_SH07",
+        "A6_SH21",
+        "A6_SH23",
+        "A6_SH25"
+      ]
+    }
+  ]
+}

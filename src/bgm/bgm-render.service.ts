@@ -25,7 +25,9 @@ import {
   DEFAULT_RENDER_PARAMS,
   OVERGEN_SECONDS,
   RENDER_MAX_SECONDS,
+  INSTRUMENTAL_LYRICS,
   normaliseMusicMetas,
+  pulseTemperature,
 } from './bgm.types';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
@@ -82,29 +84,20 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     });
     if (!segment) throw new NotFoundException(`Segment ${input.segmentId} not found`);
 
-    // Gate: music can only be generated once ALL project voiceover is done —
-    // the act length (and thus the tiling) is derived from VO, so rendering
-    // before TTS is approved would tile against a moving target. A shot "needs
-    // VO" iff it has narrationText; "ready" iff it also has an approved take.
-    const pendingTts = await this.prisma.shot.count({
-      where: {
-        projectId:        segment.block.projectId,
-        narrationText:    { not: null },
-        approvedTTSJobId: null,
-      },
-    });
-    if (pendingTts > 0) {
-      throw new BadRequestException(
-        `Cannot render music yet: ${pendingTts} shot(s) still need approved voiceover. `
-        + `Music length is computed from the finished narration — finish TTS first.`,
-      );
-    }
-
+    // There used to be an all-or-nothing gate here: no music until EVERY shot in
+    // the project had an approved take, because act length is derived from VO and
+    // tiling against a moving target seemed wrong. In practice it meant one
+    // unrendered line out of 346 froze the whole soundtrack (car_flipper, 16
+    // pending — user 2026-08-10), and the reasoning no longer holds: a shot with
+    // no take now falls back to the project's text-length estimate
+    // (`narrationUsFromText`), so the target is a decent number from the start
+    // and only sharpens as takes land. Tiles are per-act and cheap to re-render,
+    // and every act carries two spare tracks precisely for slack like this.
     const promptOverride = input.prompt?.trim();
     const promptResolved = promptOverride
       || segment.prompt?.trim()
       || segment.block.moodPrompt?.trim()
-      || 'dark synthwave, industrial soundtrack, sci-fi cinematic, John Carpenter style, Joel Nielsen Black Mesa, analog synthesizers, driving rhythm, instrumental, no vocals';
+      || 'cinematic ambient, no percussion, sustained analog synthesizer pads, low drone, instrumental, no vocals';
     const durationSec = input.durationSec ?? segment.durationSec;
     if (durationSec < 10 || durationSec > 240) {
       throw new BadRequestException(`durationSec must be in [10, 240] (got: ${durationSec})`);
@@ -141,6 +134,7 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         bpm,
         keyscale,
         timesignature,
+        temperature: pulseTemperature(promptResolved),
         durationSec,
         renderSec,
         seed,
@@ -187,6 +181,7 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         bpm:            params.bpm ?? null,
         keyscale:       params.keyscale ?? null,
         timesignature:  params.timesignature ?? null,
+        temperature:    params.temperature ?? null,
         // ACE-Step renders renderSec; CapCut trims to durationSec on export.
         // Older job rows without renderSec fall back to durationSec.
         renderSec:      params.renderSec ?? params.durationSec,
@@ -294,6 +289,11 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
    *   8 — ModelSamplingAuraFlow         (untouched, shift=3 is the v1.5 default)
    *   2 — EmptyAceStep1.5LatentAudio    .seconds  ← durationSec
    *   3 — TextEncodeAceStepAudio1.5     .tags     ← prompt (positive)
+   *                                     .lyrics   ← "[instrumental]" always
+   *                                     .temperature ← pulseTemperature() of the
+   *                                                 caption (0.7 percussive /
+   *                                                 0.85 ambient), null on older
+   *                                                 job rows keeps the template
    *                                     .duration ← durationSec (must match
    *                                                 EmptyAceStep1.5LatentAudio
    *                                                 to avoid latent/cond mismatch)
@@ -324,6 +324,8 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     bpm:            number | null;
     keyscale:       string | null;
     timesignature:  string | null;
+    /** Audio-code LM temperature; null (older job rows) keeps the template's 0.85. */
+    temperature:    number | null;
     /** Seconds passed to ACE-Step (renderSec — already includes overgen tail). */
     renderSec:      number;
     seed:           number;
@@ -339,11 +341,16 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     };
     set('2', 'seconds',         p.renderSec);
     set('3', 'tags',             p.prompt);
+    // ACE-Step was trained with section markers in the lyrics channel;
+    // "[instrumental]" is the canonical no-vocals form and beats the empty
+    // string the template ships. All our music is instrumental by policy.
+    set('3', 'lyrics',           INSTRUMENTAL_LYRICS);
     set('3', 'duration',         p.renderSec);
     set('3', 'seed',             p.seed);
     if (p.bpm           !== null) set('3', 'bpm',           p.bpm);
     if (p.keyscale      !== null) set('3', 'keyscale',      p.keyscale);
     if (p.timesignature !== null) set('3', 'timesignature', p.timesignature);
+    if (p.temperature   !== null) set('3', 'temperature',   p.temperature);
     set('5', 'seed',             p.seed);
     set('5', 'steps',            p.steps);
     set('5', 'cfg',              p.cfg);

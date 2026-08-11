@@ -11,7 +11,7 @@ import {
   SPARE_TRACK_COUNT,
   normaliseMusicMetas,
 } from './bgm.types';
-import { shotHoldUs, narrationUsFromTts } from '../exports/shot-timing';
+import { shotHoldUs, narrationUsFromTts, narrationUsFromText } from '../exports/shot-timing';
 
 /**
  * Default-fallback duration per shot when its chosen video isn't available yet
@@ -221,6 +221,48 @@ export class BgmService {
   }
 
   /**
+   * Move one tile up or down within its act. The order being edited is the
+   * exporter's placement order — main tiles by sortOrder, then spare tiles by
+   * sortOrder (exports.service.ts lays exactly this combined list on the a/b
+   * checkerboard). The spare flag belongs to the POSITION, not the tile: a
+   * spare moved into the mains zone becomes a main tile and the tile it
+   * displaces becomes a spare, so the act's coverage tile count never changes.
+   * Takes and approvals travel with the tile — that is the point: when a spare
+   * take sounds better than a main one, promote it instead of re-rendering.
+   */
+  async moveSegment(segmentId: string, direction: 'up' | 'down') {
+    if (direction !== 'up' && direction !== 'down') {
+      throw new BadRequestException(`direction must be 'up' or 'down' (got: ${String(direction)})`);
+    }
+    const seg = await this.prisma.musicSegment.findUnique({ where: { id: segmentId } });
+    if (!seg) throw new NotFoundException(`Segment ${segmentId} not found`);
+
+    const siblings = await this.prisma.musicSegment.findMany({
+      where:   { blockId: seg.blockId },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+    });
+    const ordered = [...siblings.filter((s) => !s.spare), ...siblings.filter((s) => s.spare)];
+    const from = ordered.findIndex((s) => s.id === segmentId);
+    const to   = direction === 'up' ? from - 1 : from + 1;
+    if (to < 0 || to >= ordered.length) {
+      throw new BadRequestException(`Segment is already ${direction === 'up' ? 'first' : 'last'} in its act`);
+    }
+    [ordered[from], ordered[to]] = [ordered[to], ordered[from]];
+
+    // Rewrite the whole block in one transaction: sortOrder = combined index,
+    // spare = zone. This also normalises legacy blocks whose sortOrders
+    // interleave mains and spares — the combined order IS what exports play.
+    const mainsCount = siblings.filter((s) => !s.spare).length;
+    await this.prisma.$transaction(
+      ordered.map((s, i) => this.prisma.musicSegment.update({
+        where: { id: s.id },
+        data:  { sortOrder: i, spare: i >= mainsCount },
+      })),
+    );
+    return this.getBlock(seg.blockId);
+  }
+
+  /**
    * Approve an AudioRenderJob as the canonical take for its segment. Mirrors
    * the TTSJob.approve / VideoRender.chosenVideoId convention: plain id (no FK),
    * only `completed` jobs eligible, null clears.
@@ -342,10 +384,18 @@ export class BgmService {
       const shot = shots.find((s) => s.id === id);
       if (!shot) { totalUs += DEFAULT_SHOT_SECONDS * 1_000_000; continue; }
 
-      const narrationUs = narrationUsFromTts(
-        (shot as { approvedTTSJobId?: string | null }).approvedTTSJobId ?? null,
-        (shot as { ttsJobs?: Array<{ id: string; durationMs: number | null; text: string }> }).ttsJobs ?? [],
-      );
+      // Approved take first — that is the real, probed length. Failing that,
+      // estimate from the written narration instead of letting the shot fall
+      // back to the flat no-VO default: an act whose VO isn't rendered yet would
+      // otherwise measure ~4 s per shot and get tiled far too short. The target
+      // is recomputed on every fill/recompute, so it sharpens into the exact
+      // number as the real takes land.
+      const narrationUs =
+        narrationUsFromTts(
+          (shot as { approvedTTSJobId?: string | null }).approvedTTSJobId ?? null,
+          (shot as { ttsJobs?: Array<{ id: string; durationMs: number | null; text: string }> }).ttsJobs ?? [],
+        )
+        ?? narrationUsFromText((shot as { narrationText?: string | null }).narrationText ?? null);
 
       // Resolve render mode + native animated-clip length, mirroring the export.
       let kind: 'image' | undefined;

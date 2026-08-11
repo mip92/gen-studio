@@ -32,7 +32,7 @@ export interface AnchorVerdict {
 
 /**
  * Neural validation of character ANCHOR portraits — the identity source every
- * scene draws the character from, so a bad anchor poisons every shot. Mirrors
+ * shot render draws the character from, so a bad anchor poisons every shot. Mirrors
  * ImageValidationService but scores against the character's identity spec
  * (promptBase) with a HARD anti-anime rule: this pipeline is western graphic
  * novel, so an anime/manga/chibi face is an automatic reject. Picks the best
@@ -82,7 +82,25 @@ export class AnchorValidationService {
     if (files.length === 0) {
       return { queued: false, jobId: null, reason: 'no candidate portraits on disk — generate an anchor first' };
     }
-    const job = await this.enqueue(profileId, files, profile.promptBase ?? null);
+    // Score only what was never scored (user 2026-08-03: «валидировать надо
+    // только те, которые не были провалидированы») — candidates accumulate
+    // across renders, and re-scoring the old batches wastes an Ollama pass.
+    const seen = new Set<string>();
+    const completed = await this.db.anchorValidationJob.findMany({
+      where:   { profileId, status: 'completed' },
+      orderBy: { queuedAt: 'desc' },
+      take:    20,
+    });
+    for (const j of completed) {
+      for (const v of (Array.isArray(j.result) ? j.result : [])) {
+        if (v?.filename && !v.error) seen.add(v.filename);
+      }
+    }
+    const fresh = files.filter((f) => !seen.has(f));
+    if (fresh.length === 0) {
+      return { queued: false, jobId: null, reason: 'все кандидаты уже провалидированы — новых файлов нет' };
+    }
+    const job = await this.enqueue(profileId, fresh, profile.promptBase ?? null);
     return { queued: !!job, jobId: job?.id ?? null, reason: job ? undefined : 'a validation is already pending/running' };
   }
 
@@ -147,11 +165,20 @@ export class AnchorValidationService {
 
       let suggestedPrompt: string | null = null;
       if (winner) {
-        // Install the winning candidate as the profile's canonical anchor.
+        // Install the winning candidate as the profile's canonical anchor —
+        // but ONLY when no anchor is installed yet. An existing anchor is the
+        // user's approved pick (or a prior install they've been working from):
+        // re-validating extra candidates must never overwrite it (user
+        // 2026-08-03: «не перезатирать существующие»). The verdicts still land
+        // in the gallery; installing stays the user's move.
         const destDir  = path.join(APP_ROOT, 'data', project.slug, 'reference');
         const destPath = path.join(destDir, `${profile.profileCode}_anchor.png`);
-        mkdirSync(destDir, { recursive: true });
-        copyFileSync(path.join(candDir, winner.filename), destPath);
+        if (existsSync(destPath)) {
+          this.logger.log(`Anchor validation ${jobId}: anchor already installed for ${profile.profileCode} — keeping it, verdicts only`);
+        } else {
+          mkdirSync(destDir, { recursive: true });
+          copyFileSync(path.join(candDir, winner.filename), destPath);
+        }
       } else {
         suggestedPrompt = await this.suggestPrompt(identitySpec, verdicts).catch((e) => {
           this.logger.warn(`suggestPrompt failed: ${e?.message ?? e}`);

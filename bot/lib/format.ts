@@ -4,7 +4,9 @@ import type { JobType, QueueFilters, QueueRow, StatusFilter } from './api';
 const TYPE_LABEL: Record<JobType, string> = {
   training:          'train',
   dataset:           'dataset',
-  scene:             'scene',
+  // Ledger value 'scene' is the shot IMAGE render (historical name) — show it
+  // as 'shot img' so the queue list doesn't lie about the entity.
+  scene:             'shot img',
   video:             'video',
   video_post:        'fhd+fps',
   tts:               'tts',

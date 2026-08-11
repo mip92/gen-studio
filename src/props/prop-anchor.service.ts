@@ -222,9 +222,11 @@ export class PropAnchorService {
     mkdirSync(refDir, { recursive: true });
     copyFileSync(src, path.join(refDir, destName));
     const relPath = ['data', prop.project.slug, 'reference', destName].join('/');
+    // Choosing a candidate from the gallery IS the approve — the user looked at
+    // the object and picked this render.
     return this.prisma.prop.update({
       where: { id: propId },
-      data:  { anchorPath: relPath, updatedAt: new Date() },
+      data:  { anchorPath: relPath, anchorApprovedAt: new Date(), updatedAt: new Date() },
     });
   }
 
@@ -239,9 +241,31 @@ export class PropAnchorService {
     const relPath = ['data', prop.project.slug, 'reference', destName].join('/');
     await this.prisma.prop.update({
       where: { id: propId },
-      data:  { anchorPath: relPath, updatedAt: new Date() },
+      data:  { anchorPath: relPath, anchorApprovedAt: new Date(), updatedAt: new Date() },
     });
     return relPath;
+  }
+
+  /**
+   * Sign off on the installed object anchor.
+   *
+   * Needed because a completed render installs its first candidate by itself:
+   * without an explicit approval there is no moment at which the user is asked
+   * whether that image is actually the object. Scene rendering refuses to run
+   * for a shot whose prop anchor is unapproved, and /actions keeps showing
+   * `approve_prop_anchor` until this is called.
+   */
+  async approveAnchor(propId: string) {
+    const abs = await this.anchorPath(propId);
+    if (!abs) {
+      throw new BadRequestException(
+        'This prop has no installed anchor — render or upload one before approving.',
+      );
+    }
+    return this.prisma.prop.update({
+      where: { id: propId },
+      data:  { anchorApprovedAt: new Date(), updatedAt: new Date() },
+    });
   }
 
   /** Drop the anchor — the prop falls back to text-only until regenerated. */
@@ -250,7 +274,7 @@ export class PropAnchorService {
     if (abs) { try { unlinkSync(abs); } catch { /* already gone */ } }
     return this.prisma.prop.update({
       where: { id: propId },
-      data:  { anchorPath: null, updatedAt: new Date() },
+      data:  { anchorPath: null, anchorApprovedAt: null, updatedAt: new Date() },
     });
   }
 
@@ -435,7 +459,10 @@ export class PropAnchorService {
 
         await this.prisma.prop.update({
           where: { id: prop.id },
-          data:  { anchorPath: relPath, updatedAt: new Date() },
+          // anchorApprovedAt is cleared, never carried over: this image was
+          // picked by "first file wins", nobody has looked at it, and if it
+          // just overwrote an approved anchor that approval is now stale.
+          data:  { anchorPath: relPath, anchorApprovedAt: null, updatedAt: new Date() },
         });
         await this.prisma.propAnchorJob.update({
           where: { id: j.id },

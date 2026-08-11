@@ -3,7 +3,9 @@ import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { SceneRenderService, RenderShotInput } from './scene-render.service';
 import { SceneFactory } from './scene.factory';
 
-@ApiTags('Scenes')
+// NB: the class/folder is named "scenes" for historical reasons, but everything
+// here renders the still image of ONE SHOT (Scene = act in this domain).
+@ApiTags('Shot renders')
 @Controller('generation/shots')
 export class ScenesController {
   constructor(
@@ -13,7 +15,7 @@ export class ScenesController {
 
   @Post(':shotId/render')
   @ApiOperation({
-    summary: 'Preview-only — assemble scene workflow without queuing it',
+    summary: 'Preview-only — assemble the shot render workflow without queuing it',
     description:
       'Returns the assembled prompt JSON for inspection (?dryRun=true required). ' +
       'For real rendering use POST :shotId/enqueue so the pipeline queue sequences ' +
@@ -36,9 +38,9 @@ export class ScenesController {
 
   @Post(':shotId/enqueue')
   @ApiOperation({
-    summary: 'Enqueue a scene render via the pipeline queue',
+    summary: 'Enqueue a shot image render via the pipeline queue',
     description:
-      'Creates a pending SceneRenderJob. Pipeline worker dispatches it after any running ' +
+      'Creates a pending SceneRenderJob (historical name — it renders one shot). Pipeline worker dispatches it after any running ' +
       'training/dataset finishes, ensures ComfyUI is alive, polls completion, and appends ' +
       'output filenames to shot.renderedImages.',
   })
@@ -57,15 +59,12 @@ export class ScenesController {
       '(awaiting approval), approved (chosenRender set), or already have a pending/running job. ' +
       'projectId may be the project UUID or slug. Returns { enqueued }.',
   })
-  enqueueProjectPending(
-    @Param('projectId') projectId: string,
-    @Body() body?: { validate?: boolean },
-  ) {
-    return this.render.enqueuePendingForProject(projectId, { validate: body?.validate === true });
+  enqueueProjectPending(@Param('projectId') projectId: string) {
+    return this.render.enqueuePendingForProject(projectId);
   }
 
   @Get('strategies')
-  @ApiOperation({ summary: 'List registered scene strategies' })
+  @ApiOperation({ summary: 'List registered shot render strategies (ids are scene_* for historical reasons)' })
   listStrategies() {
     return this.scenes.list();
   }

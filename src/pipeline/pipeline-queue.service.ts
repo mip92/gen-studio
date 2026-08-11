@@ -11,8 +11,10 @@ import { BgmRenderService } from '../bgm/bgm-render.service';
 import { AnchorRenderService } from '../characters/anchor-render.service';
 import { PropAnchorService } from '../props/prop-anchor.service';
 import { ThumbnailRenderService } from '../thumbnails/thumbnail-render.service';
-import { ImageValidationService } from '../validation/image-validation.service';
 import { AnchorValidationService } from '../validation/anchor-validation.service';
+import { VoValidationService } from '../validation/vo-validation.service';
+import { ImageQcService } from '../validation/image-qc.service';
+import { VideoQcService } from '../validation/video-qc.service';
 import { YoutubeCaptionsService } from '../youtube/youtube-captions.service';
 import { EngineService } from './engine.service';
 import { QueueLedgerService, QueueEntryRow } from './queue-ledger.service';
@@ -65,8 +67,10 @@ export class PipelineQueueService {
     private readonly anchors:  AnchorRenderService,
     private readonly propAnchors: PropAnchorService,
     private readonly thumbnails: ThumbnailRenderService,
-    private readonly validation: ImageValidationService,
     private readonly anchorValidation: AnchorValidationService,
+    private readonly voValidation: VoValidationService,
+    private readonly imageQc: ImageQcService,
+    private readonly videoQc: VideoQcService,
     private readonly captions: YoutubeCaptionsService,
     private readonly engine:   EngineService,
     private readonly ledger:   QueueLedgerService,
@@ -147,6 +151,25 @@ export class PipelineQueueService {
       this.logger.log(`Dispatching ${e.jobType} ${e.jobId} (${e.label}) — stopping ComfyUI to free the GPU`);
       try { await this.engine.stopComfy(); }
       catch (err: any) { this.logger.warn(`stopComfy failed (proceeding anyway): ${err.message}`); }
+
+      // An ollama-class job needs the server actually running, not merely the
+      // card free. Nothing used to start it, so a down Ollama meant the job
+      // reached its `fetch` and died instantly — the whole point of arbitrating
+      // engines is defeated if we free the GPU for a service that isn't there.
+      // Started here (not at boot) so a run with no vision work never pays for
+      // it. Consecutive ollama jobs cost nothing: this is a no-op once alive.
+      if (cls === 'ollama') {
+        try {
+          const { alreadyAlive } = await this.engine.startOllama();
+          if (!alreadyAlive) this.logger.log('Ollama was down — started it for this job');
+        } catch (err: any) {
+          const msg = `Ollama could not be started: ${err.message}`;
+          this.logger.error(`${e.jobType} ${e.jobId}: ${msg}`);
+          await this.source.fail(e.jobType, e.jobId, msg);
+          await this.ledger.close(e.jobType, e.jobId, { status: 'failed', errorMessage: msg });
+          return false;
+        }
+      }
       return true;
     }
 
@@ -204,10 +227,26 @@ export class PipelineQueueService {
           void this.tts.dispatchPending(e.jobId).catch((err) =>
             this.logger.error(`tts dispatchPending ${e.jobId} threw: ${err?.message ?? err}`));
           return;
-        case 'validation':
-          await this.markSourceRunning('imageValidationJob', e.jobId);
-          void this.validation.run(e.jobId).catch((err) =>
-            this.logger.error(`validation run ${e.jobId} threw: ${err?.message ?? err}`));
+        case 'validation': {
+          // Retired 2026-08-07 (replaced by 'image_qc'). A pending entry can
+          // only be a leftover from before the cutover — close it so it never
+          // stalls the queue.
+          const msg = 'image validation retired — заменена на image_qc';
+          await this.prisma.$executeRaw`
+            UPDATE image_validation_jobs SET status = 'failed', "errorMessage" = ${msg}, "completedAt" = now()
+            WHERE id = ${e.jobId} AND status IN ('pending', 'running')`.catch(() => {});
+          await this.ledger.close('validation', e.jobId, { status: 'cancelled', errorMessage: msg });
+          return;
+        }
+        case 'image_qc':
+          await this.markSourceRunning('imageQcRun', e.jobId);
+          void this.imageQc.run(e.jobId).catch((err) =>
+            this.logger.error(`image qc run ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
+        case 'video_qc':
+          await this.markSourceRunning('videoQcRun', e.jobId);
+          void this.videoQc.run(e.jobId).catch((err) =>
+            this.logger.error(`video qc run ${e.jobId} threw: ${err?.message ?? err}`));
           return;
         case 'anchor_validation':
           await this.markSourceRunning('anchorValidationJob', e.jobId);
@@ -218,6 +257,11 @@ export class PipelineQueueService {
           await this.markSourceRunning('captionJob', e.jobId);
           void this.captions.run(e.jobId).catch((err) =>
             this.logger.error(`caption run ${e.jobId} threw: ${err?.message ?? err}`));
+          return;
+        case 'vo_validation':
+          await this.markSourceRunning('voValidationRun', e.jobId);
+          void this.voValidation.run(e.jobId).catch((err) =>
+            this.logger.error(`vo validation run ${e.jobId} threw: ${err?.message ?? err}`));
           return;
       }
     } catch (err: any) {

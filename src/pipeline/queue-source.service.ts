@@ -39,6 +39,9 @@ const SOURCE: Record<JobType, SourceColumns> = {
   validation: { delegate: 'imageValidationJob',  status: 'status',        prompt: null,              output: 'chosenFilename',     error: 'errorMessage',        completed: 'completedAt' },
   anchor_validation: { delegate: 'anchorValidationJob', status: 'status', prompt: null,              output: 'chosenFilename',     error: 'errorMessage',        completed: 'completedAt' },
   caption:    { delegate: 'captionJob',          status: 'status',        prompt: null,              output: 'srtPath',            error: 'errorMessage',        completed: 'completedAt' },
+  vo_validation: { delegate: 'voValidationRun',  status: 'status',        prompt: null,              output: null,                 error: 'errorMessage',        completed: 'completedAt' },
+  image_qc:   { delegate: 'imageQcRun',          status: 'status',        prompt: null,              output: null,                 error: 'errorMessage',        completed: 'completedAt' },
+  video_qc:   { delegate: 'videoQcRun',          status: 'status',        prompt: null,              output: null,                 error: 'errorMessage',        completed: 'completedAt' },
   dataset:    { delegate: 'datasetJob',          status: 'status',        prompt: 'comfyPromptId',   output: null,                 error: 'errorMessage',        completed: 'completedAt' },
   training:   { delegate: 'trainingJob',         status: 'status',        prompt: null,              output: 'outputLoraPath',     error: 'errorMessage',        completed: 'completedAt' },
 };

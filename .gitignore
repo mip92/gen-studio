@@ -70,3 +70,6 @@ serve_backend.log
 # audit / migration scratch output (scripts/audit_motion_prompts.sql, _migrate_motion_wan22.py)
 tmp_motion_*.txt
 tmp_motion_*.out
+
+# scratch output from one-off audit scripts
+scripts/tmp_*.out

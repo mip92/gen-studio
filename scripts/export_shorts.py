@@ -371,7 +371,9 @@ def build_short_manifest(short: dict, shots_by_code: dict, slug: str,
         "max_timeline_us": total_us,
         # «видео уже на канале» badge over the whole short ("" = none).
         "overlay_text": overlay_text,
-        # One scene per short — its shots play in the plan's given order.
+        # The manifest "scenes" slot normally holds ACTS; for a short we fake a
+        # single pseudo-act (sceneKey = short slug) so export_capcut.py can be
+        # reused as-is. Its shots play in the plan's given order.
         "scenes": [{
             "sceneKey":  short_slug,
             "title":     short.get("title") or short_slug,

@@ -47,6 +47,9 @@ export class DualCharacterGraphicNovelSceneStrategy implements SceneStrategy {
   readonly filename         = 'scene_dual_character_graphic_novel_api.json';
   readonly participantCount = 2;
   readonly visualStyle      = 'graphic_novel_cell_shaded';
+  /** Left/right ConditioningSetArea regions are baked into the JSON for a
+   *  1344×768 canvas — any other panel shape would desync them. */
+  readonly supportedShapes  = ['landscape'];
 
   buildPrompt(template: WorkflowTemplate, params: SceneJobParams): WorkflowTemplate {
     const wf = structuredClone(template);
@@ -72,6 +75,9 @@ export class DualCharacterGraphicNovelSceneStrategy implements SceneStrategy {
 
     // Keep the canvas / region split coherent: regions are hard-coded to halves
     // of 1344×768 in the JSON, so force those dimensions regardless of input.
+    // This geometric tie is also why the strategy declares
+    // supportedShapes=['landscape'] — a square/tall canvas would desync the
+    // ConditioningSetArea regions baked into the template.
     this.set(wf, '5', 'width',      1344);
     this.set(wf, '5', 'height',     768);
     this.set(wf, '5', 'batch_size', params.batchSize ?? 1);
