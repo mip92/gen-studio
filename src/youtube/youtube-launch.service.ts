@@ -283,8 +283,19 @@ export class YoutubeLaunchService {
     if (cap && ['completed', 'pending', 'running'].includes(String(cap.status))) {
       return this.get(idOrSlug);
     }
-    await this.captions.enqueueTranscribe(idOrSlug, it.videoPath, LANG);
-    this.logger.log(`launch: subtitles requested by hand for ${key} (${it.videoPath})`);
+    // WHICH job depends on whether the video is already up. Before upload, a
+    // transcribe-only job is right — the .srt waits next to the mp4 and
+    // `attachExisting` picks it up. AFTER upload there is nothing left to attach
+    // it to, so a transcribe-only job would produce a file nobody ever sends;
+    // the full job (whisper → captions.insert onto the existing videoId) is the
+    // only thing that puts subtitles on a video that is already on YouTube.
+    if (it.videoId) {
+      await this.captions.enqueue(idOrSlug, it.videoId, it.videoPath, LANG);
+      this.logger.log(`launch: subtitles requested for ALREADY UPLOADED ${key} (${it.videoId})`);
+    } else {
+      await this.captions.enqueueTranscribe(idOrSlug, it.videoPath, LANG);
+      this.logger.log(`launch: subtitles requested by hand for ${key} (${it.videoPath})`);
+    }
     return this.get(idOrSlug);
   }
 
