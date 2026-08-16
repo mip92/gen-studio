@@ -17,11 +17,17 @@ const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..
  *  already gitignored) and off any shared disk. */
 const TOKEN_PATH = path.join(APP_ROOT, 'data', 'youtube-auth.json');
 
-/** Scopes: upload a video + set its thumbnail. `force-ssl` is what `thumbnails.set`
- *  requires; `upload` is what `videos.insert` requires. Nothing read-only needed. */
+/** Scopes: upload a video + set its thumbnail + read the channel's own analytics.
+ *  `force-ssl` is what `thumbnails.set` requires; `upload` is what `videos.insert`
+ *  requires; `yt-analytics.readonly` is what `youtubeAnalytics.reports.query` and
+ *  the Reporting API (CTR / thumbnail impressions) require. The analytics scope
+ *  MUST stay in this list — re-authorising without it silently strips it from the
+ *  stored token and every reports.query starts failing with
+ *  `insufficient authentication scopes`. */
 const SCOPES = [
   'https://www.googleapis.com/auth/youtube.upload',
   'https://www.googleapis.com/auth/youtube.force-ssl',
+  'https://www.googleapis.com/auth/yt-analytics.readonly',
 ];
 
 export interface YoutubeAuthStatus {
@@ -30,6 +36,9 @@ export interface YoutubeAuthStatus {
   channelTitle: string | null;
   /** True when env is missing YT_CLIENT_ID/SECRET — nothing can work yet. */
   configured:   boolean;
+  /** False when the stored token predates the analytics scope: uploads still
+   *  work, every reports.query fails. Fix = re-run the consent flow. */
+  analytics:    boolean;
 }
 
 /**
@@ -129,15 +138,23 @@ export class YoutubeAuthService {
     return client;
   }
 
+  /** Does the stored token actually carry the analytics scope? Google echoes the
+   *  granted scopes back in the token as a space-separated `scope` string. */
+  hasAnalyticsScope(): boolean {
+    const granted = (this.loadTokens() as Credentials & { scope?: string }).scope ?? '';
+    return granted.split(/\s+/).includes('https://www.googleapis.com/auth/yt-analytics.readonly');
+  }
+
   async getStatus(): Promise<YoutubeAuthStatus> {
     const configured = this.isConfigured();
     const client = configured ? this.getClient() : null;
-    if (!client) return { connected: false, channelTitle: null, configured };
+    const analytics = this.hasAnalyticsScope();
+    if (!client) return { connected: false, channelTitle: null, configured, analytics };
     try {
-      return { connected: true, channelTitle: await this.fetchChannelTitle(client), configured };
+      return { connected: true, channelTitle: await this.fetchChannelTitle(client), configured, analytics };
     } catch (e) {
       this.logger.warn(`Auth status check failed: ${(e as Error).message}`);
-      return { connected: false, channelTitle: null, configured };
+      return { connected: false, channelTitle: null, configured, analytics };
     }
   }
 

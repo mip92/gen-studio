@@ -9,6 +9,7 @@ import { normalizeStyleLora, normalizeAnchorStyleLora } from '../generation/scen
 import { normalizeAnchorPipeline, FLUX_COMIC_STYLE, STYLE_PREFIX } from '../characters/anchor-render.service';
 import { QwenSceneGraphBuilder } from '../generation/scenes/qwen/qwen-scene-graph.builder';
 import { composeQwenInstruction, REALCOMIC_T2I_STYLE } from '../generation/scenes/qwen/qwen-prompt';
+import { describeWorkflowLookup, resolveWorkflowPath } from '../comfy/workflow-path';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? 'E:\\ComfyUI\\gen-studio';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
@@ -304,11 +305,12 @@ export class PropAnchorService {
       : pipeline === 'flux_comic'
         ? 'gen_anchor_portrait_flux_comic_api.json'
         : 'gen_anchor_portrait_graphic_novel_api.json';
-    const perProject = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
-    const shared     = path.join(APP_ROOT, 'data', '_templates', 'comfy', workflowFilename);
-    const workflowPath = existsSync(perProject) ? perProject : shared;
-    if (!existsSync(workflowPath)) {
-      await this.failJob(jobId, `Anchor workflow not found at ${perProject} (and no shared template at ${shared})`);
+    const workflowPath = resolveWorkflowPath(project.slug, workflowFilename);
+    if (!workflowPath) {
+      await this.failJob(
+        jobId,
+        `Anchor workflow not found at ${describeWorkflowLookup(project.slug, workflowFilename)}`,
+      );
       return;
     }
 

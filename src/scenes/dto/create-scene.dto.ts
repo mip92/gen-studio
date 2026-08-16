@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsOptional, IsInt, Min } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsInt, IsIn, Min } from 'class-validator';
 
 export class CreateSceneDto {
   @IsString()
@@ -17,4 +17,10 @@ export class CreateSceneDto {
   @IsString()
   @IsOptional()
   defaultReferenceProfileCode?: string;
+
+  /** Override of the project's i2v flow for every shot in this act — 'i2v' or
+   *  'flf2v'. null/absent = inherit the project. */
+  @IsOptional()
+  @IsIn(['i2v', 'flf2v'])
+  defaultVideoFlow?: string | null;
 }

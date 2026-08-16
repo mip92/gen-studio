@@ -195,6 +195,26 @@ export class ShotsService {
       if ((dto as any).locationId !== undefined) {
         await tx.$queryRaw`UPDATE shots SET "locationId" = ${(dto as any).locationId} WHERE id = ${shotId}`;
       }
+      // videoFlow — same raw-SQL reason as locationId.
+      if ((dto as any).videoFlow !== undefined) {
+        await tx.$queryRaw`UPDATE shots SET "videoFlow" = ${(dto as any).videoFlow} WHERE id = ${shotId}`;
+      }
+      // endFramePrompt. Rewriting the instruction invalidates the approval and
+      // the pick: the frame on disk answers the OLD instruction, so keeping it
+      // approved would animate towards an ending the shot no longer asks for.
+      // Only fires on an actual change, so re-saving an unchanged shot from the
+      // UI never silently drops an approval.
+      if ((dto as any).endFramePrompt !== undefined) {
+        const next = (dto as any).endFramePrompt;
+        await tx.$queryRaw`
+          UPDATE shots
+             SET "endFramePrompt" = ${next},
+                 "chosenEndFrame"     = CASE WHEN "endFramePrompt" IS DISTINCT FROM ${next}
+                                             THEN NULL ELSE "chosenEndFrame" END,
+                 "endFrameApprovedAt" = CASE WHEN "endFramePrompt" IS DISTINCT FROM ${next}
+                                             THEN NULL ELSE "endFrameApprovedAt" END
+           WHERE id = ${shotId}`;
+      }
       return updated;
     });
   }
@@ -290,9 +310,16 @@ export class ShotsService {
         throw new BadRequestException(`Filename "${filename}" is not among rendered candidates`);
       }
     }
+    // The end frame is an EDIT of the first frame, so a different first frame
+    // makes the existing end frame the continuation of an image this shot no
+    // longer ships. Both the pick and its approval go — the candidates stay on
+    // disk, but nothing pins them to a clip until someone looks again.
+    const endFrameReset = (shot as any).chosenEndFrame && filename !== shot.chosenRender
+      ? { chosenEndFrame: null, endFrameApprovedAt: null }
+      : {};
     return this.prisma.shot.update({
       where: { id: shotId },
-      data:  { chosenRender: filename },
+      data:  { chosenRender: filename, ...endFrameReset } as any,
       include: SHOT_FULL_INCLUDE,
     });
   }

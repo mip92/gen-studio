@@ -132,15 +132,9 @@ def main():
         cur.execute('''INSERT INTO scenes (id,"projectId","sceneKey",title,"sortOrder","actBeat","defaultPaletteKey","defaultTimeOfDay","createdAt")
             VALUES (%s,%s,%s,%s,%s,%s,%s,%s,now())''',
                     (PFX + "0000000a%04x" % order, PROJ, key, title, order, beat, pal, tod))
-    cur.execute('''INSERT INTO workflow_templates (id,"projectId","templateKey","filePath",description,"visualStyle","createdAt")
-        VALUES (%s,%s,'char_realcomic_qwen',%s,'Qwen 2511 realcomic scene (characters)','realcomic_qwen',now()),
-               (%s,%s,'environment_realcomic_qwen',%s,'Qwen 2511 realcomic scene (environment)','realcomic_qwen',now())''',
-                (PFX + "0000000e0001", PROJ, SLUG + "/comfy/scene_realcomic_qwen_api.json",
-                 PFX + "0000000e0002", PROJ, SLUG + "/comfy/scene_realcomic_qwen_api.json"))
-    cur.execute('''INSERT INTO workflow_routes (id,"projectId","routeKey","createdAt")
-        VALUES (%s,%s,%s,now()),(%s,%s,%s,now())''',
-                (PFX + "0000000e0011", PROJ, SLUG + "_character_ip",
-                 PFX + "0000000e0012", PROJ, SLUG + "_environment"))
+    # No workflow templates/routes: those tables were dropped 2026-08-13 and
+    # every ComfyUI graph now lives once in data/_templates/comfy/. A project
+    # needs no comfy/ dir of its own — the render resolves the shared master.
     cx.commit(); cur.close(); cx.close()
     print("FOUNDATION OK: %s (%s) chars=%d profiles=%d props=%d locs=%d scenes=%d" %
           (SLUG, PROJ, len(CHARACTERS), len(PROFILES), len(PROPS), len(LOCATIONS), len(SCENES)))

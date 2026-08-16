@@ -80,6 +80,11 @@ export type GateKey =
   | 'approve_prop_anchor'
   | 'render_scene'
   | 'approve_render'
+  // Both live at gate 6 alongside create_video: an end frame is an INPUT to the
+  // clip, not a stage after it. (Gate numbers are stages, not keys — 9 and 10
+  // already carry two keys each.)
+  | 'render_end_frame'
+  | 'approve_end_frame'
   | 'create_video'
   | 'approve_video'
   | 'upscale_video'
@@ -354,6 +359,44 @@ export class ActionsService {
       `).map((r) => r.id),
     );
 
+    // Shots on the two-frame (flf2v) flow that still owe an end frame, and how
+    // far along each is. Raw SQL for two reasons: the flow is an inheritance
+    // chain across three tables (shot → act → project) that Prisma cannot
+    // express in one include, and these columns can predate the generated
+    // client on a backend that has not re-run `prisma generate`.
+    //
+    // Shots with an EMPTY endFramePrompt are deliberately absent: on those the
+    // flow degrades to one-frame rendering by design (user 2026-08-15), so
+    // gating them would stall a clip that is allowed to be made.
+    const endFrameState = new Map<string, { hasCandidates: boolean; approved: boolean }>();
+    for (const row of await this.prisma.$queryRaw<Array<{
+      id: string; hasCandidates: boolean; approved: boolean;
+    }>>`
+      SELECT sh.id,
+             COALESCE(jsonb_array_length(sh."endFrameRenders"), 0) > 0 AS "hasCandidates",
+             sh."endFrameApprovedAt" IS NOT NULL                      AS "approved"
+        FROM shots sh
+        JOIN scenes   sc ON sc.id = sh."sceneId"
+        JOIN projects p  ON p.id  = sh."projectId"
+       WHERE sh."projectId" = ${project.id}
+         AND sh."renderMode" <> 'static'
+         AND COALESCE(sh."videoFlow", sc."defaultVideoFlow", p."defaultVideoFlow") = 'flf2v'
+         AND COALESCE(NULLIF(btrim(sh."endFramePrompt"), ''), NULL) IS NOT NULL
+    `) {
+      endFrameState.set(row.id, { hasCandidates: row.hasCandidates, approved: row.approved });
+    }
+    // An end-frame job already queued or running — the same suppression every
+    // other gate applies, so a refresh mid-render does not offer the work twice.
+    const endFrameInFlight = new Set(
+      (await this.prisma.$queryRaw<Array<{ shotId: string }>>`
+        SELECT DISTINCT j."shotId"
+          FROM end_frame_jobs j
+          JOIN shots s ON s.id = j."shotId"
+         WHERE s."projectId" = ${project.id}
+           AND j.status IN ('pending', 'running')
+      `).map((r) => r.shotId),
+    );
+
     for (const shot of shots) {
       const scene = shot.scene
         ? { id: shot.scene.id, sceneKey: shot.scene.sceneKey, title: shot.scene.title }
@@ -398,6 +441,27 @@ export class ActionsService {
       // generation for a shot the user marked renderMode='static'. The chosen
       // render PNG is the finished deliverable for these shots.
       if (shot.renderMode === 'static') continue;
+
+      // Gate 6 — end frame, for shots on the two-frame flow. Comes BEFORE
+      // create_video because the end frame is one of the clip's two inputs:
+      // offering the clip first would spend the GPU on a one-frame render of a
+      // shot that was configured for two.
+      const endFrame = endFrameState.get(shot.id);
+      if (endFrame && !shot.chosenVideoId && !endFrameInFlight.has(shot.id)) {
+        if (!endFrame.hasCandidates) {
+          out.push(this.shotItem(6, 'render_end_frame', project, shot, scene, {
+            link:   `/projects/${project.id}/shots/${shot.id}/end-frame`,
+            action: { method: 'POST', path: `/generation/shots/${shot.id}/end-frames` },
+          }));
+          continue;
+        }
+        if (!endFrame.approved) {
+          out.push(this.shotItem(6, 'approve_end_frame', project, shot, scene, {
+            link: `/projects/${project.id}/shots/${shot.id}/end-frame`,
+          }));
+          continue;
+        }
+      }
 
       // Gate 6 — create video. No chosenVideoId, no in-flight video render.
       if (!shot.chosenVideoId) {
@@ -744,12 +808,17 @@ export class ActionsService {
   ): Promise<void> {
     // Tiles nobody has rendered yet. Spares are deliberate extras and are not
     // owed, so they don't nag from here — render them from the BGM page.
+    //
+    // «Не рендерилась» — это НЕТ живого и НЕТ удачного джоба, а не «нет джобов
+    // совсем»: плитка, у которой все попытки упали (failed/cancelled), раньше не
+    // попадала ни сюда (джобы есть), ни в approve_bgm (нечего утверждать) — и
+    // молча висела в долгах овервью, ничего не предлагая (2026-08-12).
     const unrendered = await this.prisma.musicSegment.findMany({
       where: {
         block:         { projectId: project.id },
         approvedJobId: null,
         spare:         false,
-        jobs:          { none: {} },
+        jobs:          { none: { status: { in: ['pending', 'running', 'completed'] } } },
       } as any,
       select: {
         id:          true,

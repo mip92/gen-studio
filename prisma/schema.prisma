@@ -51,6 +51,18 @@ model Project {
   /// "static". Should be a strong "freeze frame, no motion" directive.
   /// **Required** (NOT NULL + CHECK non-empty).
   defaultStaticMotionPrompt String
+  /// Which i2v flow every shot in this project uses by default.
+  ///   "i2v"   — (default) one conditioning frame. `WanImageToVideo`: the shot's
+  ///             chosenRender is pinned to frame 0 and the remaining 80 frames
+  ///             are free. This is what every project rendered before 2026-08-15.
+  ///   "flf2v" — two conditioning frames. `WanFirstLastFrameToVideo`: chosenRender
+  ///             is pinned to frame 0 AND an approved end frame is pinned to the
+  ///             last frame, so drift has nowhere to accumulate. Costs one extra
+  ///             Qwen-edit image + an approval per shot.
+  /// Overridable per act (`Scene.defaultVideoFlow`) and per shot (`Shot.videoFlow`).
+  /// Default is "i2v" precisely so every pre-existing project keeps rendering the
+  /// byte-identical graph it always did; new projects opt in.
+  defaultVideoFlow          String    @default("i2v")
   /// TTS engine to use for narration synthesis. 'silero' = CPU Silero V5 ru
   /// (default; legacy projects); 'xtts2' = XTTS-v2 GPU voice cloning;
   /// 'f5' = F5-TTS Russian GPU voice cloning. Null = treat as 'silero'.
@@ -124,8 +136,6 @@ model Project {
   scenes            Scene[]
   shots             Shot[]
   locations         Location[]
-  workflowTemplates WorkflowTemplate[]
-  workflowRoutes    WorkflowRoute[]
   referenceAssets   ReferenceAsset[]
   narrativeBlocks   NarrativeBlock[]
   ttsEmotionRefs    ProjectTTSEmotionRef[]
@@ -318,6 +328,12 @@ model Scene {
   /// composer that read it was removed 2026-07-04 (renderer uses pf.positive
   /// verbatim); nothing in the backend reads this column anymore.
   lightingMood                String?
+  /// Override of Project.defaultVideoFlow for every shot in this act
+  /// ("i2v" | "flf2v"). Null = inherit the project. Same inheritance idiom as
+  /// defaultPaletteKey / defaultTimeOfDay: an act that is all quiet talking
+  /// heads can stay on the cheap one-frame flow while an act full of movement
+  /// runs on two frames.
+  defaultVideoFlow            String?
   createdAt                   DateTime @default(now())
 
   project Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
@@ -380,7 +396,25 @@ model Shot {
   /// Camera angle. Canonical values: "eye" | "low" | "high" | "dutch".
   cameraAngle          String?
   /// Camera movement. Canonical values: "static" | "track_lateral" |
-  /// "push_in" | "pull_out" | "window_pov" | "locked_off" | "handheld".
+  /// "push_in" | "pull_out" | "window_pov" | "locked_off" | "handheld" |
+  /// "pan_left" | "pan_right" | "tilt_up" | "tilt_down" |
+  /// "arc_left" | "arc_right".
+  ///
+  /// An ARC is the camera travelling AROUND the subject (added 2026-08-15); a
+  /// PAN turns the camera on its own axis and lets the subject slide out of
+  /// frame. They are different moves and both are needed.
+  ///
+  /// TWO moves may be combined with `+`, primary first: `arc_left+push_in` =
+  /// the camera arcs around the subject while closing on it. The second part is
+  /// rendered as a `while …` clause on the clip and as a compact addition on the
+  /// end frame, so both channels state ONE combined move rather than two
+  /// competing ones. Three or more parts are ignored past the second.
+  ///
+  /// This ONE column feeds two places that must never disagree: the clip's
+  /// camera clause (`CAMERA_CLAUSE` + `CAMERA_SECONDARY`, video-render.service.ts)
+  /// and, on the two-frame flow, the end frame's viewpoint
+  /// (`END_FRAME_CAMERA_MOVE` + `END_FRAME_CAMERA_ALSO`, qwen-prompt.ts).
+  /// Adding a value means adding it to all four maps.
   cameraMove           String?
   /// Dramaturgical beat this shot serves. Project-specific token, e.g.
   /// "opening_image", "catalyst", "midpoint_twist", "all_is_lost",
@@ -437,6 +471,34 @@ model Shot {
   /// Source of truth is template.slots[comicSlot].shape; the comic-plan gate
   /// verifies this column agrees with it. Null = render at legacy sizes.
   comicPanelShape      String?
+  /// Override of Scene.defaultVideoFlow → Project.defaultVideoFlow for THIS shot
+  /// ("i2v" | "flf2v"). Null = inherit. Resolution is
+  /// `shot.videoFlow ?? scene.defaultVideoFlow ?? project.defaultVideoFlow`.
+  videoFlow            String?
+  /// Qwen-Image-Edit-2511 instruction that turns this shot's `chosenRender` into
+  /// its END frame — i.e. what has CHANGED five seconds later, and nothing else
+  /// ("she is now standing, palm flat on the door handle"). The end frame is an
+  /// EDIT of the start frame, never a fresh generation: re-generating would give
+  /// a different face and Wan would spend the clip morphing between two people.
+  ///
+  /// Empty on a flf2v shot means "no end frame planned here" — the /actions gate
+  /// skips it, and the shot cannot start a video until either a prompt is written
+  /// or the shot is flipped back to "i2v".
+  endFramePrompt       String?
+  /// Rendered end-frame candidates, same shape as `renderedImages`:
+  /// [{filename, promptId, seed, createdAt}]. Files live in
+  /// `data/<project>/shots/<shotCode>/endframes/`.
+  endFrameRenders      Json?
+  /// Basename of the end-frame candidate picked as canonical. Mirrors
+  /// `chosenRender` for the last frame.
+  chosenEndFrame       String?
+  /// When the chosen end frame was approved for animation. Mirrors
+  /// `CharacterProfile.anchorApprovedAt`: a flf2v shot REFUSES to start a video
+  /// until this is set, because a bad end frame does not degrade the clip — it
+  /// dictates the last thing the viewer sees, and the GPU time is spent either
+  /// way. Cleared whenever `chosenEndFrame`, `endFramePrompt` or the shot's
+  /// `chosenRender` changes, since all three invalidate the approval.
+  endFrameApprovedAt   DateTime?
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 
@@ -446,6 +508,7 @@ model Shot {
   comicPage      ComicPage?           @relation(fields: [comicPageId], references: [id], onDelete: SetNull)
   participants     ShotParticipant[]
   renderJobs       SceneRenderJob[]
+  endFrameJobs     EndFrameJob[]
   videoRenders     VideoRender[]
   ttsJobs          TTSJob[]
   validationJobs   ImageValidationJob[]
@@ -461,6 +524,7 @@ model Shot {
   @@index([propId])
   @@index([comicPageId])
   @@index([projectId, comicPanelShape])
+  @@index([projectId, videoFlow])
   @@map("shots")
 }
 
@@ -536,51 +600,12 @@ model ShotParticipant {
 }
 
 // ─── Workflow ─────────────────────────────────────────────────────────────────
-
-model WorkflowTemplate {
-  id          String   @id @default(uuid())
-  projectId   String
-  templateKey String
-  filePath    String
-  description String?
-  /// Optional: this template is style-specific (e.g. graphic-novel cell-shaded
-  /// IP-Adapter workflow). Null = generic across styles (TTS, BGM, upscale).
-  /// References visual_styles.id.
-  visualStyle String?
-  createdAt   DateTime @default(now())
-
-  project    Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  routeSteps WorkflowRouteStep[]
-
-  @@unique([projectId, templateKey])
-  @@map("workflow_templates")
-}
-
-model WorkflowRoute {
-  id        String   @id @default(uuid())
-  projectId String
-  routeKey  String
-  createdAt DateTime @default(now())
-
-  project Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
-  steps   WorkflowRouteStep[]
-
-  @@unique([projectId, routeKey])
-  @@map("workflow_routes")
-}
-
-model WorkflowRouteStep {
-  id                 String @id @default(uuid())
-  workflowRouteId    String
-  stepOrder          Int
-  workflowTemplateId String
-
-  workflowRoute    WorkflowRoute    @relation(fields: [workflowRouteId], references: [id], onDelete: Cascade)
-  workflowTemplate WorkflowTemplate @relation(fields: [workflowTemplateId], references: [id], onDelete: Restrict)
-
-  @@unique([workflowRouteId, stepOrder])
-  @@map("workflow_route_steps")
-}
+//
+// There is no workflow table. Every ComfyUI graph lives once, on disk, in
+// data/_templates/comfy/, resolved by src/comfy/workflow-path.ts. The old
+// workflow_templates / workflow_routes / workflow_route_steps trio mirrored the
+// per-project copy layout and was never read at dispatch — dropped 2026-08-13
+// (migration 20260813120000_drop_dead_workflow_tables).
 
 // ─── Training ─────────────────────────────────────────────────────────────────
 
@@ -612,6 +637,42 @@ model DatasetJob {
 /// Renders the still image of ONE SHOT (the name is historical — there is no
 /// sceneId here, the only FK is shotId). Queue ledger jobType 'scene' maps to
 /// this table.
+/// One Qwen-Image-Edit-2511 pass that turns a shot's approved still into the END
+/// frame of its clip, for the two-frame (flf2v) video flow.
+///
+/// It is an EDIT of the start frame, never a fresh generation — the start frame
+/// enters the graph as a reference and the instruction says only what changed.
+/// Generating a last frame from text instead would produce a different face in a
+/// similar room, and Wan would spend the whole clip morphing one person into
+/// another: worse than the drift the two-frame flow exists to remove.
+model EndFrameJob {
+  id                  String    @id @default(uuid())
+  shotId              String
+  /// The START frame this was edited from — snapshot of `Shot.chosenRender` at
+  /// enqueue time, so a later re-pick of the shot's still does not make it
+  /// ambiguous which image the finished end frame actually continues from.
+  sourceImageFilename String
+  /// The instruction actually sent — snapshot of `Shot.endFramePrompt`, in the
+  /// same spirit as `TTSJob.text`: editing the shot later never rewrites what a
+  /// finished job did.
+  instruction         String
+  status              String // pending | running | completed | failed | cancelled
+  comfyPromptId       String?
+  params              Json?
+  /// Basename written into `data/<project>/shots/<shotCode>/endframes/`.
+  outputFilename      String?
+  errorMessage        String?
+  queuedAt            DateTime  @default(now())
+  startedAt           DateTime?
+  completedAt         DateTime?
+
+  shot Shot @relation(fields: [shotId], references: [id], onDelete: Cascade)
+
+  @@index([shotId])
+  @@index([status, queuedAt])
+  @@map("end_frame_jobs")
+}
+
 model SceneRenderJob {
   id            String    @id @default(uuid())
   shotId        String
@@ -736,6 +797,14 @@ model VideoRender {
   /// Which image was used as the i2v starting frame. Stored as the basename
   /// inside `data/<project>/shots/<shotCode>/`.
   sourceImageFilename String
+  /// Which image was pinned to the LAST frame, for a flf2v ("2 кадра") render.
+  /// Basename inside `data/<project>/shots/<shotCode>/endframes/`. Null = this
+  /// render used the one-frame i2v flow.
+  ///
+  /// Snapshot, not a live lookup: baked at enqueue time exactly like
+  /// `params.panelShape` and `TTSJob.engine`, so re-approving a different end
+  /// frame later never silently changes what an already-queued clip renders.
+  endImageFilename    String?
   /// Motion prompt — what should the animated frame do (camera move, subject
   /// movement, etc.). Concatenated into the Wan2.2 positive prompt.
   motionPrompt        String

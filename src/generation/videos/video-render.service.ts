@@ -17,6 +17,7 @@ import {
 import * as path from 'path';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService } from '../../comfy/comfy.service';
+import { describeWorkflowLookup, readWorkflowJson } from '../../comfy/workflow-path';
 import { StartVideoInput } from './video-job.types';
 import { stripPromptWeights } from '../scenes/scene-render.service';
 import { QueueLedgerService } from '../../pipeline/queue-ledger.service';
@@ -84,9 +85,49 @@ const CAMERA_CLAUSE: Record<string, string> = {
   pan_right:     'the camera pans slowly to the right',
   tilt_up:       'the camera tilts up slowly',
   tilt_down:     'the camera tilts down slowly',
+  // An ARC is the camera travelling around the subject, which `pan` is not —
+  // a pan turns the camera on its own axis and the subject slides out of frame.
+  // Added 2026-08-15 for the two-frame flow: Qwen-Image-Edit-2511 does novel
+  // view synthesis in the base model, so a small arc can actually be drawn on
+  // the end frame, and Wan then has a real viewpoint change to travel.
+  arc_left:      'the camera arcs slowly around him to the left, keeping him centred',
+  arc_right:     'the camera arcs slowly around him to the right, keeping him centred',
   handheld:      'a faint handheld drift',
   window_pov:    'the camera holds a fixed point of view through the window',
 };
+/**
+ * Secondary phrasing, used when a shot combines TWO camera moves. `cameraMove`
+ * accepts a compound value joined with `+` — e.g. `arc_left+push_in`, the camera
+ * arcing around the subject while closing on it. The first part supplies the
+ * sentence, the second is appended as a `while …` clause, so the model gets one
+ * readable instruction instead of two competing ones.
+ *
+ * Kept as its own map rather than derived by regex from CAMERA_CLAUSE: the
+ * grammar differs («pushes in slowly» → «pushing in slowly») and a derivation
+ * would be one more thing to get subtly wrong.
+ */
+const CAMERA_SECONDARY: Record<string, string> = {
+  push_in:       'pushing in slowly',
+  pull_out:      'pulling back slowly',
+  track:         'tracking alongside',
+  track_lateral: 'tracking sideways',
+  pan_left:      'panning to the left',
+  pan_right:     'panning to the right',
+  tilt_up:       'tilting up',
+  tilt_down:     'tilting down',
+  arc_left:      'arcing around him to the left',
+  arc_right:     'arcing around him to the right',
+};
+
+/** Resolve one or two `+`-joined moves into a single camera sentence. */
+function cameraClauseFor(move: string): string | undefined {
+  const parts = move.split('+').map((m) => m.trim()).filter(Boolean);
+  const head  = CAMERA_CLAUSE[parts[0] ?? ''];
+  if (!head) return undefined;
+  const tail = parts[1] ? CAMERA_SECONDARY[parts[1]] : undefined;
+  return tail ? `${head} while ${tail}` : head;
+}
+
 /** Does this text already tell the camera what to do? */
 const MENTIONS_CAMERA = /camera|handheld|point of view/i;
 
@@ -98,6 +139,16 @@ const DEFAULT_WIDTH  = 768;
 const DEFAULT_HEIGHT = 432;
 const DEFAULT_LENGTH = 81;
 const DEFAULT_FPS    = 16;
+
+// Which conditioning flow an i2v render uses. Orthogonal to `mode`
+// (fast/guard/cfg): the MODE picks the workflow FILE, the FLOW rewrites one node
+// inside whichever file was picked, so every combination of the two works.
+//   'i2v'   — `WanImageToVideo`, one pinned frame. Every render before 2026-08-15.
+//   'flf2v' — `WanFirstLastFrameToVideo`, first AND last frame pinned.
+export type VideoFlow = 'i2v' | 'flf2v';
+const VIDEO_FLOWS: readonly string[] = ['i2v', 'flf2v'];
+/** Per-shot subfolder holding end-frame candidates, next to the shot's stills. */
+const ENDFRAMES_DIR = 'endframes';
 
 @Injectable()
 export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
@@ -124,6 +175,46 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     `;
     const shape = rows[0]?.shape ?? null;
     return shape && shape.trim().length > 0 ? shape : null;
+  }
+
+  /**
+   * Which conditioning flow this shot renders on, and — when it is `flf2v` —
+   * which end frame it is allowed to pin to its last frame.
+   *
+   * Inheritance is `shot.videoFlow ?? scene.defaultVideoFlow ?? project.defaultVideoFlow`,
+   * the same three-level idiom as paletteKey/timeOfDay, so an act can sit on a
+   * different flow from its project and a single shot on a different flow from
+   * its act. An unrecognised value resolves to 'i2v' rather than throwing — the
+   * DB CHECK constraints already refuse to store one, so this only ever fires on
+   * a row edited around them.
+   *
+   * $queryRaw for the same reason `resolveComicPanelShape` uses it: these columns
+   * can predate the generated Prisma client on a backend that has not re-run
+   * `prisma generate` yet (documented repo pattern).
+   */
+  private async resolveVideoFlow(shotId: string): Promise<{
+    flow:           VideoFlow;
+    chosenEndFrame: string | null;
+    approvedAt:     Date | null;
+  }> {
+    const rows = await this.prisma.$queryRaw<Array<{
+      flow: string | null; chosenEndFrame: string | null; approvedAt: Date | null;
+    }>>`
+      SELECT COALESCE(sh."videoFlow", sc."defaultVideoFlow", p."defaultVideoFlow") AS flow,
+             sh."chosenEndFrame"     AS "chosenEndFrame",
+             sh."endFrameApprovedAt" AS "approvedAt"
+        FROM shots sh
+        JOIN scenes   sc ON sc.id = sh."sceneId"
+        JOIN projects p  ON p.id  = sh."projectId"
+       WHERE sh.id = ${shotId}
+    `;
+    const row  = rows[0];
+    const flow = row?.flow && VIDEO_FLOWS.includes(row.flow) ? (row.flow as VideoFlow) : 'i2v';
+    return {
+      flow,
+      chosenEndFrame: row?.chosenEndFrame ?? null,
+      approvedAt:     row?.approvedAt ?? null,
+    };
   }
 
   onModuleInit() {
@@ -174,6 +265,55 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     const count = Math.max(1, Math.min(8, input.count ?? 1));
     const workflowFilename = this.resolveWorkflowFilename(input.mode);
 
+    // Conditioning flow: one pinned frame ('i2v') or two ('flf2v'). Resolved
+    // from shot → act → project.
+    //
+    // A flf2v shot whose second frame is not ready DEGRADES to the one-frame
+    // flow and renders anyway (user 2026-08-15, chosen over a 400 after the
+    // trade-off was put to them): waiting on an end frame must never be able to
+    // stall a clip that could have been made.
+    //
+    // The degrade is recorded rather than silent — `params.flowFallback` carries
+    // the reason and the dispatch logs a warning — because the resulting clip is
+    // indistinguishable from a deliberate i2v render, and "how much of this
+    // project actually rendered on two frames" has to stay answerable with one
+    // query instead of by re-reading graphs.
+    const { flow, chosenEndFrame, approvedAt } = await this.resolveVideoFlow(shot.id);
+    let endImageFilename: string | null = null;
+    let flowFallback:     string | null = null;
+    if (flow === 'flf2v') {
+      const endPath = chosenEndFrame
+        ? path.join(APP_ROOT, 'data', shot.project.slug, 'shots', shot.shotCode, ENDFRAMES_DIR, chosenEndFrame)
+        : null;
+
+      // A CHOSEN but unapproved end frame is the one case that is refused rather
+      // than degraded. The degrade exists so that not having got round to a shot
+      // never blocks its clip — but a frame already rendered AND picked means the
+      // user is mid-flow, and the clip they get back looks exactly like a failed
+      // two-frame render while never having been one. That is what happened to
+      // A1_SH02 on `bully` (user 2026-08-15: «бред получился полностью, не
+      // соответствует финальному кадру»), and nothing on the finished clip says
+      // why. Refusing here costs one click; the silent version costs a render
+      // plus the time spent blaming the model.
+      if (chosenEndFrame && !approvedAt) {
+        throw new BadRequestException(
+          `Кадр ${shot.shotCode}: последний кадр «${chosenEndFrame}» выбран, но не утверждён. `
+          + `Утвердите его на вкладке «Посл. кадр» — или снимите выбор, если он не годится. `
+          + `Иначе клип уехал бы по ОДНОМУ кадру и не имел бы к нему никакого отношения.`,
+        );
+      }
+
+      if (!chosenEndFrame)            flowFallback = 'no_end_frame';
+      else if (!existsSync(endPath!)) flowFallback = 'end_frame_missing_on_disk';
+      else                            endImageFilename = chosenEndFrame;
+
+      if (flowFallback) {
+        this.logger.warn(
+          `[${shot.shotCode}] flow=flf2v but ${flowFallback} — rendering on the one-frame i2v flow instead`,
+        );
+      }
+    }
+
     // Comic panel shape (template-layout mode): the shot's Wan render size
     // comes from its shape's `wan` row. The shape is BAKED into
     // VideoRender.params at creation (like TTSJob.engine) so the later
@@ -198,16 +338,23 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         length: input.length ?? DEFAULT_LENGTH,
         fps:    input.fps    ?? DEFAULT_FPS,
         ...(panelShape ? { panelShape } : {}),
+        // Only stamped on two-frame renders, so the params blob of every legacy
+        // i2v render stays byte-identical to what it has always been.
+        ...(flow === 'flf2v' ? { flow } : {}),
+        ...(flowFallback ? { flowFallback } : {}),
       };
       const row = await this.prisma.videoRender.create({
+        // `as any`: endImageFilename can predate the generated Prisma client on a
+        // backend that has not re-run `prisma generate` yet.
         data: {
           shotId:              shot.id,
           sourceImageFilename: shot.chosenRender!,
+          endImageFilename,
           motionPrompt:        input.motionPrompt?.trim() || '',
           status:              'pending',
           workflowFilename:    workflowFilename,
           params,
-        },
+        } as any,
       });
       await this.ledger.enqueue('video', row.id, { workflowFilename, paramsSnapshot: params });
       results.push(row);
@@ -267,6 +414,35 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     mkdirSync(COMFY_INPUT, { recursive: true });
     copyFileSync(sourcePath, inputDest);
 
+    // Two-frame render: the end frame was chosen, approved and BAKED onto this
+    // row at enqueue time, so re-approving a different one since then cannot
+    // change what this clip renders. Read from the row, never re-resolved.
+    const endImageFilename = (v as any).endImageFilename as string | null | undefined;
+    let endBasename: string | undefined;
+    let endDest:     string | undefined;
+    if (endImageFilename) {
+      const endSource = path.join(
+        APP_ROOT, 'data', v.shot.project.slug, 'shots', v.shot.shotCode, ENDFRAMES_DIR, endImageFilename,
+      );
+      if (!existsSync(endSource)) {
+        // Same treatment as a missing start frame: keep the row as `failed` with
+        // its reason instead of rendering a one-frame clip that would silently
+        // pass for a two-frame one.
+        const why = `End frame missing on disk: ${endSource}`;
+        this.logger.warn(`dispatchPending video ${v.id}: ${why} — failing the row`);
+        try { unlinkSync(inputDest); } catch { /* best-effort */ }
+        await this.prisma.videoRender.update({
+          where: { id: v.id },
+          data:  { status: 'failed', errorMessage: why, completedAt: new Date() },
+        });
+        await this.ledger.close('video', v.id, { status: 'failed', errorMessage: why });
+        return;
+      }
+      endBasename = `video_${v.id}_end${path.extname(endImageFilename) || '.png'}`;
+      endDest     = path.join(COMFY_INPUT, endBasename);
+      copyFileSync(endSource, endDest);
+    }
+
     try {
       const params = v.params as { seed: number; width: number; height: number; length: number; fps: number };
       const template = this.loadTemplate(v.shot.project.slug, v.workflowFilename);
@@ -297,6 +473,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         : undefined;
       const workflow = this.patch(template, {
         sourceImage:    inputBasename,
+        endImage:       endBasename,
         motionPrompt,
         motionNegative,
         seed:           params.seed,
@@ -316,6 +493,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       const why = `ComfyUI dispatch failed: ${e?.message}`;
       this.logger.error(`dispatchPending video ${v.id}: ${why}`);
       try { unlinkSync(inputDest); } catch { /* best-effort */ }
+      if (endDest) { try { unlinkSync(endDest); } catch { /* best-effort */ } }
       await this.prisma.videoRender.update({
         where: { id: v.id },
         data:  { status: 'failed', errorMessage: why, completedAt: new Date() },
@@ -509,15 +687,19 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     const filename = workflowFilename && ALLOWED_WORKFLOWS.has(workflowFilename)
       ? workflowFilename
       : WORKFLOW_FILENAME;
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', filename);
-    if (!existsSync(filePath)) {
-      throw new NotFoundException(`Video workflow not found: ${filePath}`);
+    const template = readWorkflowJson(projectSlug, filename);
+    if (!template) {
+      throw new NotFoundException(
+        `Video workflow not found: ${describeWorkflowLookup(projectSlug, filename)}`,
+      );
     }
-    return JSON.parse(readFileSync(filePath, 'utf-8'));
+    return template;
   }
 
   private patch(template: Record<string, any>, p: {
     sourceImage:    string;
+    /** Basename in COMFY_INPUT to pin to the LAST frame. Undefined = one-frame i2v. */
+    endImage?:      string;
     motionPrompt:   string;
     /** Optional override for node 10 (negative). When undefined, the workflow
      *  JSON's hardcoded fallback stays. Resolved from
@@ -541,6 +723,51 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     set('13', 'width',  p.width);
     set('13', 'height', p.height);
     set('13', 'length', p.length);
+
+    // ── Two-frame flow (flf2v) ────────────────────────────────────────────────
+    // Swap node 13 from `WanImageToVideo` to `WanFirstLastFrameToVideo` in place
+    // and feed it a second image, mirroring 11→12→13 with 19→20→13.
+    //
+    // The swap is legal because the two nodes take the SAME input names
+    // (positive/negative/vae/width/height/length/batch_size/start_image) and
+    // return the same three outputs (positive, negative, latent) — see
+    // comfy_extras/nodes_wan.py. `end_image` is the only addition, and both
+    // clip_vision inputs stay unwired exactly as they are today.
+    //
+    // Done as a graph rewrite rather than as three more workflow JSONs because
+    // the flow is orthogonal to the MODE: fast/guard/cfg each pick a different
+    // template file, and shipping a flf2v twin of each would mean six files that
+    // have to be edited in lockstep forever. One node swap covers every mode,
+    // present and future, and nothing can drift out of sync.
+    //
+    // The two new node ids are ALLOCATED, not hardcoded: the templates do not
+    // share a node-id range (the fast and cfg graphs stop at 18, guard already
+    // uses 19), and a fixed id would silently overwrite a real node in whichever
+    // template grows into it next.
+    if (p.endImage) {
+      if (wf['13']?.class_type !== 'WanImageToVideo') {
+        // Refuse to rewrite a graph that is not shaped the way this method
+        // assumes — better a failed render with a reason than a clip quietly
+        // produced from a mangled graph.
+        throw new Error(
+          `flf2v: expected node 13 to be WanImageToVideo, found "${wf['13']?.class_type ?? 'nothing'}"`,
+        );
+      }
+      const nextId = Math.max(...Object.keys(wf).map(Number).filter(Number.isFinite)) + 1;
+      const loadId  = String(nextId);
+      const scaleId = String(nextId + 1);
+
+      wf['13'].class_type = 'WanFirstLastFrameToVideo';
+      wf[loadId]  = { class_type: 'LoadImage',  inputs: { image: p.endImage } };
+      wf[scaleId] = {
+        class_type: 'ImageScale',
+        inputs: {
+          image: [loadId, 0], upscale_method: 'lanczos',
+          width: p.width, height: p.height, crop: 'center',
+        },
+      };
+      wf['13'].inputs.end_image = [scaleId, 0];
+    }
 
     // Positive prompt is on node 9; negative on node 10. Negative only set
     // when the caller provides one (per-shot or per-project DB value) — when
@@ -621,7 +848,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     // can never be contradicted by the enum, and a shot with no cameraMove is
     // left alone rather than given an invented default.
     const move  = (shot.cameraMove ?? '').trim();
-    const clause = CAMERA_CLAUSE[move];
+    const clause = cameraClauseFor(move);
     if (clause && !MENTIONS_CAMERA.test(motionLine)) {
       return `${motionLine.replace(/[\s,]+$/, '')}, ${clause}`;
     }
@@ -823,11 +1050,13 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Combined one-pass upscale→RIFE template, or null when the project doesn't have it (legacy fallback). */
+  /**
+   * Combined one-pass upscale→RIFE template. Null only if the graph is missing
+   * from both the project dir and data/_templates/comfy/ — the shared master is
+   * always shipped, so the null branch is defensive rather than a live path.
+   */
   private loadCombinedTemplate(projectSlug: string): Record<string, any> | null {
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', COMBINED_WORKFLOW_FILENAME);
-    if (!existsSync(filePath)) return null;
-    return JSON.parse(readFileSync(filePath, 'utf-8'));
+    return readWorkflowJson(projectSlug, COMBINED_WORKFLOW_FILENAME);
   }
 
   private patchCombined(template: Record<string, any>, p: {

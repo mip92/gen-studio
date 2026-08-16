@@ -948,7 +948,31 @@ export class SceneRenderService {
     const propText   = propDescription?.trim() ?? '';
     const propIsHero = propText.length > 0 && participants.length === 0;
 
-    if (propIsHero) {
+    if (propIsHero && usingQwenGraph) {
+      // PROP-HERO on the QWEN path: the same directive, but it must not be
+      // PREPENDED and it must not restate the whole Prop.description.
+      //
+      // Measured 2026-08-13 on `hidden_layoff` / `optimizer`: `macro insert,
+      // <25-30 word description>, <36 word DOF boilerplate>` is 55-66 words on
+      // its own, and the Qwen scene budget is 55 words trimmed from the TAIL
+      // (Skill: gen-studio-qwen2511 §2a). So on ALL 39 prop-hero shots of the
+      // two films the budget was exhausted before the shot's own text began:
+      // the instruction that reached the model was the object's anchor
+      // description plus "keep it exactly as in its reference picture", with
+      // the shot's own angle, placement, surface and light dropped entirely.
+      // The render could only be the anchor again — user 2026-08-13 «предметы
+      // на кадрах это тупо якоря тупо под теми же углами».
+      //
+      // The object's LOOK already travels twice (its anchor picture + the
+      // composer's keep-clause), so here it needs a NAME, not a description,
+      // and the shot leads. Non-Qwen styles keep the long form below: they have
+      // no word budget, and their object has no reference picture at all.
+      const head = propText.split(',')[0].trim().split(/\s+/).slice(0, 10).join(' ');
+      const dof  = 'the single clear subject, the surroundings soft and out of focus';
+      if (!positive.includes(dof)) {
+        positive = [positive.trim(), head, dof].filter((s) => s.length > 0).join(', ');
+      }
+    } else if (propIsHero) {
       const dof = 'the prop fills the frame as the single clear subject in crisp sharp focus, the surroundings thrown far out of focus into soft neutral shapes, shallow depth of field, one warm focused light on the object';
       const propClause = `macro insert, ${propText}, ${dof}`;
       if (!positive.startsWith(propClause)) {
@@ -1031,6 +1055,14 @@ export class SceneRenderService {
       reduxClipVision: REDUX_CLIP_VISION_NAME,
       anchorImagePaths,
       objectReferenceLabel,
+      // POV = only the character's own hands enter the frame; BACK = seen from
+      // behind. Both used to ship the full identity line plus "keep each
+      // person's face and hair" — an order to draw a face into a frame that has
+      // none, which is why a POV shot came back as the character standing in
+      // the foreground looking at his own hands (user 2026-08-13).
+      faceVisibility:
+        (shot as any).shotType === 'POV'  ? 'hands-only' :
+        (shot as any).shotType === 'BACK' ? 'back' : 'full',
       qwenStyleLora,
       qwenReferenceLatents: normalizeQwenReferenceLatents((shot.project as any).settings),
     };

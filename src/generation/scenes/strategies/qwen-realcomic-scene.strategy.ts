@@ -68,6 +68,7 @@ export class QwenRealcomicSceneStrategy implements SceneStrategy {
       styleDirective: anchors.length > 0 ? REALCOMIC_TRIGGER : t2iStyle,
       withReferences: anchors.length > 0,
       objectReference:  params.objectReferenceLabel ? { label: params.objectReferenceLabel } : undefined,
+      faceVisibility:   params.faceVisibility,
     });
 
     return this.builder.build(template, {

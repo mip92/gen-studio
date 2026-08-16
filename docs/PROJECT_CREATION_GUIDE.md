@@ -260,16 +260,7 @@ workflowRouteKey =
 data/<slug>/
 ├── PROJECT.md              ← полная спека проекта (mirror of scriptText)
 ├── SHOTLIST.md             ← все шоты с paste-ready промптами
-├── comfy/                  ← ComfyUI workflow JSONs
-│   ├── ai_syndicate_dataset_creator_v3_api.json
-│   ├── scene_environment_flux_api.json
-│   ├── scene_single_character_api.json
-│   ├── scene_single_character_hires_api.json
-│   ├── scene_single_character_ipadapter_api.json  (создать на основе)
-│   ├── video_wan22_i2v_api.json
-│   ├── video_wan22_i2v_cfg_api.json    (mode='cfg', негатив работает)
-│   ├── video_upscale_interp_api.json   (one-pass upscale→RIFE, обязателен)
-│   └── bgm_acestep_api.json
+├── (НЕТ comfy/ — воркфлоу общие, см. ниже)
 ├── datasets/               ← LoRA training images
 │   ├── CONDUCTOR_BASE/
 │   ├── PAX_MIL/
@@ -292,6 +283,21 @@ data/<slug>/
 ├── exports/capcut/         ← CapCut import package
 └── characters/             ← (optional) per-character notes
 ```
+
+### Воркфлоу — общие, не копировать (2026-08-13)
+
+Все ComfyUI-графы лежат ОДНОЙ копией в `data/_templates/comfy/`. Новому проекту
+папка `comfy/` не нужна вообще — рендер сам возьмёт граф из мастера
+(`src/comfy/workflow-path.ts`).
+
+Раньше каждый проект получал свою копию (382 файла, 22 уникальных содержимых,
+ни одна копия ни разу не была отредактирована), а сидеры копировали `comfy/`
+**соседнего проекта**. Правка одного узла превращалась в Python-фанаут по 42
+файлам (`scripts/_strip_fhd_save_branch.py` — памятник этой схеме).
+
+Персональная копия в `data/<slug>/comfy/<file>.json` по-прежнему перебивает
+мастер, если её положить — так закрепляют эксперимент на одном фильме. По
+умолчанию таких копий нет ни у кого.
 
 ---
 
@@ -329,10 +335,8 @@ BEGIN
   INSERT INTO characters (...) VALUES ...;
   INSERT INTO character_profiles (...) VALUES ...;
 
-  -- 4. Workflow templates + routes + steps
-  INSERT INTO workflow_templates (...) VALUES ...;
-  INSERT INTO workflow_routes (...) VALUES ...;
-  INSERT INTO workflow_route_steps (...) VALUES ...;
+  -- 4. (шага «workflow templates + routes» больше НЕТ — таблицы удалены
+  --     2026-08-13, воркфлоу берутся из data/_templates/comfy/)
 
   -- 5. 200 Shots (с full promptFields + новыми полями схемы)
   INSERT INTO shots (...) VALUES
@@ -612,7 +616,7 @@ SELECT * FROM scoped WHERE "shotType" = prev_type;
 4. **Прогон seed-скрипта + пост-seed скрипты** (1 час)
 5. **Consistency-аудит** (30 мин) — §12
 6. **Файловая структура — создать папки** — §6
-7. **Скопировать workflow JSONs** из соседнего проекта в `<slug>/comfy/`
+7. ~~Скопировать workflow JSONs~~ — НЕ НУЖНО, воркфлоу общие (`data/_templates/comfy/`)
 8. **Сгенерить Nano Banana референс-портреты** для всех персонажей — §11
    - 1 anchor на персонажа → потом 4-5 ракурсов для conductor (для faceswap), 1 для пассажиров (для IP-Adapter)
 9. **Собрать датасеты для LoRA-персонажей**
@@ -654,12 +658,10 @@ SELECT * FROM scoped WHERE "shotType" = prev_type;
 - [ ] ~200 `shots` со всеми полями + `narrationText`
 - [ ] `characters` + `character_profiles` с FATHER_BASE-quality промптами
 - [ ] `shot_participants` для всех character-bearing шотов
-- [ ] `workflow_templates` + `workflow_routes` + steps
 - [ ] Consistency-аудит проходит (см. §12)
 
 ## Чеклист «всё в файловой системе»
 
-- [ ] `data/<slug>/comfy/*.json` скопированы и адаптированы
 - [ ] `data/<slug>/datasets/<profile>/` структура готова
 - [ ] `data/<slug>/reference/passengers/passenger_*.png` сгенерированы
 - [ ] `data/<slug>/reference/<main>_dataset/` мульти-ракурсные референсы
@@ -673,7 +675,7 @@ SELECT * FROM scoped WHERE "shotType" = prev_type;
 |---|---|
 | Шрам на лице героя/героини | Не использовать. Использовать родинку/веснушки. AI экзагерирует шрам и зритель видит «крипово» |
 | `promptFields.positive` с `{TOKEN}` плейсхолдерами в UI | Прогнать `resolve_placeholders.sql` — UI ждёт чистый английский без шаблонов |
-| Файл workflow зарегистрирован в БД но физически отсутствует | Скопировать из `data/<old_slug>/comfy/` в `data/<new_slug>/comfy/` |
+| Воркфлоу не найден при рендере | Файла нет в `data/_templates/comfy/` — положить туда ОДНУ копию, не в проект |
 | Prisma migrate fails: "could not create shadow database" | Write migration SQL by hand, apply with `psql -f`, register with `prisma migrate resolve --applied <name>` |
 | Prisma client не пересобирается (EPERM, DLL locked) | gen-studio сервер запущен и держит DLL. Рестартануть сервер → `npx prisma generate` |
 | `to_jsonb($pp$...$pp$)` ошибка «unknown type» | Использовать `DO $$ DECLARE v_text TEXT := $pp$...$pp$; BEGIN ... END $$` или явный cast |

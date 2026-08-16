@@ -9,6 +9,8 @@ import { DatasetQueueController } from './dataset-queue.controller';
 import { DatasetQueueService } from './dataset-queue.service';
 import { VideosController } from './videos/videos.controller';
 import { VideoRenderService } from './videos/video-render.service';
+import { EndFramesController } from './endframes/endframes.controller';
+import { EndFrameService } from './endframes/end-frame.service';
 import { TrainingModule } from '../training/training.module';
 import { ValidationModule } from '../validation/validation.module';
 import { ComicModule } from '../comic/comic.module';
@@ -20,6 +22,7 @@ import { ComicModule } from '../comic/comic.module';
     ScenesController,
     DatasetQueueController,
     VideosController,
+    EndFramesController,
   ],
   providers: [
     GenerationService,
@@ -28,7 +31,8 @@ import { ComicModule } from '../comic/comic.module';
     SceneFactory,
     DatasetQueueService,
     VideoRenderService,
+    EndFrameService,
   ],
-  exports: [DatasetQueueService, SceneRenderService, VideoRenderService],
+  exports: [DatasetQueueService, SceneRenderService, VideoRenderService, EndFrameService],
 })
 export class GenerationModule {}

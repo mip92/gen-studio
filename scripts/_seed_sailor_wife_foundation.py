@@ -3,7 +3,7 @@
 «ТЫ — Жена моряка. И это вся твоя жизнь.» Track B (тёплая элегия), f5 (female), graphic_novel_cell_shaded (Eldritch, как coffee).
 Nameless country, no currency. ~35 min. ALL shots animated. No cameos.
 """
-import os, shutil, datetime, psycopg2
+import os, datetime, psycopg2
 PFX="7e6c0000-0000-4000-8000-"; PROJ=PFX+"000000000001"; SLUG="sailor_wife"
 NAME="ТЫ — Жена моряка. И это вся твоя жизнь."
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__))); NOW=datetime.datetime.now()
@@ -69,9 +69,9 @@ LOCS={
  "courtyard_bench":("Двор, лавочка","the inner courtyard of a port-town apartment block, a bench under an old acacia, laundry lines between poles, bicycles against a fence, a rug-beating frame, gossiping windows open over geraniums, an atmosphere of everyone knowing whose husband is at sea"),
 }
 
-TEMPLATES=[("b1","char_ip_graphic_novel","sailor_wife/comfy/scene_single_character_graphic_novel_api.json"),
-           ("b2","environment_graphic_novel","sailor_wife/comfy/scene_environment_graphic_novel_api.json")]
-ROUTES=[("b3","sailor_wife_character_ip"),("b4","sailor_wife_environment")]
+    # No comfy/ dir, no copying, no workflow_templates/routes rows: every
+    # ComfyUI graph lives once in data/_templates/comfy/ and the render
+    # resolves it there (src/comfy/workflow-path.ts). Tables dropped 2026-08-13.
 
 def main():
     cx=psycopg2.connect(host="localhost",dbname="gen_studio",user="gen_studio",password="gen_studio"); cx.autocommit=False; cur=cx.cursor()
@@ -96,17 +96,9 @@ def main():
     for n,(slug,(name,desc)) in enumerate(LOCS.items(),1):
         cur.execute('INSERT INTO locations (id,"projectId",slug,name,description,"createdAt","updatedAt") VALUES (%s,%s,%s,%s,%s,%s,%s)',
                     (PFX+"000000000e%02x"%n,PROJ,slug,name,desc,NOW,NOW))
-    for suf,key,path in TEMPLATES:
-        cur.execute('INSERT INTO workflow_templates (id,"projectId","templateKey","filePath","visualStyle","createdAt") VALUES (%s,%s,%s,%s,%s,%s)',
-                    (PFX+"0000000000"+suf,PROJ,key,path,'graphic_novel_cell_shaded',NOW))
-    for suf,key in ROUTES:
-        cur.execute('INSERT INTO workflow_routes (id,"projectId","routeKey","createdAt") VALUES (%s,%s,%s,%s)',(PFX+"0000000000"+suf,PROJ,key,NOW))
-    for sub in ("comfy","reference","tts","shots","scenes","bgm"): os.makedirs(os.path.join(ROOT,"data","sailor_wife",sub),exist_ok=True)
-    src=os.path.join(ROOT,"data","coffee","comfy"); dst=os.path.join(ROOT,"data","sailor_wife","comfy"); c=0
-    for fn in os.listdir(src):
-        if fn.endswith(".json"): shutil.copyfile(os.path.join(src,fn),os.path.join(dst,fn)); c+=1
+    for sub in ("reference","tts","shots","scenes","bgm"): os.makedirs(os.path.join(ROOT,"data","sailor_wife",sub),exist_ok=True)
     cx.commit()
-    print("OK sailor_wife scenes=%d chars=%d profiles=%d locs=%d comfy=%d"%(len(SCENES),len(CHARS),len(PROFILES),len(LOCS),c))
+    print("OK sailor_wife scenes=%d chars=%d profiles=%d locs=%d"%(len(SCENES),len(CHARS),len(PROFILES),len(LOCS)))
     cur.close(); cx.close()
 
 if __name__=="__main__": main()

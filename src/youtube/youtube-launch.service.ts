@@ -1,6 +1,9 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { existsSync, statSync } from 'fs';
 import { PrismaService } from '../prisma/prisma.service';
+// Чистая арифметика слотов релизного календаря (без Nest/Prisma) — часовой пояс
+// канала берём оттуда же, где его знает /releases.
+import { DEFAULT_TZ } from '../releases/slot-planner';
 import { YoutubeCaptionsService } from './youtube-captions.service';
 import { YoutubeUploadService } from './youtube-upload.service';
 
@@ -8,6 +11,13 @@ const LANG = 'ru';
 /** Data API cap for thumbnails.set. Studio's uploader allows 50MB — anything in
  *  between goes up by hand there rather than being re-encoded here. */
 const API_THUMB_LIMIT = 2 * 1024 * 1024;
+/** Шорты выходят следом за своим основным видео, тем же слотом. */
+const SHORTS_OFFSET_MIN = 5;
+/** Инстант из БД (UTC) — по стенным часам канала: сообщения об ошибке читает
+ *  человек, а он живёт в той же сетке, что и календарь релизов. */
+function wallClock(d: Date): string {
+  return d.toLocaleString('ru-RU', { timeZone: DEFAULT_TZ, dateStyle: 'short', timeStyle: 'short' });
+}
 /** Size of a cover file, 0 when it's gone (a moved/deleted file must not throw
  *  from a plain read of the launch state). */
 function thumbBytes(p?: string): number {
@@ -52,6 +62,21 @@ export interface LaunchItemView extends LaunchItem {
   thumbnailTooBig:  boolean;
 }
 
+/**
+ * Откуда взялась дата публикации.
+ *   calendar — из релизного календаря (`Project.releaseAt`), это норма;
+ *   auto     — в календаре даты нет, взят ближайший вт/чт по каналу (запасной путь).
+ */
+export type SlotSource = 'calendar' | 'auto';
+
+export interface PlannedSlot {
+  /** ISO-инстант публикации основного видео. */
+  publishAt: string;
+  source:    SlotSource;
+  /** Пояснение для UI/лога. */
+  reason:    string;
+}
+
 export interface LaunchView {
   items:           LaunchItemView[];
   linkedConfirmed: boolean;
@@ -71,6 +96,10 @@ export interface LaunchView {
   publishMode:     'scheduled' | 'public' | null;
   mainPublishAt:   string | null;
   shortsPublishAt: string | null;
+  /** Дата из релизного календаря (`Project.releaseAt`), null — слот не назначен. */
+  plannedReleaseAt: string | null;
+  /** Дата в календаре уже прошла — планировать по ней нельзя, надо подвинуть слот. */
+  plannedReleasePast: boolean;
 }
 
 /**
@@ -82,7 +111,8 @@ export interface LaunchView {
  *   3. upload     — upload all as UNLISTED, attaching the pre-made .srt
  *   4. link       — operator links shorts→main in Studio (manual; API can't) and
  *                   confirms (server verifies uploads+subs, NOT the links)
- *   5. schedule   — videos.update all: main next Tue/Thu 16:00, shorts same day 16:05
+ *   5. schedule   — videos.update all: main on ITS DATE FROM THE RELEASE CALENDAR
+ *                   (Project.releaseAt), shorts 5 min after it
  * State lives in Project.settings.youtube.launch (survives reloads/restarts).
  */
 @Injectable()
@@ -133,6 +163,50 @@ export class YoutubeLaunchService {
       shortsPublishAt: l.shortsPublishAt ?? null,
     };
   }
+  /** Плановая дата фильма из релизного календаря (владелец поля — ReleasesService). */
+  private async plannedReleaseAt(projectId: string): Promise<Date | null> {
+    const row = await this.prisma.project.findUnique({
+      where:  { id: projectId },
+      select: { releaseAt: true },
+    });
+    return row?.releaseAt ?? null;
+  }
+
+  /**
+   * Дата публикации основного видео.
+   *
+   * Источник истины — релизный календарь: раз слот проставлен на /releases,
+   * заливка обязана встать ровно в него, а не в «следующий свободный вт/чт»
+   * (user, 2026-08-12: «мы теперь планируем релизы по календарю»). Ближайший
+   * вт/чт остаётся только запасным путём для фильма, которого в календаре нет.
+   *
+   * Прошедшая дата — не повод молча уехать на другой день: это ошибка плана,
+   * её чинят на /releases (или публикуют «сейчас»).
+   */
+  async resolveSlot(idOrSlug: string): Promise<PlannedSlot> {
+    const project = await this.project(idOrSlug);
+    const planned = await this.plannedReleaseAt(project.id);
+    if (planned) {
+      if (planned.getTime() <= Date.now()) {
+        throw new BadRequestException(
+          `Дата в календаре релизов (${wallClock(planned)}) уже прошла — подвинь слот на /releases `
+          + 'или публикуй сейчас.',
+        );
+      }
+      return {
+        publishAt: planned.toISOString(),
+        source:    'calendar',
+        reason:    'дата из релизного календаря',
+      };
+    }
+    const slot = await this.upload.suggestNextSlot('main');
+    return {
+      publishAt: slot.publishAt,
+      source:    'auto',
+      reason:    `в календаре даты нет — ${slot.reason}`,
+    };
+  }
+
   private async writeState(projectId: string, state: LaunchState): Promise<void> {
     const p = await this.prisma.project.findUnique({ where: { id: projectId } });
     const settings = ((p?.settings ?? {}) as Record<string, any>);
@@ -194,12 +268,15 @@ export class YoutubeLaunchService {
     if (subtitlesReady)    step = 3;
     if (allUploaded)       step = hasShorts ? 4 : 5;               // no shorts → skip linking
     if (allUploaded && (!hasShorts || state.linkedConfirmed)) step = 5;
+    const planned = await this.plannedReleaseAt(project.id);
     return {
       items, linkedConfirmed: state.linkedConfirmed, allTranscribed, subtitlesReady, allUploaded, hasShorts, step,
       published:       Boolean(state.published),
       publishMode:     state.publishMode ?? null,
       mainPublishAt:   state.mainPublishAt ?? null,
       shortsPublishAt: state.shortsPublishAt ?? null,
+      plannedReleaseAt:   planned ? planned.toISOString() : null,
+      plannedReleasePast: Boolean(planned && planned.getTime() <= Date.now()),
     };
   }
 
@@ -402,7 +479,7 @@ export class YoutubeLaunchService {
   }
 
   // ── step 5: schedule everything (gated on subtitles) ─────────────────────────
-  async schedule(idOrSlug: string): Promise<{ mainPublishAt: string; shortsPublishAt: string; view: LaunchView }> {
+  async schedule(idOrSlug: string): Promise<{ mainPublishAt: string; shortsPublishAt: string; slotSource: SlotSource; view: LaunchView }> {
     const project = await this.project(idOrSlug);
     const view = await this.get(idOrSlug);
     if (view.published)        throw new BadRequestException('Связка уже опубликована');
@@ -410,11 +487,12 @@ export class YoutubeLaunchService {
     if (!view.subtitlesReady)  throw new BadRequestException('Нельзя публиковать без субтитров основного видео');
     if (view.hasShorts && !view.linkedConfirmed) throw new BadRequestException('Сначала подтверди связывание в Studio');
 
-    // main → next Tue/Thu 16:00; shorts → same day 16:05
-    const slot = await this.upload.suggestNextSlot('main');
+    // main → слот из релизного календаря; shorts → +5 минут к нему (смещением, а
+    // не setMinutes: слот необязательно ровно в :00, и час менять нельзя).
+    const slot = await this.resolveSlot(idOrSlug);
     const mainPublishAt = slot.publishAt;
-    const d = new Date(mainPublishAt); d.setMinutes(5, 0, 0);   // 16:05 same day
-    const shortsPublishAt = d.toISOString();
+    const shortsPublishAt = new Date(new Date(mainPublishAt).getTime() + SHORTS_OFFSET_MIN * 60_000).toISOString();
+    this.logger.log(`launch ${idOrSlug}: слот ${mainPublishAt} (${slot.source} — ${slot.reason})`);
 
     for (const it of view.items) {
       if (!it.videoId) continue;
@@ -424,14 +502,20 @@ export class YoutubeLaunchService {
     }
 
     // Mark the project published (main video link) so the /actions gates clear.
+    // Заодно фиксируем в календаре ровно тот слот, который ушёл на YouTube: для
+    // фильма без плановой даты (source='auto') календарь иначе остался бы пустым
+    // при уже запланированной публикации.
     const main = view.items.find((i) => i.kind === 'main');
     if (main?.videoId) {
-      await this.prisma.project.update({ where: { id: project.id }, data: { youtubeUrl: `https://youtu.be/${main.videoId}` } });
+      await this.prisma.project.update({
+        where: { id: project.id },
+        data: { youtubeUrl: `https://youtu.be/${main.videoId}`, releaseAt: new Date(mainPublishAt) },
+      });
     }
     // Persist the publish fact so the buttons lock and survive reloads.
     const state = this.readState(await this.project(idOrSlug));
     await this.writeState(project.id, { ...state, published: true, publishMode: 'scheduled', mainPublishAt, shortsPublishAt });
-    return { mainPublishAt, shortsPublishAt, view: await this.get(idOrSlug) };
+    return { mainPublishAt, shortsPublishAt, slotSource: slot.source, view: await this.get(idOrSlug) };
   }
 
   /** Publish everything PUBLIC now (instead of scheduling). Same gates as schedule. */
@@ -449,7 +533,12 @@ export class YoutubeLaunchService {
     }
     const main = view.items.find((i) => i.kind === 'main');
     if (main?.videoId) {
-      await this.prisma.project.update({ where: { id: project.id }, data: { youtubeUrl: `https://youtu.be/${main.videoId}` } });
+      // Фактическая дата выхода = сейчас; плановая (если была) уже неверна, а
+      // календарь по ней считает «залито, публикация отложена».
+      await this.prisma.project.update({
+        where: { id: project.id },
+        data: { youtubeUrl: `https://youtu.be/${main.videoId}`, releaseAt: new Date() },
+      });
     }
     const state = this.readState(await this.project(idOrSlug));
     await this.writeState(project.id, { ...state, published: true, publishMode: 'public', mainPublishAt: null, shortsPublishAt: null });

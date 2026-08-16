@@ -351,6 +351,9 @@ export class ProjectsDashboardController {
         approvedTTSJobId: s.approvedTTSJobId ?? null,
         scriptStartLine:  s.scriptStartLine  ?? null,
         scriptEndLine:    s.scriptEndLine    ?? null,
+        // Act-level i2v flow override; null = the act follows the project. The
+        // scenes page renders it as a per-act select.
+        defaultVideoFlow: (s as any).defaultVideoFlow ?? null,
         shots: s.shots.map((sh) => {
           const pf = (sh.promptFields ?? {}) as {
             narrativeBeat?: string;
@@ -461,6 +464,20 @@ export class ProjectsDashboardController {
             pipelineInterp: inflightInterp
               ? { id: inflightInterp.id, status: inflightInterp.interpStatus as string }
               : null,
+            // ── End frame (two-frame / flf2v flow) ──────────────────────────
+            // The RESOLVED flow, not the shot's own column: the act list is
+            // where you look to see what a shot will actually render as, and
+            // the override usually lives a level or two up.
+            videoFlow: ((sh as any).videoFlow
+              ?? (s as any).defaultVideoFlow
+              ?? (project as any).defaultVideoFlow
+              ?? 'i2v') as string,
+            endFrame: {
+              hasPrompt:  (((sh as any).endFramePrompt ?? '').trim().length > 0),
+              candidates: Array.isArray((sh as any).endFrameRenders) ? (sh as any).endFrameRenders.length : 0,
+              chosen:     ((sh as any).chosenEndFrame ?? null) as string | null,
+              approved:   ((sh as any).endFrameApprovedAt ?? null) !== null,
+            },
             // ── Per-shot narration (shot-level TTS) ─────────────────────────
             narrationText:    (sh as any).narrationText    ?? null,
             approvedTTSJobId: (sh as any).approvedTTSJobId ?? null,

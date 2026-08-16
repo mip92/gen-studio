@@ -1,11 +1,8 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { existsSync, readFileSync } from 'fs';
-import * as path from 'path';
 import { WorkflowStrategy } from './workflow.strategy';
 import { WorkflowTemplate } from './workflow.types';
 import { AiSyndicateV3Strategy } from './strategies/ai-syndicate-v3.strategy';
-
-const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..', '..');
+import { describeWorkflowLookup, readWorkflowJson } from '../../comfy/workflow-path';
 
 @Injectable()
 export class WorkflowFactory {
@@ -43,15 +40,17 @@ export class WorkflowFactory {
   }
 
   /**
-   * Loads the workflow template JSON from disk for the given strategy and project slug.
-   * Path: <appRoot>/data/<projectSlug>/comfy/<strategy.filename>
+   * Loads the workflow template JSON for the given strategy and project slug.
+   * Per-project copy wins, then the shared master in data/_templates/comfy/.
    */
   loadTemplate(strategy: WorkflowStrategy, projectSlug: string): WorkflowTemplate {
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', strategy.filename);
-    if (!existsSync(filePath)) {
-      throw new NotFoundException(`Workflow file not found: ${filePath}`);
+    const template = readWorkflowJson<WorkflowTemplate>(projectSlug, strategy.filename);
+    if (!template) {
+      throw new NotFoundException(
+        `Workflow file not found: ${describeWorkflowLookup(projectSlug, strategy.filename)}`,
+      );
     }
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as WorkflowTemplate;
+    return template;
   }
 
   private register(strategy: WorkflowStrategy): void {

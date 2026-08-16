@@ -28,6 +28,7 @@ interface SourceColumns {
 
 const SOURCE: Record<JobType, SourceColumns> = {
   scene:      { delegate: 'sceneRenderJob',      status: 'status',        prompt: 'comfyPromptId',   output: null,                 error: 'errorMessage',        completed: 'completedAt' },
+  end_frame:  { delegate: 'endFrameJob',         status: 'status',        prompt: 'comfyPromptId',   output: 'outputFilename',     error: 'errorMessage',        completed: 'completedAt' },
   video:      { delegate: 'videoRender',         status: 'status',        prompt: 'comfyPromptId',   output: 'outputFilename',     error: 'errorMessage',        completed: 'completedAt' },
   video_post: { delegate: 'videoRender',         status: 'upscaleStatus', prompt: 'upscalePromptId', output: 'interpFilename',     error: 'upscaleErrorMessage', completed: 'upscaleCompletedAt' },
   tts:        { delegate: 'tTSJob',              status: 'status',        prompt: null,              output: 'outputFilename',     error: 'errorMessage',        completed: 'completedAt' },

@@ -17,6 +17,7 @@ import {
 } from '../generation/scenes/qwen/qwen-prompt';
 import { AnchorValidationService, anchorCandidateDir } from '../validation/anchor-validation.service';
 import { buildChain, wouldCycle } from './profile-chain';
+import { describeWorkflowLookup, resolveWorkflowPath } from '../comfy/workflow-path';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? 'E:\\ComfyUI\\gen-studio';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
@@ -41,8 +42,8 @@ const ANCHOR_CANDIDATES = Math.max(1, Number(process.env.ANCHOR_CANDIDATES ?? 4)
  * `feedback_all_gpu_jobs_through_queue` — never spawn GPU work directly in an
  * HTTP handler.
  *
- * Workflow file convention:
- *   data/<projectSlug>/comfy/gen_anchor_portrait_graphic_novel_api.json
+ * Workflow file (shared master, one copy for every project):
+ *   data/_templates/comfy/gen_anchor_portrait_graphic_novel_api.json
  *
  * Identity assets land at:
  *   data/<projectSlug>/reference/<profileCode>_anchor.png
@@ -67,26 +68,60 @@ export const FLUX_COMIC_STYLE =
   'mature naturalistic face, gritty inked comic art, ' +
   'no anime, no manga, no chibi, no big shiny eyes, no photorealism, no 3D render';
 
-const PORTRAIT_COMPOSITION =
-  'three-quarter portrait facing camera, head-and-shoulders framing, ' +
+/**
+ * ─── THE POSE OF EVERY CHARACTER ANCHOR. ONE DEFINITION. ───────────────────
+ *
+ * This constant is the ONLY place the anchor's body is described, for every
+ * pipeline and every project, and it CANNOT be overridden — not by
+ * `settings.anchorComposition`, not per style. `resolveAnchorComposition()`
+ * always emits it.
+ *
+ * Why it is a constant and not part of the composition strings below: until
+ * 2026-08-13 the pose lived in three code constants AND in a full copy of the
+ * string inside `settings.anchorComposition` on eleven projects — twelve places
+ * that had already drifted apart. None of them mentioned the arms, so the model
+ * invented a pose, and asked for a "character portrait" it reliably invents a
+ * DISTINCTIVE one: arms folded, hands in pockets, a hand at the collar. With the
+ * anchor also feeding the pixel channel, that invented gesture is what every
+ * shot of the film inherits — which is how a whole film came back with one man
+ * standing the same way in every scene (user 2026-08-13).
+ *
+ * Arms hanging relaxed is the least semantically loaded body a donor can carry:
+ * build and wardrobe still read, and there is no gesture left for a scene to
+ * copy. It REDUCES the bleed, it does not remove it — the donor still fixes
+ * framing, so shot positives still need their own stance clause
+ * (Skill: gen-studio-qwen2511 §2b).
+ *
+ * If the pose ever needs to change, it changes HERE, once.
+ */
+export const ANCHOR_POSE =
+  'one person alone, three-quarters to camera, ' +
+  'arms hanging relaxed at the sides, shoulders level';
+
+// ─── SETTING: framing distance + backdrop + light. NOT the pose. ────────────
+// These describe where the person stands and how they are lit. Everything about
+// the BODY belongs to ANCHOR_POSE above. `settings.anchorComposition` overrides
+// a project's SETTING only, which is why a per-project value can no longer
+// silently carry a stale pose.
+
+const PORTRAIT_SETTING =
+  'head-and-shoulders framing, ' +
   'neutral pale grey backdrop, soft north-window light, anchor reference portrait';
 
 // realcomic_qwen: Qwen's VL encoder reads natural language, and the anchor
 // must show enough of the body for scene renders to copy the outfit/build —
 // not just head-and-shoulders.
-const QWEN_PORTRAIT_COMPOSITION =
-  'a three-quarter portrait of a single person facing the camera, waist-up framing, ' +
+const QWEN_PORTRAIT_SETTING =
+  'waist-up framing, ' +
   'neutral pale grey backdrop, soft window light, clean character reference sheet look';
 
-// Scene-donor composition — the default whenever the project consumes its
-// anchors as PIXELS (settings.qwenReferenceLatents = true): the studio-sheet
-// compositions above are the worst possible donor for the reference_latents
-// channel (their flat grey backdrop and frontal pose paste into every shot).
-// Keeps: single person, three-quarter, facing camera, waist-up (the outfit
-// must stay visible). Drops: the flat grey backdrop and every "reference
-// sheet" cue. Explicit settings.anchorComposition still wins over this.
-const SCENE_DONOR_COMPOSITION =
-  'three-quarter portrait facing camera, waist-up framing, ' +
+// Scene-donor setting — the default whenever the project consumes its anchors as
+// PIXELS (settings.qwenReferenceLatents = true): the studio-sheet settings above
+// are the worst possible donor for the reference_latents channel, because their
+// flat grey backdrop pastes into every shot. Keeps waist-up (the outfit must stay
+// visible); drops the flat backdrop and every "reference sheet" cue.
+const SCENE_DONOR_SETTING =
+  'waist-up framing, ' +
   'standing in a softly blurred muted interior with natural depth, ' +
   'gentle directional daylight, soft natural shadows';
 
@@ -102,15 +137,37 @@ export const ANCHOR_NEGATIVE =
   'full body, multiple people, group photo, profile only, back view';
 
 /**
+ * Words that describe the BODY. `settings.anchorComposition` is a SETTING
+ * override — framing distance, backdrop, light — and must never carry any of
+ * these: the pose has exactly one definition (ANCHOR_POSE) and a second copy in
+ * a project's settings is how the twelve-way drift of 2026-08-13 happened.
+ * A stored value that names one is not silently obeyed and not silently
+ * stripped either — it is logged, loudly, every time that project renders an
+ * anchor, so the divergence is visible instead of inherited.
+ */
+const POSE_WORDS_RE =
+  /\b(arms?|shoulders?|hands?|three[- ]quarters?|facing the camera|portrait facing|standing straight|posture|crossed|folded)\b/i;
+
+/**
+ * Framing terms that merely CONTAIN a body word. `head-and-shoulders framing`
+ * is a crop, not a pose, and flagging it would make the warning above fire on
+ * four legitimate projects — a warning that cries wolf is a warning nobody
+ * reads, which is how the arms rule sat unenforced for five days. Removed
+ * before the pose test, never from the prompt itself.
+ */
+const FRAMING_PHRASES_RE = /\bhead[- ]and[- ]shoulders\b/gi;
+
+/**
  * Read `project.settings.anchorComposition` — a per-project override of the
- * composition clause baked into the anchor positive (framing + backdrop +
- * light). The pipeline defaults above describe a studio character sheet on a
- * flat grey backdrop; that is the right donor while anchors feed scenes
- * through semantic channels only, but a project whose scenes consume the
- * anchor as PIXELS (settings.qwenReferenceLatents = true) wants a
- * scene-friendlier donor instead — the sheet's flat backdrop and frontal pose
- * bleed into every shot via reference_latents. Returns null when unset so the
- * caller falls back to the pipeline default.
+ * anchor's SETTING (framing distance + backdrop + light). It does NOT and
+ * cannot override the pose; see ANCHOR_POSE.
+ *
+ * The pipeline defaults describe a studio character sheet on a flat grey
+ * backdrop; that is the right donor while anchors feed scenes through semantic
+ * channels only, but a project whose scenes consume the anchor as PIXELS
+ * (settings.qwenReferenceLatents = true) wants a scene-friendlier donor — the
+ * sheet's flat backdrop bleeds into every shot via reference_latents. Returns
+ * null when unset so the caller falls back to the pipeline default.
  */
 export function normalizeAnchorComposition(settings: unknown): string | null {
   const v = (settings as { anchorComposition?: unknown } | null | undefined)?.anchorComposition;
@@ -120,17 +177,30 @@ export function normalizeAnchorComposition(settings: unknown): string | null {
 }
 
 /**
- * The composition clause for a project's anchors: explicit
- * settings.anchorComposition wins; otherwise projects that consume anchors as
- * pixels (settings.qwenReferenceLatents = true) auto-default to the
- * scene-donor composition, and everything else keeps the pipeline's studio
- * default. Started projects that must keep the OLD default despite
- * refLatents=true (approved anchors) pin it via an explicit
- * settings.anchorComposition instead of a code branch.
+ * The composition clause for a project's anchors = the ONE pose + the setting.
+ *
+ * The pose is always ANCHOR_POSE. The setting is: explicit
+ * settings.anchorComposition, else the scene-donor setting for projects that
+ * consume anchors as pixels (settings.qwenReferenceLatents = true), else the
+ * pipeline's studio default.
  */
-function resolveAnchorComposition(settings: unknown, pipelineDefault: string): string {
-  return normalizeAnchorComposition(settings)
-    ?? (normalizeQwenReferenceLatents(settings) === true ? SCENE_DONOR_COMPOSITION : pipelineDefault);
+function resolveAnchorComposition(
+  settings: unknown,
+  pipelineDefault: string,
+  logger?: Logger,
+  projectSlug?: string,
+): string {
+  const override = normalizeAnchorComposition(settings);
+  if (override && POSE_WORDS_RE.test(override.replace(FRAMING_PHRASES_RE, ''))) {
+    logger?.warn(
+      `[${projectSlug ?? 'project'}] settings.anchorComposition describes the BODY ` +
+      `("${override.slice(0, 80)}…"). The pose has one definition (ANCHOR_POSE) and this ` +
+      `second copy will fight it — edit the setting down to framing/backdrop/light.`,
+    );
+  }
+  const setting = override
+    ?? (normalizeQwenReferenceLatents(settings) === true ? SCENE_DONOR_SETTING : pipelineDefault);
+  return `${ANCHOR_POSE}, ${setting}`;
 }
 
 export type AnchorPipeline = 'qwen' | 'flux_comic' | 'sdxl_comic';
@@ -302,15 +372,12 @@ export class AnchorRenderService {
       : anchorPipeline === 'flux_comic'
         ? 'gen_anchor_portrait_flux_comic_api.json'
         : 'gen_anchor_portrait_graphic_novel_api.json';
-    // Per-project workflow wins; fall back to the shared master template so a
-    // new project renders anchors without pre-copying its comfy/ dir.
-    const perProject   = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
-    const shared       = path.join(APP_ROOT, 'data', '_templates', 'comfy', workflowFilename);
-    const workflowPath = existsSync(perProject) ? perProject : shared;
-    if (!existsSync(workflowPath)) {
+    const workflowPath = resolveWorkflowPath(project.slug, workflowFilename);
+    if (!workflowPath) {
       await this.failJob(
         jobId,
-        `Anchor workflow not found at ${perProject} (and no shared template at ${shared}). Configure a LoRA loader for visualStyle=${visualStyle}.`,
+        `Anchor workflow not found at ${describeWorkflowLookup(project.slug, workflowFilename)}. `
+        + `Configure a LoRA loader for visualStyle=${visualStyle}.`,
       );
       return;
     }
@@ -324,7 +391,7 @@ export class AnchorRenderService {
       // the real prompt as "PLACEHOLDER" (garbage anchor, no error). Delegate
       // to the shared Qwen builder instead.
       const styleLora = normalizeStyleLora((project as any).settings);
-      const composition = resolveAnchorComposition((project as any).settings, QWEN_PORTRAIT_COMPOSITION);
+      const composition = resolveAnchorComposition((project as any).settings, QWEN_PORTRAIT_SETTING, this.logger, (project as any).slug);
       const instruction = composeQwenInstruction({
         participants:   [],
         scenePrompt:    [composition, profile.promptBase].join(', '),
@@ -380,7 +447,7 @@ export class AnchorRenderService {
     // The Flux graph needs the western/realistic anti-anime prefix; the SDXL
     // comic prefix ("cell-shaded …") sends Flux portraits to anime.
     const stylePrefix = anchorPipeline === 'flux_comic' ? FLUX_COMIC_STYLE : STYLE_PREFIX;
-    const composition = resolveAnchorComposition((project as any).settings, PORTRAIT_COMPOSITION);
+    const composition = resolveAnchorComposition((project as any).settings, PORTRAIT_SETTING, this.logger, (project as any).slug);
     const positive = [stylePrefix, composition, profile.promptBase].join(', ');
     const negative = (profile.negative && profile.negative.trim().length > 0)
       ? profile.negative
@@ -431,11 +498,12 @@ export class AnchorRenderService {
     }
 
     const workflowFilename = 'gen_anchor_portrait_realcomic_qwen_api.json';
-    const perProject   = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
-    const shared       = path.join(APP_ROOT, 'data', '_templates', 'comfy', workflowFilename);
-    const workflowPath = existsSync(perProject) ? perProject : shared;
-    if (!existsSync(workflowPath)) {
-      await this.failJob(jobId, `Qwen anchor workflow not found at ${perProject} (and no shared template at ${shared})`);
+    const workflowPath = resolveWorkflowPath(project.slug, workflowFilename);
+    if (!workflowPath) {
+      await this.failJob(
+        jobId,
+        `Qwen anchor workflow not found at ${describeWorkflowLookup(project.slug, workflowFilename)}`,
+      );
       return;
     }
 
@@ -446,7 +514,7 @@ export class AnchorRenderService {
 
     const name = ((profile.character?.displayName ?? '') as string).trim() || profile.profileCode;
     const identity = capClauses(stripIdentityBoilerplate(profile.promptBase ?? ''), QWEN_WORD_BUDGET.identity);
-    const composition = resolveAnchorComposition((project as any).settings, QWEN_PORTRAIT_COMPOSITION);
+    const composition = resolveAnchorComposition((project as any).settings, QWEN_PORTRAIT_SETTING, this.logger, (project as any).slug);
     // Qwen skill rules: describe the RESULT (the target identity IS the change —
     // older, bruised, richer), no negations, short. The keep-clause pins what
     // must survive the edit: facial identity — deliberately NOT age or clothes.

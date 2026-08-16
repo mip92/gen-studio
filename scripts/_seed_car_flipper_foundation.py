@@ -8,7 +8,7 @@ character ANCHORS render on Flux (settings.anchorPipeline='flux_comic' +
 settings.anchorStyleLora) — settings.styleLora stays the Qwen scene LoRA.
 Nameless country, no currency names. ~330 shots ≈ 38 min.
 """
-import os, shutil, datetime, psycopg2
+import os, datetime, psycopg2
 
 PFX = "7e6e0000-0000-4000-8000-"
 PROJ = PFX + "000000000001"
@@ -192,9 +192,6 @@ LOCS = {
                    "an atmosphere of ruined machinery waiting to be bought cheap"),
 }
 
-TEMPLATES = [("b1", "char_realcomic_qwen", "car_flipper/comfy/scene_realcomic_qwen_api.json"),
-             ("b2", "environment_realcomic_qwen", "car_flipper/comfy/scene_realcomic_qwen_api.json")]
-ROUTES = [("b3", "car_flipper_character_ip"), ("b4", "car_flipper_environment")]
 
 SETTINGS = (
     '{"styleLora": {"name": "style\\\\RealComic_2509_base.safetensors"},'
@@ -232,30 +229,13 @@ def main():
     for n, (slug, (name, desc)) in enumerate(LOCS.items(), 1):
         cur.execute('INSERT INTO locations (id,"projectId",slug,name,description,"createdAt","updatedAt") VALUES (%s,%s,%s,%s,%s,%s,%s)',
                     (PFX + "000000000e%02x" % n, PROJ, slug, name, desc, NOW, NOW))
-    for suf, key, path in TEMPLATES:
-        cur.execute('INSERT INTO workflow_templates (id,"projectId","templateKey","filePath","visualStyle","createdAt") VALUES (%s,%s,%s,%s,%s,%s)',
-                    (PFX + "0000000000" + suf, PROJ, key, path, 'realcomic_qwen', NOW))
-    for suf, key in ROUTES:
-        cur.execute('INSERT INTO workflow_routes (id,"projectId","routeKey","createdAt") VALUES (%s,%s,%s,%s)', (PFX + "0000000000" + suf, PROJ, key, NOW))
-    for sub in ("comfy", "reference", "tts", "shots", "scenes", "bgm"):
+    # No workflow_templates/routes rows and no comfy/ dir: those tables were
+    # dropped 2026-08-13 and every ComfyUI graph now lives once in
+    # data/_templates/comfy/, resolved by src/comfy/workflow-path.ts.
+    for sub in ("reference", "tts", "shots", "scenes", "bgm"):
         os.makedirs(os.path.join(ROOT, "data", SLUG, sub), exist_ok=True)
-    dst = os.path.join(ROOT, "data", SLUG, "comfy")
-    c = 0
-    src = os.path.join(ROOT, "data", "trucker", "comfy")
-    # distill / fps_interp dropped 2026-07-30: the first was byte-identical to
-    # the fast default and never loaded, the second was superseded by the
-    # one-pass video_upscale_interp_api.json.
-    for fn in ("video_wan22_i2v_api.json", "video_wan22_i2v_cfg_api.json",
-               "video_upscale_interp_api.json", "bgm_acestep_api.json"):
-        p = os.path.join(src, fn)
-        if os.path.exists(p):
-            shutil.copyfile(p, os.path.join(dst, fn)); c += 1
-    tpl = os.path.join(ROOT, "data", "_templates", "comfy")
-    # scene graph = Qwen; anchor graph = FLUX (settings.anchorPipeline='flux_comic')
-    for fn in ("scene_realcomic_qwen_api.json", "gen_anchor_portrait_flux_comic_api.json"):
-        shutil.copyfile(os.path.join(tpl, fn), os.path.join(dst, fn)); c += 1
     cx.commit()
-    print("OK car_flipper scenes=%d chars=%d profiles=%d locs=%d comfy=%d" % (len(SCENES), len(CHARS), len(PROFILES), len(LOCS), c))
+    print("OK car_flipper scenes=%d chars=%d profiles=%d locs=%d" % (len(SCENES), len(CHARS), len(PROFILES), len(LOCS)))
     cur.close()
     cx.close()
 

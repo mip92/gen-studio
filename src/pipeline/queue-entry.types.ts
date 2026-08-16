@@ -21,6 +21,11 @@ export type JobType =
   | 'training'
   | 'dataset'
   | 'scene'
+  // Qwen-Image-Edit-2511 pass that turns a shot's approved still into its END
+  // frame, for the two-frame (flf2v) video flow. Its own type rather than a
+  // flavour of 'scene': it edits an existing image instead of generating one,
+  // writes to different columns, and a project can want it for some acts only.
+  | 'end_frame'
   | 'video'
   | 'video_post'
   | 'tts'
@@ -49,7 +54,7 @@ export type JobType =
   | 'video_qc';
 
 export const JOB_TYPES: readonly JobType[] = [
-  'training', 'dataset', 'scene', 'video', 'video_post', 'tts',
+  'training', 'dataset', 'scene', 'end_frame', 'video', 'video_post', 'tts',
   'bgm', 'anchor', 'validation', 'anchor_validation', 'caption',
   'thumbnail', 'thumbnail_ideas', 'prop_anchor', 'vo_validation',
   'image_qc', 'video_qc',
@@ -84,6 +89,7 @@ export type EngineClass = 'comfy' | 'ollama' | 'whisper' | 'kohya' | 'standalone
 
 export const ENGINE_CLASS: Record<JobType, EngineClass> = {
   scene:             'comfy',
+  end_frame:         'comfy',
   video:             'comfy',
   video_post:        'comfy',
   bgm:               'comfy',
@@ -190,6 +196,11 @@ export function groupKeyFor(
     case 'video':      return `video:${opts.workflowFilename ?? 'default'}`;
     case 'video_post': return 'video_post';
     case 'scene':      return `scene:${opts.visualStyle ?? 'default'}`;
+    // Always the Qwen-Image-Edit-2511 chain regardless of the project's visual
+    // style — it is the only model on disk that EDITS an image rather than
+    // regenerating it, which is the whole point of an end frame. One group, so a
+    // batch of end frames drains without reloading the checkpoint between shots.
+    case 'end_frame':  return 'end_frame:qwen';
     case 'anchor':     return `anchor:${opts.visualStyle ?? 'default'}`;
     // Same graph as a character anchor, so the same model stays resident.
     case 'prop_anchor': return `anchor:${opts.visualStyle ?? 'default'}`;

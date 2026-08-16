@@ -867,6 +867,9 @@ export class QueueLedgerService {
   private async resolveContext(jobType: JobType, jobId: string): Promise<SnapshotContext> {
     switch (jobType) {
       case 'scene':      return this.shotContext(await this.sceneJobShot(jobId), '');
+      // Prefixed so a queue full of shot codes still reads at a glance: this row
+      // is making the LAST frame of that shot, not re-rendering the shot itself.
+      case 'end_frame':  return this.shotContext(await this.endFrameJobShot(jobId), '⏭ ');
       case 'validation': return this.shotContext(await this.validationShot(jobId), '🔎 ');
       case 'video':
       case 'video_post': {
@@ -1024,6 +1027,14 @@ export class QueueLedgerService {
 
   private async sceneJobShot(jobId: string) {
     const j = await this.prisma.sceneRenderJob.findUnique({
+      where:   { id: jobId },
+      include: { shot: { include: { project: true, scene: true } } },
+    });
+    return j?.shot ?? null;
+  }
+
+  private async endFrameJobShot(jobId: string) {
+    const j = await (this.prisma as any).endFrameJob.findUnique({
       where:   { id: jobId },
       include: { shot: { include: { project: true, scene: true } } },
     });

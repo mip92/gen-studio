@@ -19,6 +19,7 @@ import * as path from 'path';
 import { PrismaService } from '../prisma/prisma.service';
 import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { ComfyService } from '../comfy/comfy.service';
+import { describeWorkflowLookup, readWorkflowJson } from '../comfy/workflow-path';
 import {
   StartRenderInput,
   AudioRenderParams,
@@ -275,11 +276,13 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
   // ── Workflow patch ────────────────────────────────────────────────────────
 
   private loadTemplate(projectSlug: string, filename: string): Record<string, any> {
-    const filePath = path.join(APP_ROOT, 'data', projectSlug, 'comfy', filename);
-    if (!existsSync(filePath)) {
-      throw new NotFoundException(`BGM workflow not found: ${filePath}`);
+    const template = readWorkflowJson(projectSlug, filename);
+    if (!template) {
+      throw new NotFoundException(
+        `BGM workflow not found: ${describeWorkflowLookup(projectSlug, filename)}`,
+      );
     }
-    return JSON.parse(readFileSync(filePath, 'utf-8'));
+    return template;
   }
 
   /**

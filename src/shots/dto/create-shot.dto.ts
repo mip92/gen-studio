@@ -37,4 +37,17 @@ export class CreateShotDto {
   @IsOptional()
   @IsIn(['animated', 'static'])
   renderMode?: string;
+
+  /** Which i2v flow this shot animates on — 'i2v' (one pinned frame) or 'flf2v'
+   *  (first AND last frame pinned). null/absent = inherit the act, then the
+   *  project. See Shot.videoFlow in schema.prisma. */
+  @IsOptional()
+  @IsIn(['i2v', 'flf2v'])
+  videoFlow?: string | null;
+
+  /** Qwen-Image-Edit instruction that turns this shot's chosen still into its
+   *  END frame: ONLY what is different a few seconds later. */
+  @IsOptional()
+  @IsString()
+  endFramePrompt?: string | null;
 }

@@ -84,8 +84,20 @@ export class YoutubeLaunchController {
     return this.launch.confirmLinked(idOrSlug);
   }
 
+  @Get('slot')
+  @ApiOperation({
+    summary: 'Дата публикации фильма: слот из релизного календаря (или запасной вт/чт)',
+    description: 'Источник — Project.releaseAt. 400, если плановая дата уже прошла: '
+      + 'слот двигают на /releases, а не молча переносят на другой день.',
+  })
+  slot(@Param('idOrSlug') idOrSlug: string) {
+    return this.launch.resolveSlot(idOrSlug);
+  }
+
   @Post('schedule')
-  @ApiOperation({ summary: 'Step 5 — schedule all (main 16:00, shorts 16:05), gated on subtitles' })
+  @ApiOperation({
+    summary: 'Step 5 — schedule all on the release-calendar date (shorts +5 min), gated on subtitles',
+  })
   schedule(@Param('idOrSlug') idOrSlug: string) {
     return this.launch.schedule(idOrSlug);
   }

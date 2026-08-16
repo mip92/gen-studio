@@ -105,6 +105,11 @@ export class ProjectsService {
           ...((dto as any).youtubeUrl !== undefined
             ? { youtubeUrl: ((dto as any).youtubeUrl as string).trim() || null }
             : {}),
+          // Default i2v flow for the project's shots. Affects FUTURE renders
+          // only; acts and shots can still override it.
+          ...((dto as any).defaultVideoFlow !== undefined
+            ? { defaultVideoFlow: (dto as any).defaultVideoFlow }
+            : {}),
         } as any),
       },
     });

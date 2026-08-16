@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, IsOptional, IsObject } from 'class-validator';
+import { IsString, IsNotEmpty, IsOptional, IsObject, IsIn } from 'class-validator';
 
 export class CreateProjectDto {
   @IsString()
@@ -28,6 +28,12 @@ export class CreateProjectDto {
   @IsString()
   @IsNotEmpty()
   defaultMotionPrompt!: string;
+
+  /** Default i2v flow for this project's shots — 'i2v' (one pinned frame) or
+   *  'flf2v' (first AND last frame pinned). Acts and shots may override it. */
+  @IsOptional()
+  @IsIn(['i2v', 'flf2v'])
+  defaultVideoFlow?: string;
 
   @IsString()
   @IsNotEmpty()

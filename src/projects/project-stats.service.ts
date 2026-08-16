@@ -333,9 +333,21 @@ export class ProjectStatsService {
     }
 
     // Music: segments still without an approved take (spares are deliberate
-    // extras, not gaps).
+    // extras, not gaps) И БЕЗ УЖЕ ИДУЩЕГО рендера.
+    //
+    // Плитка с pending/running джобом посчитана выше как queuedOwn — без этого
+    // условия она попадала В ОБА ведра сразу: её секунды складывались дважды, а
+    // овервью писал «музыка: 25, ещё даже не поставлено в очередь», хотя все 25
+    // стояли в очереди и /actions правильно не предлагал ничего начинать
+    // (user, car_flipper, 2026-08-12). Кадровые стадии так не врали — у них есть
+    // queuedByShot; у музыки такой проверки просто не было.
     const bgmSegments = await this.prisma.musicSegment.count({
-      where: { block: { projectId }, approvedJobId: null, spare: false } as any,
+      where: {
+        block:         { projectId },
+        approvedJobId: null,
+        spare:         false,
+        jobs:          { none: { status: { in: ['pending', 'running'] } } },
+      } as any,
     });
 
     return { stages, bgmSegments };

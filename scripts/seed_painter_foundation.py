@@ -218,18 +218,10 @@ for slug, name, desc in LOCATIONS:
                    VALUES (%s,%s,%s,%s,%s, now())""",
                 (str(uuid.uuid4()), pid, slug, name, desc))
 
-# ── Workflow templates + routes (mirror fortune) ───────────────────────────────
-TEMPLATES = [
-  ("char_ip_graphic_novel", f"{SLUG}/comfy/scene_single_character_graphic_novel_api.json", "graphic_novel_cell_shaded"),
-  ("environment_graphic_novel", f"{SLUG}/comfy/scene_environment_graphic_novel_api.json", "graphic_novel_cell_shaded"),
-]
-for key, path, vs in TEMPLATES:
-    cur.execute("""INSERT INTO workflow_templates (id,"projectId","templateKey","filePath","visualStyle")
-                   VALUES (%s,%s,%s,%s,%s)""", (str(uuid.uuid4()), pid, key, path, vs))
-
-for routekey in (f"{SLUG}_character_ip", f"{SLUG}_environment"):
-    cur.execute("""INSERT INTO workflow_routes (id,"projectId","routeKey")
-                   VALUES (%s,%s,%s)""", (str(uuid.uuid4()), pid, routekey))
+# ── Workflow templates + routes: GONE ──────────────────────────────────────────
+# Those tables were dropped 2026-08-13. Every ComfyUI graph now lives once in
+# data/_templates/comfy/, and a project needs no comfy/ dir of its own — the
+# render resolves the shared master (src/comfy/workflow-path.ts).
 
 conn.commit()
 print(f"OK: project '{SLUG}' id={pid}")
@@ -237,10 +229,8 @@ cur.execute("""SELECT
   (SELECT count(*) FROM character_profiles cp JOIN characters c ON cp."characterId"=c.id WHERE c."projectId"=%s),
   (SELECT count(*) FROM project_characters WHERE "projectId"=%s),
   (SELECT count(*) FROM scenes WHERE "projectId"=%s),
-  (SELECT count(*) FROM locations WHERE "projectId"=%s),
-  (SELECT count(*) FROM workflow_templates WHERE "projectId"=%s),
-  (SELECT count(*) FROM workflow_routes WHERE "projectId"=%s)
-""", (pid, pid, pid, pid, pid, pid))
-prof, links, sc, loc, tpl, rt = cur.fetchone()
-print(f"profiles={prof} project_characters={links} scenes={sc} locations={loc} templates={tpl} routes={rt}")
+  (SELECT count(*) FROM locations WHERE "projectId"=%s)
+""", (pid, pid, pid, pid))
+prof, links, sc, loc = cur.fetchone()
+print(f"profiles={prof} project_characters={links} scenes={sc} locations={loc}")
 cur.close(); conn.close()

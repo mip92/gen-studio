@@ -9,10 +9,9 @@ import { WorkflowTemplate } from '../../workflows/workflow.types';
  * a single anchor reference image + comic-style LoRA on SDXL base. NO character
  * LoRA training (cartoon project loraPipeline='none' per visual_styles registry).
  *
- * Workflow file: scene_single_character_graphic_novel_api.json (TO BE CREATED
- * under data/<project_slug>/comfy/ — copy from
- * scene_single_character_ipadapter_api.json + swap LoRA loader to comic-style
- * LoRA and lower IP-Adapter weight).
+ * Workflow file: scene_single_character_graphic_novel_api.json, in the shared
+ * master dir data/_templates/comfy/. Edit it there — every project loads that
+ * one copy.
  *
  * Style block is prepended automatically by scene-render.service via the
  * visual_styles.styleBlock column.

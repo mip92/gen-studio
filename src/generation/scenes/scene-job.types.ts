@@ -27,6 +27,10 @@ export interface SceneJobParams {
    *  that image was actually attached, so the strategy can bind it to its own
    *  `Picture N` line. See Prop.anchorPath / props.controller. */
   objectReferenceLabel?: string;
+  /** Derived from `Shot.shotType`: 'hands-only' for POV, 'back' for BACK, else
+   *  'full'. Qwen strategies use it to stop ordering a face into a frame that
+   *  has none — see QwenInstructionOpts.faceVisibility. */
+  faceVisibility?: 'full' | 'back' | 'hands-only';
   /** Negative prompt — appended to the strategy's defaults. */
   negativeExtra?:  string;
   width:           number;

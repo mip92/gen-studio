@@ -2,6 +2,7 @@ import { Injectable, NotFoundException, BadRequestException } from '@nestjs/comm
 import { PrismaService } from '../prisma/prisma.service';
 import { QueueLedgerService } from '../pipeline/queue-ledger.service';
 import { CreateSceneDto } from './dto/create-scene.dto';
+import { UpdateSceneDto } from './dto/update-scene.dto';
 
 @Injectable()
 export class ScenesService {
@@ -45,6 +46,32 @@ export class ScenesService {
         sceneKey:                    dto.sceneKey,
         title:                       dto.title,
         sortOrder,
+        defaultReferenceProfileCode: dto.defaultReferenceProfileCode,
+      },
+    });
+  }
+
+  /**
+   * Update an act's own fields. Only the keys present in the body are touched,
+   * so this never overwrites a field the caller did not mean to send.
+   *
+   * `defaultVideoFlow` goes through raw SQL for the same reason `Shot.locationId`
+   * does — the column can predate the generated Prisma client on a backend that
+   * has not re-run `prisma generate`. Passing null clears the override and the
+   * act falls back to the project's flow.
+   */
+  async update(projectIdOrSlug: string, sceneId: string, dto: UpdateSceneDto) {
+    await this.findOne(projectIdOrSlug, sceneId);
+    const flow = (dto as any).defaultVideoFlow;
+    if (flow !== undefined) {
+      await this.prisma.$queryRaw`
+        UPDATE scenes SET "defaultVideoFlow" = ${flow ?? null} WHERE id = ${sceneId}`;
+    }
+    return this.prisma.scene.update({
+      where: { id: sceneId },
+      data:  {
+        title:                       dto.title,
+        sortOrder:                   dto.sortOrder,
         defaultReferenceProfileCode: dto.defaultReferenceProfileCode,
       },
     });

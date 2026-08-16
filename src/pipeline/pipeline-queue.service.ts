@@ -5,6 +5,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { DatasetQueueService } from '../generation/dataset-queue.service';
 import { SceneRenderService } from '../generation/scenes/scene-render.service';
 import { VideoRenderService } from '../generation/videos/video-render.service';
+import { EndFrameService } from '../generation/endframes/end-frame.service';
 import { TrainingService } from '../training/training.service';
 import { TTSService } from '../tts/tts.service';
 import { BgmRenderService } from '../bgm/bgm-render.service';
@@ -61,6 +62,7 @@ export class PipelineQueueService {
     private readonly datasets: DatasetQueueService,
     private readonly scenes:   SceneRenderService,
     private readonly videos:   VideoRenderService,
+    private readonly endFrames: EndFrameService,
     private readonly training: TrainingService,
     private readonly tts:      TTSService,
     private readonly bgm:      BgmRenderService,
@@ -209,6 +211,8 @@ export class PipelineQueueService {
           return;
         case 'dataset':    await this.datasets.dispatchPending(e.jobId); return;
         case 'scene':      await this.scenes.dispatchPending(e.jobId);   return;
+        // Qwen edit that makes a shot's LAST frame for the two-frame video flow.
+        case 'end_frame':  await this.endFrames.dispatchPending(e.jobId); return;
         case 'video':      await this.videos.dispatchPending(e.jobId);   return;
         // ONE queue job for the combined upscale→RIFE pass: a single ComfyUI
         // prompt yields both the FHD and the smooth clip.

@@ -4,7 +4,7 @@
 Unnamed Central European country, grand railway terminus, 1985->2026, currency crowns.
 Voice everyone knows, face no one knows; replaced by a synthetic voice built from her own.
 """
-import os, shutil, datetime, psycopg2
+import os, datetime, psycopg2
 PFX="7e600000-0000-4000-8000-"; PROJ=PFX+"000000000001"; SLUG="announcer"
 NAME="ТЫ — Диктор на вокзале. И это вся твоя жизнь."
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__))); NOW=datetime.datetime.utcnow()
@@ -80,9 +80,9 @@ LOCS={
  "train_interior":("Вагон поезда","the interior of a passenger train carriage, rows of worn upholstered seats, luggage racks above, large windows with landscape sliding past, a ceiling loudspeaker grille, soft daylight, an atmosphere of anonymous transit"),
 }
 
-TEMPLATES=[("b1","char_ip_graphic_novel","announcer/comfy/scene_single_character_graphic_novel_api.json"),
-           ("b2","environment_graphic_novel","announcer/comfy/scene_environment_graphic_novel_api.json")]
-ROUTES=[("b3","announcer_character_ip"),("b4","announcer_environment")]
+    # No comfy/ dir, no copying, no workflow_templates/routes rows: every
+    # ComfyUI graph lives once in data/_templates/comfy/ and the render
+    # resolves it there (src/comfy/workflow-path.ts). Tables dropped 2026-08-13.
 
 def main():
     cx=psycopg2.connect(host="localhost",dbname="gen_studio",user="gen_studio",password="gen_studio"); cx.autocommit=False; cur=cx.cursor()
@@ -107,17 +107,9 @@ def main():
     for n,(slug,(name,desc)) in enumerate(LOCS.items(),1):
         cur.execute('INSERT INTO locations (id,"projectId",slug,name,description,"createdAt","updatedAt") VALUES (%s,%s,%s,%s,%s,%s,%s)',
                     (PFX+"000000000e%02x"%n,PROJ,slug,name,desc,NOW,NOW))
-    for suf,key,path in TEMPLATES:
-        cur.execute('INSERT INTO workflow_templates (id,"projectId","templateKey","filePath","visualStyle","createdAt") VALUES (%s,%s,%s,%s,%s,%s)',
-                    (PFX+"0000000000"+suf,PROJ,key,path,'graphic_novel_cell_shaded',NOW))
-    for suf,key in ROUTES:
-        cur.execute('INSERT INTO workflow_routes (id,"projectId","routeKey","createdAt") VALUES (%s,%s,%s,%s)',(PFX+"0000000000"+suf,PROJ,key,NOW))
-    for sub in ("comfy","reference","tts","shots","scenes","bgm"): os.makedirs(os.path.join(ROOT,"data","announcer",sub),exist_ok=True)
-    src=os.path.join(ROOT,"data","cat_lady","comfy"); dst=os.path.join(ROOT,"data","announcer","comfy"); c=0
-    for fn in os.listdir(src):
-        if fn.endswith(".json"): shutil.copyfile(os.path.join(src,fn),os.path.join(dst,fn)); c+=1
+    for sub in ("reference","tts","shots","scenes","bgm"): os.makedirs(os.path.join(ROOT,"data","announcer",sub),exist_ok=True)
     cx.commit()
-    print("OK announcer scenes=%d chars=%d profiles=%d locs=%d comfy=%d"%(len(SCENES),len(CHARS),len(PROFILES),len(LOCS),c))
+    print("OK announcer scenes=%d chars=%d profiles=%d locs=%d"%(len(SCENES),len(CHARS),len(PROFILES),len(LOCS)))
     cur.close(); cx.close()
 
 if __name__=="__main__": main()

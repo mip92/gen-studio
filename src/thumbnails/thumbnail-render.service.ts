@@ -11,6 +11,7 @@ import { ComfyService } from '../comfy/comfy.service';
 import { normalizeStyleLora } from '../generation/scenes/scene-render.service';
 import { QwenSceneGraphBuilder } from '../generation/scenes/qwen/qwen-scene-graph.builder';
 import { composeQwenInstruction, KEEP_REFERENCE_STYLE, REALCOMIC_COVER_STYLE } from '../generation/scenes/qwen/qwen-prompt';
+import { describeWorkflowLookup, resolveWorkflowPath } from '../comfy/workflow-path';
 import {
   batchDiversityProblems,
   composeCoverPrompt,
@@ -1232,11 +1233,12 @@ export class ThumbnailRenderService {
 
     const project = job.project;
     const workflowFilename = 'scene_realcomic_qwen_api.json';
-    const perProject = path.join(APP_ROOT, 'data', project.slug, 'comfy', workflowFilename);
-    const shared     = path.join(APP_ROOT, 'data', '_templates', 'comfy', workflowFilename);
-    const workflowPath = existsSync(perProject) ? perProject : shared;
-    if (!existsSync(workflowPath)) {
-      await this.failJob(jobId, `Thumbnail workflow not found at ${perProject} nor ${shared}`);
+    const workflowPath = resolveWorkflowPath(project.slug, workflowFilename);
+    if (!workflowPath) {
+      await this.failJob(
+        jobId,
+        `Thumbnail workflow not found at ${describeWorkflowLookup(project.slug, workflowFilename)}`,
+      );
       return;
     }
 

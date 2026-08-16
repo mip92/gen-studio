@@ -3,11 +3,11 @@
 One-shot creation of the `flat_earth` project (NOT a maintained seeder — DB is
 source of truth; this file is deleted after the project is verified).
 Creates: project row, 14 scenes (acts), cast (6 chars / 8 profiles) + M:N,
-18 locations, 2 workflow templates + 2 routes. Copies comfy JSONs from cat_lady.
+18 locations. Workflows are shared — nothing is copied (data/_templates/comfy/).
 Idempotent: aborts if the project already exists.
 Run:  PYTHONIOENCODING=utf-8 python scripts/_seed_flat_earth_foundation.py
 """
-import os, shutil, datetime, psycopg2
+import os, datetime, psycopg2
 
 PFX  = "7e5c0000-0000-4000-8000-"        # flat_earth id namespace (free: 7e5a=cat_lady, 7e5b=honeywagon)
 PROJ = PFX + "000000000001"
@@ -158,11 +158,6 @@ LOCS = {
     "horizon, scrubby cedars, a gravel pull-off, telephone wires crossing the foreground, deep gold and violet sky"),
 }
 
-TEMPLATES = [  # (idsuffix, templateKey, filePath)
-    ("b1", "char_ip_graphic_novel",     "flat_earth/comfy/scene_single_character_graphic_novel_api.json"),
-    ("b2", "environment_graphic_novel", "flat_earth/comfy/scene_environment_graphic_novel_api.json"),
-]
-ROUTES = [("b3", "flat_earth_character_ip"), ("b4", "flat_earth_environment")]
 
 def main():
     cx = psycopg2.connect(host="localhost", dbname="gen_studio", user="gen_studio", password="gen_studio")
@@ -213,26 +208,15 @@ def main():
         cur.execute("""INSERT INTO locations (id,"projectId",slug,name,description,"createdAt","updatedAt")
             VALUES (%s,%s,%s,%s,%s,%s,%s)""", (lid, PROJ, slug, name, desc, NOW, NOW))
 
-    for suf,key,path in TEMPLATES:
-        cur.execute("""INSERT INTO workflow_templates (id,"projectId","templateKey","filePath","visualStyle","createdAt")
-            VALUES (%s,%s,%s,%s,'graphic_novel_cell_shaded',%s)""", (PFX+"0000000000"+suf, PROJ, key, path, NOW))
-    for suf,key in ROUTES:
-        cur.execute("""INSERT INTO workflow_routes (id,"projectId","routeKey","createdAt")
-            VALUES (%s,%s,%s,%s)""", (PFX+"0000000000"+suf, PROJ, key, NOW))
-
-    # filesystem: dirs + copy comfy JSONs from cat_lady
-    for sub in ("comfy","reference","tts","shots","scenes","bgm"):
+    # No workflow_templates/routes rows and no comfy/ dir: those tables were
+    # dropped 2026-08-13 and every ComfyUI graph now lives once in
+    # data/_templates/comfy/, resolved by src/comfy/workflow-path.ts.
+    for sub in ("reference","tts","shots","scenes","bgm"):
         os.makedirs(os.path.join(ROOT,"data","flat_earth",sub), exist_ok=True)
-    src = os.path.join(ROOT,"data","cat_lady","comfy")
-    dst = os.path.join(ROOT,"data","flat_earth","comfy")
-    copied = []
-    for fn in os.listdir(src):
-        if fn.endswith(".json"):
-            shutil.copyfile(os.path.join(src,fn), os.path.join(dst,fn)); copied.append(fn)
 
     cx.commit()
-    print("OK project=%s scenes=%d chars=%d profiles=%d locs=%d templates=%d routes=%d comfy_copied=%d"
-          % (PROJ, len(SCENES), len(CHARS), len(PROFILES), len(LOCS), len(TEMPLATES), len(ROUTES), len(copied)))
+    print("OK project=%s scenes=%d chars=%d profiles=%d locs=%d"
+          % (PROJ, len(SCENES), len(CHARS), len(PROFILES), len(LOCS)))
     cur.close(); cx.close()
 
 if __name__ == "__main__":

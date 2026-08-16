@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """One-shot creation of `shuttle`. Run: PYTHONIOENCODING=utf-8 python scripts/_seed_shuttle_foundation.py
 «ТЫ — Челночница.» Track B semi-light, f5 female «Учительница Казахстан», graphic_novel_flux (divorce look: Comic_Style-FLUX)."""
-import os, shutil, datetime, psycopg2
+import os, datetime, psycopg2
 PFX="7e6a0000-0000-4000-8000-"; PROJ=PFX+"000000000001"; SLUG="shuttle"
 NAME="ТЫ — Челночница. И это вся твоя жизнь."
 ROOT=os.path.dirname(os.path.dirname(os.path.abspath(__file__))); NOW=datetime.datetime.utcnow()
@@ -64,9 +64,9 @@ LOCS={
  "new_flat":("Квартира дочери (2026)","a bright modern apartment hallway with a high built-in mezzanine cupboard, a stepladder under its open doors, moving boxes half unpacked along the wall, warm spot lighting, a coat rack with a soft red scarf, the fresh settled feel of a life that turned out well"),
 }
 
-TEMPLATES=[("b1","char_ip_flux_comic","shuttle/comfy/scene_single_character_flux_comic_api.json"),
-           ("b2","environment_flux_comic","shuttle/comfy/scene_environment_flux_comic_api.json")]
-ROUTES=[("b3","shuttle_character_ip"),("b4","shuttle_environment")]
+    # No comfy/ dir, no copying, no workflow_templates/routes rows: every
+    # ComfyUI graph lives once in data/_templates/comfy/ and the render
+    # resolves it there (src/comfy/workflow-path.ts). Tables dropped 2026-08-13.
 
 def main():
     cx=psycopg2.connect(host="localhost",dbname="gen_studio",user="gen_studio",password="gen_studio"); cx.autocommit=False; cur=cx.cursor()
@@ -91,17 +91,9 @@ def main():
     for n,(slug,(name,desc)) in enumerate(LOCS.items(),1):
         cur.execute('INSERT INTO locations (id,"projectId",slug,name,description,"createdAt","updatedAt") VALUES (%s,%s,%s,%s,%s,%s,%s)',
                     (PFX+"000000000e%02x"%n,PROJ,slug,name,desc,NOW,NOW))
-    for suf,key,path in TEMPLATES:
-        cur.execute('INSERT INTO workflow_templates (id,"projectId","templateKey","filePath","visualStyle","createdAt") VALUES (%s,%s,%s,%s,%s,%s)',
-                    (PFX+"0000000000"+suf,PROJ,key,path,'graphic_novel_flux',NOW))
-    for suf,key in ROUTES:
-        cur.execute('INSERT INTO workflow_routes (id,"projectId","routeKey","createdAt") VALUES (%s,%s,%s,%s)',(PFX+"0000000000"+suf,PROJ,key,NOW))
-    for sub in ("comfy","reference","tts","shots","scenes","bgm"): os.makedirs(os.path.join(ROOT,"data","shuttle",sub),exist_ok=True)
-    src=os.path.join(ROOT,"data","divorce","comfy"); dst=os.path.join(ROOT,"data","shuttle","comfy"); c=0
-    for fn in os.listdir(src):
-        if fn.endswith(".json"): shutil.copyfile(os.path.join(src,fn),os.path.join(dst,fn)); c+=1
+    for sub in ("reference","tts","shots","scenes","bgm"): os.makedirs(os.path.join(ROOT,"data","shuttle",sub),exist_ok=True)
     cx.commit()
-    print("OK shuttle scenes=%d chars=%d profiles=%d locs=%d comfy=%d"%(len(SCENES),len(CHARS),len(PROFILES),len(LOCS),c))
+    print("OK shuttle scenes=%d chars=%d profiles=%d locs=%d"%(len(SCENES),len(CHARS),len(PROFILES),len(LOCS)))
     cur.close(); cx.close()
 
 if __name__=="__main__": main()

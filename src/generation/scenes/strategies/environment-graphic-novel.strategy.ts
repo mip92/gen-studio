@@ -8,9 +8,8 @@ import { WorkflowTemplate } from '../../workflows/workflow.types';
  * No character, no LoRA face-lock. SDXL base + comic-style LoRA only.
  * Used for establishing shots, atmosphere shots, isolated prop close-ups.
  *
- * Workflow file: scene_environment_graphic_novel_api.json (TO BE CREATED
- * under data/<project_slug>/comfy/ — copy from scene_environment_api.json +
- * add comic-style LoRA loader before the KSampler).
+ * Workflow file: scene_environment_graphic_novel_api.json, in the shared master
+ * dir data/_templates/comfy/. Edit it there — every project loads that one copy.
  */
 const STYLE_PREFIX =
   'cinematic graphic novel illustration, illustrated comic book panel, ' +

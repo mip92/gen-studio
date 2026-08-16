@@ -52,6 +52,7 @@ export class QwenDualCharacterOverlayStrategy implements SceneStrategy {
       locationPrompt: params.locationPrompt,
       styleDirective: KEEP_REFERENCE_STYLE,
       withReferences: true,
+      faceVisibility: params.faceVisibility,
     });
 
     return this.builder.build(template, {

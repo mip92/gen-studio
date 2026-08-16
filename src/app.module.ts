@@ -5,7 +5,6 @@ import { ProjectsModule } from './projects/projects.module';
 import { CharactersModule } from './characters/characters.module';
 import { ScenesModule } from './scenes/scenes.module';
 import { ShotsModule } from './shots/shots.module';
-import { WorkflowModule } from './workflow/workflow.module';
 import { ReferenceAssetsModule } from './reference-assets/reference-assets.module';
 import { ComfyModule } from './comfy/comfy.module';
 import { GenerationModule } from './generation/generation.module';
@@ -37,7 +36,6 @@ import { ReleasesModule } from './releases/releases.module';
     CharactersModule,
     ScenesModule,
     ShotsModule,
-    WorkflowModule,
     ReferenceAssetsModule,
     ComfyModule,
     GenerationModule,

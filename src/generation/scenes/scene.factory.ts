@@ -1,6 +1,4 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { existsSync, readFileSync } from 'fs';
-import * as path from 'path';
 import { SceneStrategy } from './scene-strategy';
 import { WorkflowTemplate } from '../workflows/workflow.types';
 import { SingleCharacterSceneStrategy } from './strategies/single-character.strategy';
@@ -18,8 +16,7 @@ import { SingleCharacterFluxComicSceneStrategy } from './strategies/single-chara
 import { DualCharacterFluxComicSceneStrategy } from './strategies/dual-character-flux-comic.strategy';
 import { QwenRealcomicSceneStrategy } from './strategies/qwen-realcomic-scene.strategy';
 import { QwenDualCharacterOverlayStrategy } from './strategies/qwen-dual-character-overlay.strategy';
-
-const APP_ROOT = process.env.APP_ROOT ?? path.resolve(__dirname, '..', '..', '..', '..');
+import { describeWorkflowLookup, readWorkflowJson } from '../../comfy/workflow-path';
 
 const DEFAULT_VISUAL_STYLE = 'photoreal_cinematic';
 
@@ -146,17 +143,13 @@ export class SceneFactory {
   }
 
   loadTemplate(strategy: SceneStrategy, projectSlug: string): WorkflowTemplate {
-    // Per-project workflow JSON wins; fall back to the shared master template
-    // in data/_templates/comfy/ when a project hasn't copied it in yet. This is
-    // how a NEW project (e.g. a graphic_novel_flux one) renders out of the box —
-    // its comfy/ dir need not be pre-populated for every strategy.
-    const perProject = path.join(APP_ROOT, 'data', projectSlug, 'comfy', strategy.filename);
-    const shared     = path.join(APP_ROOT, 'data', '_templates', 'comfy', strategy.filename);
-    const filePath   = existsSync(perProject) ? perProject : shared;
-    if (!existsSync(filePath)) {
-      throw new NotFoundException(`Shot render workflow not found: ${perProject} (and no shared template at ${shared})`);
+    const template = readWorkflowJson<WorkflowTemplate>(projectSlug, strategy.filename);
+    if (!template) {
+      throw new NotFoundException(
+        `Shot render workflow not found: ${describeWorkflowLookup(projectSlug, strategy.filename)}`,
+      );
     }
-    return JSON.parse(readFileSync(filePath, 'utf-8')) as WorkflowTemplate;
+    return template;
   }
 
   private register(s: SceneStrategy): void {
