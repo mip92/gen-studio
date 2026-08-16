@@ -385,7 +385,9 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       );
       // Warn-only: surfaces negations-in-the-positive and missing camera clauses
       // in the log. Does not rewrite the prompt and does not block the render.
-      this.lintMotionPrompt(v.shot.shotCode, motionPrompt);
+      this.lintMotionPrompt(
+        v.shot.shotCode, motionPrompt,
+        typeof pf.positive === 'string' ? pf.positive : undefined);
       const motionNegative = rawMotionNegative
         ? stripPromptWeights(
             rawMotionNegative,
@@ -710,9 +712,15 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
    * Also flags prompts long enough to approach the umt5 quality cliff (~320–350
    * tokens; the 512-token cap truncates silently from the tail).
    */
-  private lintMotionPrompt(shotCode: string, prompt: string): void {
+  private lintMotionPrompt(shotCode: string, prompt: string, positive?: string): void {
     const low = prompt.toLowerCase();
-    const negations = (low.match(/\bno\s+\w+|\bwithout\s+\w+/g) ?? []).slice(0, 4);
+    // `no music` is the ONE negation the LTX dialect requires rather than
+    // tolerates — Lightricks' guide asks for it explicitly whenever an external
+    // soundtrack will be laid over the clip, and ours always is (ACE-Step).
+    // Without this exemption every LTX shot warns, and a warning that fires on
+    // everything is read by nobody.
+    const negations = (low.replace(/\bno music\b/g, '')
+      .match(/\bno\s+\w+|\bwithout\s+\w+/g) ?? []).slice(0, 4);
     if (negations.length > 0) {
       this.logger.warn(
         `[${shotCode}] motionPrompt carries negations in the POSITIVE at cfg=1 `
@@ -731,6 +739,34 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         `[${shotCode}] motionPrompt is ${words} words — past the 30–60 word budget and `
         + `approaching the umt5 quality cliff (Skill: gen-studio-wan22 §2)`,
       );
+    }
+
+    // A frame with people BEHIND the subject needs them pinned, and pinned
+    // POSITIVELY. Two failures live here and they pull in opposite directions:
+    // the single-figure lock («the same single figure throughout the shot») on a
+    // frame that visibly holds a queue is a guard fighting its own image, and i2v
+    // answers by melting or deleting the crowd; while a frame with people and no
+    // lock at all gets a crowd that walks, turns and multiplies.
+    //
+    // Warn-only, like the rest of this method: it surfaces in the dispatch log
+    // rather than blocking a render (user rule 2026-08-16 — background people
+    // must move minimally).
+    if (positive && /\b(traders?|queue|crowd|people|passers-?by|shoppers|customers|onlookers|bystanders|classmates|colleagues)\b/i.test(positive)) {
+      if (/\bthe same single figure\b/i.test(prompt)) {
+        this.logger.warn(
+          `[${shotCode}] positive shows background people but motionPrompt carries the `
+          + `SINGLE-figure lock — the guard fights the frame (Skill: gen-studio-wan22 §5.3a)`,
+        );
+      // Wide on purpose. The recommended tail is one phrasing among several the
+      // corpus actually uses — «holding its place», «keeping its place», «hold
+      // still», «barely shift» all pin a crowd, and a narrow matcher would warn
+      // on shots that are already correct. A lint nobody trusts gets muted.
+      } else if (!/\bbackground figures?\b|\b(hold|keep)(s|ing)?\s+(still|(their|its)\s+places?)\b|\bbarely\s+(move|shift)/i.test(prompt)) {
+        this.logger.warn(
+          `[${shotCode}] positive shows background people but motionPrompt does not pin them — `
+          + `they will walk and multiply (Skill: gen-studio-wan22 §5.3a)`,
+        );
+      }
     }
   }
 
