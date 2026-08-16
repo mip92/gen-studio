@@ -63,6 +63,15 @@ model Project {
   /// Default is "i2v" precisely so every pre-existing project keeps rendering the
   /// byte-identical graph it always did; new projects opt in.
   defaultVideoFlow          String    @default("i2v")
+  /// Which model family renders this project's clips: "wan" (Wan 2.2 i2v, the
+  /// original and the default) or "ltx" (LTX-2.5). Chosen per PROJECT, like
+  /// `visualStyle` for stills — one film is shot on one engine so a single
+  /// montage never mixes two grains, and there is deliberately no per-shot
+  /// override (user 2026-08-16).
+  ///
+  /// Resolved through `VideoEngineFactory`; an unknown value falls back to wan
+  /// rather than failing, so a film mid-production keeps rendering.
+  videoEngine               String    @default("wan")
   /// TTS engine to use for narration synthesis. 'silero' = CPU Silero V5 ru
   /// (default; legacy projects); 'xtts2' = XTTS-v2 GPU voice cloning;
   /// 'f5' = F5-TTS Russian GPU voice cloning. Null = treat as 'silero'.

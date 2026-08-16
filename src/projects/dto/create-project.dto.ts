@@ -35,6 +35,12 @@ export class CreateProjectDto {
   @IsIn(['i2v', 'flf2v'])
   defaultVideoFlow?: string;
 
+  /** Which model family renders this project's clips. Per project, like
+   *  visualStyle for stills — see Project.videoEngine in schema.prisma. */
+  @IsOptional()
+  @IsIn(['wan', 'ltx'])
+  videoEngine?: string;
+
   @IsString()
   @IsNotEmpty()
   defaultStaticMotionPrompt!: string;

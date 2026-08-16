@@ -110,6 +110,12 @@ export class ProjectsService {
           ...((dto as any).defaultVideoFlow !== undefined
             ? { defaultVideoFlow: (dto as any).defaultVideoFlow }
             : {}),
+          // Video model family. Affects FUTURE renders only — the filename is
+          // baked onto each queued clip, so switching never re-patches work
+          // already in the queue.
+          ...((dto as any).videoEngine !== undefined
+            ? { videoEngine: (dto as any).videoEngine }
+            : {}),
         } as any),
       },
     });

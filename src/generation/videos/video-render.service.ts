@@ -22,35 +22,13 @@ import { StartVideoInput } from './video-job.types';
 import { stripPromptWeights } from '../scenes/scene-render.service';
 import { QueueLedgerService } from '../../pipeline/queue-ledger.service';
 import { PageTemplateRegistryService } from '../../comic/page-template-registry.service';
+import { VideoEngineFactory } from './engines/video-engine.factory';
+import { VideoFlow } from './engines/video-engine';
 
 const APP_ROOT     = process.env.APP_ROOT     ?? path.resolve(__dirname, '..', '..', '..', '..');
 const COMFY_INPUT  = process.env.COMFY_INPUT  ?? 'E:\\ComfyUI\\input';
 const COMFY_OUTPUT = process.env.COMFY_OUTPUT ?? 'E:\\ComfyUI\\output';
 const POLL_MS      = 4000;
-const WORKFLOW_FILENAME = 'video_wan22_i2v_api.json';
-// Alternative "quality" i2v workflow: full Wan2.2 dual-expert, no lightx2v
-// speed LoRA, 20 steps @ cfg=4.0 → the negative prompt actually fires.
-// MEASURED on 6 208 completed renders (2026-07-30): median 980 s against the
-// fast path's 150 s, i.e. **6.5× slower**, not the ~5× this comment used to
-// claim. Selected via StartVideoInput.mode='cfg'.
-const CFG_WORKFLOW_FILENAME = 'video_wan22_i2v_cfg_api.json';
-// «страж» — the fast graph with cfg raised on the HIGH-NOISE sampler only
-// (node 14, steps 0→2 @ cfg 2.5); node 15 stays at cfg 1.0. In an A14B MoE the
-// high-noise expert decides composition — what exists in the frame and where —
-// so this is the one pass on which a negative prompt can stop a figure walking
-// into an empty shot, and it is the cheapest place to pay for it: 6 model
-// passes instead of 4 (~196 s vs 150 s) against the cfg path's 40 (980 s).
-// Byte-identical to the fast default apart from node 14's cfg and node 10's
-// fallback negative, so an A/B isolates cfg as the only variable.
-const GUARD_WORKFLOW_FILENAME = 'video_wan22_i2v_guard_api.json';
-// Allowlist of i2v workflow files the service is permitted to load — guards
-// loadTemplate against a row carrying an unexpected workflowFilename value.
-// `video_wan22_i2v_distill_api.json` was dropped from this set (and deleted from
-// every project) 2026-07-30: it was byte-identical to the fast default, its
-// mode was already gone from the API, and 0 of 6 945 render rows ever carried
-// the filename. A row with an unknown name falls back to the fast default in
-// loadTemplate anyway, so nothing can break by removing it.
-const ALLOWED_WORKFLOWS = new Set([WORKFLOW_FILENAME, CFG_WORKFLOW_FILENAME, GUARD_WORKFLOW_FILENAME]);
 // One-pass upscale→RIFE graph: a single ComfyUI prompt saves BOTH the FHD clip
 // and the FPS-interpolated (smooth) clip — one queue job, models load once,
 // nothing to reorder between the two steps, no intermediate mp4 decode. This is
@@ -63,90 +41,13 @@ const COMBINED_WORKFLOW_FILENAME = 'video_upscale_interp_api.json';
 // compatible — the native loader rejects them ("Unrecognized model format").
 const INTERP_MODEL_NAME        = process.env.INTERP_MODEL_NAME ?? 'rife_v4.26.safetensors';
 const DEFAULT_INTERP_MULTIPLIER = 2;
-
-// Wan-readable phrasing for our own `Shot.cameraMove` vocabulary.
-//
-// Alibaba's I2V prompt formula is `Motion + Camera movement`, and an i2v model
-// given no camera instruction does not hold still — it invents a drift, which at
-// 4 steps is where warping and «бред» live. Measured 2026-07-30: only 84 of
-// 5 671 animated shots (1.5 %) named a camera anywhere in their motion prompt,
-// while `Shot.cameraMove` was populated for 6 205 of 6 425 (96.6 %). So the
-// clause is DERIVED from that column at dispatch instead of being re-baked into
-// thousands of prompt strings. Authoring rules: Skill(gen-studio-wan22) §4.
-const CAMERA_CLAUSE: Record<string, string> = {
-  static:        'the camera stays fixed',
-  locked_off:    'the camera stays fixed',
-  push_in:       'the camera pushes in slowly',
-  pull_out:      'the camera pulls back slowly',
-  track:         'the camera tracks slowly alongside',
-  track_lateral: 'the camera tracks slowly sideways',
-  pan:           'the camera pans slowly',
-  pan_left:      'the camera pans slowly to the left',
-  pan_right:     'the camera pans slowly to the right',
-  tilt_up:       'the camera tilts up slowly',
-  tilt_down:     'the camera tilts down slowly',
-  // An ARC is the camera travelling around the subject, which `pan` is not —
-  // a pan turns the camera on its own axis and the subject slides out of frame.
-  // Added 2026-08-15 for the two-frame flow: Qwen-Image-Edit-2511 does novel
-  // view synthesis in the base model, so a small arc can actually be drawn on
-  // the end frame, and Wan then has a real viewpoint change to travel.
-  arc_left:      'the camera arcs slowly around him to the left, keeping him centred',
-  arc_right:     'the camera arcs slowly around him to the right, keeping him centred',
-  handheld:      'a faint handheld drift',
-  window_pov:    'the camera holds a fixed point of view through the window',
-};
-/**
- * Secondary phrasing, used when a shot combines TWO camera moves. `cameraMove`
- * accepts a compound value joined with `+` — e.g. `arc_left+push_in`, the camera
- * arcing around the subject while closing on it. The first part supplies the
- * sentence, the second is appended as a `while …` clause, so the model gets one
- * readable instruction instead of two competing ones.
- *
- * Kept as its own map rather than derived by regex from CAMERA_CLAUSE: the
- * grammar differs («pushes in slowly» → «pushing in slowly») and a derivation
- * would be one more thing to get subtly wrong.
- */
-const CAMERA_SECONDARY: Record<string, string> = {
-  push_in:       'pushing in slowly',
-  pull_out:      'pulling back slowly',
-  track:         'tracking alongside',
-  track_lateral: 'tracking sideways',
-  pan_left:      'panning to the left',
-  pan_right:     'panning to the right',
-  tilt_up:       'tilting up',
-  tilt_down:     'tilting down',
-  arc_left:      'arcing around him to the left',
-  arc_right:     'arcing around him to the right',
-};
-
-/** Resolve one or two `+`-joined moves into a single camera sentence. */
-function cameraClauseFor(move: string): string | undefined {
-  const parts = move.split('+').map((m) => m.trim()).filter(Boolean);
-  const head  = CAMERA_CLAUSE[parts[0] ?? ''];
-  if (!head) return undefined;
-  const tail = parts[1] ? CAMERA_SECONDARY[parts[1]] : undefined;
-  return tail ? `${head} while ${tail}` : head;
-}
+/** Last-resort output framerate for the upscale→RIFE pass. `params.fps` is
+ *  always stamped at enqueue, so this only covers a hand-edited row. */
+const FALLBACK_FPS = 16;
 
 /** Does this text already tell the camera what to do? */
 const MENTIONS_CAMERA = /camera|handheld|point of view/i;
 
-// Wan2.2 i2v defaults — 768×432 = exact 16:9, both dims divisible by 16.
-// Chosen over 832×480 because 832/480 = 1.733 ≠ 1920/1080 = 1.778, which would
-// force crop or stretch on FHD upscale. 768×432 upscales to FHD with uniform
-// scale factor 0.625, no distortion. Preview-quality; FHD via /upscale endpoint.
-const DEFAULT_WIDTH  = 768;
-const DEFAULT_HEIGHT = 432;
-const DEFAULT_LENGTH = 81;
-const DEFAULT_FPS    = 16;
-
-// Which conditioning flow an i2v render uses. Orthogonal to `mode`
-// (fast/guard/cfg): the MODE picks the workflow FILE, the FLOW rewrites one node
-// inside whichever file was picked, so every combination of the two works.
-//   'i2v'   — `WanImageToVideo`, one pinned frame. Every render before 2026-08-15.
-//   'flf2v' — `WanFirstLastFrameToVideo`, first AND last frame pinned.
-export type VideoFlow = 'i2v' | 'flf2v';
-const VIDEO_FLOWS: readonly string[] = ['i2v', 'flf2v'];
 /** Per-shot subfolder holding end-frame candidates, next to the shot's stills. */
 const ENDFRAMES_DIR = 'endframes';
 
@@ -162,6 +63,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     private readonly comfy:  ComfyService,
     private readonly ledger: QueueLedgerService,
     private readonly comicRegistry: PageTemplateRegistryService,
+    private readonly engines: VideoEngineFactory,
   ) {}
 
   /**
@@ -209,7 +111,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
        WHERE sh.id = ${shotId}
     `;
     const row  = rows[0];
-    const flow = row?.flow && VIDEO_FLOWS.includes(row.flow) ? (row.flow as VideoFlow) : 'i2v';
+    const flow: VideoFlow = row?.flow === 'flf2v' ? 'flf2v' : 'i2v';
     return {
       flow,
       chosenEndFrame: row?.chosenEndFrame ?? null,
@@ -263,7 +165,11 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     }
 
     const count = Math.max(1, Math.min(8, input.count ?? 1));
-    const workflowFilename = this.resolveWorkflowFilename(input.mode);
+    // Which model family renders this film. Per project, like `visualStyle` for
+    // stills. The chosen workflow filename is BAKED onto every row below, so a
+    // clip already in the queue is later patched by the engine it was queued
+    // for even if the project has since been switched.
+    const engine = this.engines.get((shot.project as any).videoEngine);
 
     // Conditioning flow: one pinned frame ('i2v') or two ('flf2v'). Resolved
     // from shot → act → project.
@@ -314,6 +220,14 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       }
     }
 
+    // The workflow filename is picked AFTER the flow has degraded, not before.
+    // For Wan the two are independent — one file, a node swapped inside it — but
+    // LTX has a separate graph per flow, and a row baked with the two-frame file
+    // while carrying no end image would reach a `LTXVAddGuide` with nothing to
+    // guide. Effective flow, therefore: whether an end image actually survived.
+    const effectiveFlow: VideoFlow = endImageFilename ? 'flf2v' : 'i2v';
+    const workflowFilename = engine.workflowFor(input.mode, effectiveFlow);
+
     // Comic panel shape (template-layout mode): the shot's Wan render size
     // comes from its shape's `wan` row. The shape is BAKED into
     // VideoRender.params at creation (like TTSJob.engine) so the later
@@ -333,10 +247,12 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         : Math.floor(Math.random() * 2 ** 32);
       const params = {
         seed,
-        width:  input.width  ?? wanSize?.[0] ?? DEFAULT_WIDTH,
-        height: input.height ?? wanSize?.[1] ?? DEFAULT_HEIGHT,
-        length: input.length ?? DEFAULT_LENGTH,
-        fps:    input.fps    ?? DEFAULT_FPS,
+        // Native size comes from the ENGINE, not from a shared constant: Wan's
+        // 768×432 / 81 frames is not LTX's. A comic panel shape still wins.
+        width:  input.width  ?? wanSize?.[0] ?? engine.defaults.width,
+        height: input.height ?? wanSize?.[1] ?? engine.defaults.height,
+        length: input.length ?? engine.defaults.length,
+        fps:    input.fps    ?? engine.defaults.fps,
         ...(panelShape ? { panelShape } : {}),
         // Only stamped on two-frame renders, so the params blob of every legacy
         // i2v render stays byte-identical to what it has always been.
@@ -445,7 +361,12 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
 
     try {
       const params = v.params as { seed: number; width: number; height: number; length: number; fps: number };
-      const template = this.loadTemplate(v.shot.project.slug, v.workflowFilename);
+      // The engine is resolved from the workflow filename BAKED on the row, not
+      // from the project's current setting: switching a project's engine must
+      // not change how a clip already in the queue is patched.
+      const engine   = this.engines.forWorkflow(v.workflowFilename);
+      const template = this.loadTemplate(
+        engine, v.shot.project.slug, v.workflowFilename, endBasename ? 'flf2v' : 'i2v');
       // Resolve motion negative from DB: per-shot override > project default.
       // When both empty, the workflow JSON's hardcoded fallback stays.
       const pf      = (v.shot.promptFields ?? {}) as Record<string, unknown>;
@@ -459,7 +380,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
       // Strip any weight syntax from BOTH motion prompts before they reach
       // the i2v workflow. Project rule: zero `(token:N)` anywhere.
       const motionPrompt = stripPromptWeights(
-        this.composeMotionPrompt(v.motionPrompt, v.shot, project),
+        this.composeMotionPrompt(v.motionPrompt, v.shot, project, engine),
         (tok, w) => this.logger.warn(`[${v.shot.shotCode}] stripped motionPrompt weight "(${tok}:${w})"`),
       );
       // Warn-only: surfaces negations-in-the-positive and missing camera clauses
@@ -471,7 +392,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
             (tok, w) => this.logger.warn(`[${v.shot.shotCode}] stripped motionNegative weight "(${tok}:${w})"`),
           )
         : undefined;
-      const workflow = this.patch(template, {
+      const workflow = engine.patch(template as any, {
         sourceImage:    inputBasename,
         endImage:       endBasename,
         motionPrompt,
@@ -675,18 +596,22 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
    * properties and silently multiplied render time. This is a fixed default the
    * user chose, overridable per render, not an inference.
    */
-  private resolveWorkflowFilename(mode: 'fast' | 'cfg' | 'guard' | undefined): string {
-    if (mode === 'cfg')   return CFG_WORKFLOW_FILENAME;
-    if (mode === 'guard') return GUARD_WORKFLOW_FILENAME;
-    return WORKFLOW_FILENAME;
-  }
-
-  private loadTemplate(projectSlug: string, workflowFilename?: string | null): Record<string, any> {
-    // Only ever load a known i2v workflow file; fall back to the fast default
-    // if the row carries an empty/unrecognised name.
-    const filename = workflowFilename && ALLOWED_WORKFLOWS.has(workflowFilename)
+  private loadTemplate(
+    engine: {
+      workflowFor(mode?: string | null, flow?: VideoFlow): string;
+      ownsWorkflow(f: string): boolean;
+    },
+    projectSlug: string,
+    workflowFilename?: string | null,
+    flow: VideoFlow = 'i2v',
+  ): Record<string, any> {
+    // Only ever load a file the engine knows how to patch; fall back to its
+    // default when the row carries an empty or unrecognised name. The fallback
+    // needs the flow too — on an engine with a graph per flow, defaulting blind
+    // would hand a two-frame render the one-frame file.
+    const filename = workflowFilename && engine.ownsWorkflow(workflowFilename)
       ? workflowFilename
-      : WORKFLOW_FILENAME;
+      : engine.workflowFor(null, flow);
     const template = readWorkflowJson(projectSlug, filename);
     if (!template) {
       throw new NotFoundException(
@@ -696,94 +621,6 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return template;
   }
 
-  private patch(template: Record<string, any>, p: {
-    sourceImage:    string;
-    /** Basename in COMFY_INPUT to pin to the LAST frame. Undefined = one-frame i2v. */
-    endImage?:      string;
-    motionPrompt:   string;
-    /** Optional override for node 10 (negative). When undefined, the workflow
-     *  JSON's hardcoded fallback stays. Resolved from
-     *  `Shot.promptFields.motionNegative || Project.defaultVideoNegative`. */
-    motionNegative?: string;
-    seed:           number;
-    width:          number;
-    height:         number;
-    length:         number;
-    fps:            number;
-    filenamePrefix: string;
-  }): Record<string, any> {
-    const wf = structuredClone(template);
-    const set = (id: string, key: string, value: unknown) => {
-      if (wf[id]) wf[id].inputs[key] = value;
-    };
-    // Source image goes through LoadImage (11) → ImageScale (12) → WanImageToVideo (13).
-    set('11', 'image',  p.sourceImage);
-    set('12', 'width',  p.width);
-    set('12', 'height', p.height);
-    set('13', 'width',  p.width);
-    set('13', 'height', p.height);
-    set('13', 'length', p.length);
-
-    // ── Two-frame flow (flf2v) ────────────────────────────────────────────────
-    // Swap node 13 from `WanImageToVideo` to `WanFirstLastFrameToVideo` in place
-    // and feed it a second image, mirroring 11→12→13 with 19→20→13.
-    //
-    // The swap is legal because the two nodes take the SAME input names
-    // (positive/negative/vae/width/height/length/batch_size/start_image) and
-    // return the same three outputs (positive, negative, latent) — see
-    // comfy_extras/nodes_wan.py. `end_image` is the only addition, and both
-    // clip_vision inputs stay unwired exactly as they are today.
-    //
-    // Done as a graph rewrite rather than as three more workflow JSONs because
-    // the flow is orthogonal to the MODE: fast/guard/cfg each pick a different
-    // template file, and shipping a flf2v twin of each would mean six files that
-    // have to be edited in lockstep forever. One node swap covers every mode,
-    // present and future, and nothing can drift out of sync.
-    //
-    // The two new node ids are ALLOCATED, not hardcoded: the templates do not
-    // share a node-id range (the fast and cfg graphs stop at 18, guard already
-    // uses 19), and a fixed id would silently overwrite a real node in whichever
-    // template grows into it next.
-    if (p.endImage) {
-      if (wf['13']?.class_type !== 'WanImageToVideo') {
-        // Refuse to rewrite a graph that is not shaped the way this method
-        // assumes — better a failed render with a reason than a clip quietly
-        // produced from a mangled graph.
-        throw new Error(
-          `flf2v: expected node 13 to be WanImageToVideo, found "${wf['13']?.class_type ?? 'nothing'}"`,
-        );
-      }
-      const nextId = Math.max(...Object.keys(wf).map(Number).filter(Number.isFinite)) + 1;
-      const loadId  = String(nextId);
-      const scaleId = String(nextId + 1);
-
-      wf['13'].class_type = 'WanFirstLastFrameToVideo';
-      wf[loadId]  = { class_type: 'LoadImage',  inputs: { image: p.endImage } };
-      wf[scaleId] = {
-        class_type: 'ImageScale',
-        inputs: {
-          image: [loadId, 0], upscale_method: 'lanczos',
-          width: p.width, height: p.height, crop: 'center',
-        },
-      };
-      wf['13'].inputs.end_image = [scaleId, 0];
-    }
-
-    // Positive prompt is on node 9; negative on node 10. Negative only set
-    // when the caller provides one (per-shot or per-project DB value) — when
-    // undefined the JSON's hardcoded text stays.
-    set('9',  'text',   p.motionPrompt);
-    if (p.motionNegative !== undefined) set('10', 'text', p.motionNegative);
-
-    // Both KSampler stages need the same seed (14 = high-noise stage, 15 = low-noise).
-    set('14', 'noise_seed', p.seed);
-    set('15', 'noise_seed', p.seed);
-
-    // Output framerate (CreateVideo) + filename prefix (SaveVideo).
-    set('17', 'fps',              p.fps);
-    set('18', 'filename_prefix',  p.filenamePrefix);
-    return wf;
-  }
 
   /**
    * Resolve the Wan2.2 positive prompt (node 9 of the i2v graph) for this render.
@@ -811,6 +648,9 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     motion: string,
     shot: { promptFields: any; cameraMove?: string | null; shotCode?: string },
     project?: { defaultMotionPrompt?: string | null; defaultStaticMotionPrompt?: string | null },
+    // The camera sentence is the engine's dialect, so it is asked for rather
+    // than built here. Omitted → no camera clause is appended.
+    engine?: { cameraClause(move: string): string | undefined },
   ): string {
     const pf = (shot.promptFields ?? {}) as Record<string, unknown>;
     const cam = (pf.camera as Record<string, unknown> | undefined) ?? {};
@@ -847,8 +687,8 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     // a camera behaviour is left exactly as written, so a hand-authored prompt
     // can never be contradicted by the enum, and a shot with no cameraMove is
     // left alone rather than given an invented default.
-    const move  = (shot.cameraMove ?? '').trim();
-    const clause = cameraClauseFor(move);
+    const move   = (shot.cameraMove ?? '').trim();
+    const clause = engine?.cameraClause(move);
     if (clause && !MENTIONS_CAMERA.test(motionLine)) {
       return `${motionLine.replace(/[\s,]+$/, '')}, ${clause}`;
     }
@@ -1020,7 +860,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         fhdPrefix:    `video_fhd/${v.shot.shotCode}/${v.id}`,
         smoothPrefix: `video_smooth/${v.shot.shotCode}/${v.id}`,
         multiplier:   mult,
-        fps:          (params.fps ?? DEFAULT_FPS) * mult,
+        fps:          (params.fps ?? FALLBACK_FPS) * mult,
         smoothWidth:  smooth?.[0],
         smoothHeight: smooth?.[1],
       });
