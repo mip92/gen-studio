@@ -6,6 +6,8 @@ import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { QueueEventsService } from './pipeline/queue-events.service';
+import { attachQueueEventsGateway } from './pipeline/queue-events.gateway';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
@@ -37,6 +39,15 @@ async function bootstrap() {
   server.headersTimeout = 0;      // don't abort while the handler runs silently
   server.setTimeout(0);           // no socket inactivity timeout
   server.keepAliveTimeout = 65_000;
+
+  // Live queue deltas, pushed to every open browser tab. Attached to the server
+  // Nest already built rather than run as a Nest gateway — see the gateway file
+  // for why. Broadcast-only: nothing a client sends over it is read.
+  //
+  // Browsers connect straight to this port (ws://<host>:4000/ws/queue), NOT
+  // through the frontend's /api rewrite — Next's rewrites() does not proxy the
+  // websocket upgrade, the same reason long comic exports already bypass it.
+  attachQueueEventsGateway(server, app.get(QueueEventsService));
 
   const port = process.env.PORT ?? 3000;
   await app.listen(port, '0.0.0.0');

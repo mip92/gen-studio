@@ -3,6 +3,7 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { QueueLedgerService } from './queue-ledger.service';
 import { QueueOutcomeService } from './queue-outcome.service';
 import { QueueSourceService } from './queue-source.service';
+import { QueueEventsService } from './queue-events.service';
 
 /**
  * The queue/ledger, exported globally.
@@ -19,7 +20,7 @@ import { QueueSourceService } from './queue-source.service';
 @Global()
 @Module({
   imports:   [PrismaModule],
-  providers: [QueueSourceService, QueueLedgerService, QueueOutcomeService],
-  exports:   [QueueSourceService, QueueLedgerService, QueueOutcomeService],
+  providers: [QueueSourceService, QueueLedgerService, QueueOutcomeService, QueueEventsService],
+  exports:   [QueueSourceService, QueueLedgerService, QueueOutcomeService, QueueEventsService],
 })
 export class QueueLedgerModule {}

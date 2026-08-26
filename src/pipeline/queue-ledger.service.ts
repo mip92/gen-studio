@@ -1,8 +1,8 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import {
-  ENGINE_CLASS,
   JobType,
+  engineClassFor,
   Outcome,
   OutcomeReason,
   QueueStatus,
@@ -14,6 +14,7 @@ import {
 } from './queue-entry.types';
 import { QueueSourceService } from './queue-source.service';
 import { ComfyService } from '../comfy/comfy.service';
+import { QueueEventsService, QueueDeltaInput, QueueEventOp } from './queue-events.service';
 
 /** A queue entry as it comes back from the DB (shape mirrors the Prisma model). */
 export interface QueueEntryRow {
@@ -129,11 +130,38 @@ export class QueueLedgerService {
     private readonly prisma: PrismaService,
     private readonly source: QueueSourceService,
     private readonly comfy:  ComfyService,
+    private readonly events: QueueEventsService,
   ) {}
 
   /** Prisma delegate. Cast keeps the build green until `prisma generate` runs. */
   private get entries(): any {
     return (this.prisma as any).queueEntry;
+  }
+
+  // ── Broadcast ─────────────────────────────────────────────────────────────
+
+  /**
+   * Tell every connected browser that this entry moved.
+   *
+   * Called after the write has committed, never before: a client that refetches
+   * on the event must not be able to read the pre-write state. Fire-and-forget —
+   * QueueEventsService swallows listener errors so a websocket problem can never
+   * fail a queue transition. See docs/live-updates.md for who listens.
+   */
+  private broadcast(op: QueueEventOp, row: Partial<QueueEntryRow> | null, over: Partial<QueueDeltaInput> = {}): void {
+    this.events.emit({
+      op,
+      scope:     'entry',
+      entryId:   row?.id        ?? null,
+      jobType:   row?.jobType   ?? null,
+      jobId:     row?.jobId     ?? null,
+      status:    row?.status    ?? null,
+      projectId: row?.projectId ?? null,
+      shotId:    row?.shotId    ?? null,
+      profileId: row?.profileId ?? null,
+      segmentId: row?.segmentId ?? null,
+      ...over,
+    });
   }
 
   /**
@@ -253,7 +281,7 @@ export class QueueLedgerService {
         jobId,
         attemptNumber,
         status:      'pending' as QueueStatus,
-        engineClass: ENGINE_CLASS[jobType],
+        engineClass: this.engineClassFor(jobType, ctx),
         groupKey,
         rank,
         projectId:     ctx.projectId     ?? null,
@@ -274,6 +302,7 @@ export class QueueLedgerService {
         historyTruncated: opts.historyTruncated ?? false,
       },
     });
+    this.broadcast('enqueued', created as QueueEntryRow);
     return created as QueueEntryRow;
   }
 
@@ -386,6 +415,11 @@ export class QueueLedgerService {
       ),
     );
     this.logger.log(`renumberPending: re-spaced ${pending.length} pending entr(ies)`);
+    this.events.emit({
+      op: 'reordered', scope: 'bulk',
+      entryId: null, jobType: null, jobId: null, status: null,
+      projectId: null, shotId: null, profileId: null, segmentId: null,
+    });
     return pending.length;
   }
 
@@ -480,15 +514,23 @@ export class QueueLedgerService {
       where: { id: entryId, status: 'pending' },
       data:  { status: 'running', startedAt: new Date() },
     });
-    return (res?.count ?? 0) > 0;
+    const won = (res?.count ?? 0) > 0;
+    // The CAS updateMany returns a count, not the row, so re-read it for the
+    // scope ids the browsers filter on. One PK read, only on the tick that
+    // actually won the slot.
+    if (won) this.broadcast('claimed', await this.entries.findUnique({ where: { id: entryId } }));
+    return won;
   }
 
   /** Release a claimed slot back to pending (dispatch bailed before starting work). */
   async release(entryId: string): Promise<void> {
-    await this.entries.updateMany({
+    const res = await this.entries.updateMany({
       where: { id: entryId, status: 'running' },
       data:  { status: 'pending', startedAt: null },
     });
+    if ((res?.count ?? 0) > 0) {
+      this.broadcast('released', await this.entries.findUnique({ where: { id: entryId } }));
+    }
   }
 
   /** Record the ComfyUI prompt id once the work is actually submitted. */
@@ -531,7 +573,7 @@ export class QueueLedgerService {
           jobType, jobId,
           attemptNumber: 1 + await this.entries.count({ where: { jobType, jobId } }),
           status:      opts.status,
-          engineClass: ENGINE_CLASS[jobType],
+          engineClass: this.engineClassFor(jobType, ctx),
           groupKey:    this.groupKeyFor(jobType, ctx, null),
           rank:        await this.tailRank(),
           projectId:     ctx.projectId     ?? null,
@@ -556,6 +598,7 @@ export class QueueLedgerService {
           historyTruncated: true,
         },
       });
+      this.broadcast('closed', { ...ctx, jobType, jobId, status: opts.status } as Partial<QueueEntryRow>);
       return;
     }
 
@@ -573,6 +616,7 @@ export class QueueLedgerService {
         classifiedAt: outcome === null && outcomeReason === null ? null : now,
       },
     });
+    this.broadcast('closed', { ...live, status: opts.status });
   }
 
   /**
@@ -621,6 +665,7 @@ export class QueueLedgerService {
       const peers = await this.sameTier(ordered, tier);
       if (peers.length === 0 || peers[0].id === entryId) return { moved: false, reason: 'edge' };
       await this.entries.update({ where: { id: entryId }, data: { rank: peers[0].rank - RANK_GAP } });
+      this.broadcast('moved', ordered[idx]);
       return { moved: true };
     }
 
@@ -638,6 +683,7 @@ export class QueueLedgerService {
       this.entries.update({ where: { id: a.id }, data: { rank: b.rank } }),
       this.entries.update({ where: { id: b.id }, data: { rank: a.rank } }),
     ]);
+    this.broadcast('moved', a);
     return { moved: true, swappedWith: b.id };
   }
 
@@ -672,6 +718,7 @@ export class QueueLedgerService {
 
     const rank = await this.rankBetween(prev?.rank ?? null, next?.rank ?? null, entryId, beforeEntryId);
     await this.entries.update({ where: { id: entryId }, data: { rank } });
+    this.broadcast('moved', target as QueueEntryRow);
     return { moved: true };
   }
 
@@ -737,6 +784,11 @@ export class QueueLedgerService {
     await this.prisma.project.update({
       where: { id: projectId },
       data:  { queuePriorityTier: level, queuePrioritizedAt: level > 0 ? new Date() : null } as any,
+    });
+    this.events.emit({
+      op: 'prioritized', scope: 'bulk',
+      entryId: null, jobType: null, jobId: null, status: null,
+      projectId, shotId: null, profileId: null, segmentId: null,
     });
     return { projectId, tier: level };
   }
@@ -849,6 +901,15 @@ export class QueueLedgerService {
   // ── Snapshot + grouping resolution ────────────────────────────────────────
 
   /** Batching group for this entry — see groupKeyFor in queue-entry.types. */
+  /**
+   * Which GPU consumer this entry will need. Only TTS varies by job (fish_s2
+   * needs the card to itself, the other engines do not) — `groupHint` carries
+   * the engine for a tts row, the same value `groupKeyFor` groups on.
+   */
+  private engineClassFor(jobType: JobType, ctx: SnapshotContext): string {
+    return engineClassFor(jobType, { ttsEngine: ctx.groupHint });
+  }
+
   private groupKeyFor(jobType: JobType, ctx: SnapshotContext, workflowFilename?: string | null): string {
     return groupKeyFor(jobType, {
       visualStyle:      ctx.visualStyle,
