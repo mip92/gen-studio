@@ -142,6 +142,11 @@ interface ManifestShot  {
    *  speed = source_us / duration_us (< 1.0 → slow-motion). When absent the
    *  python path is unchanged (speed 1.0, clip plays at its native length). */
   source_us?:  number;
+  /** Drop this clip's own audio: the python exporter lays the video segment with
+   *  volume=0. Emitted ONLY when the clip is muted, so a manifest for a project
+   *  that never touched the switch is byte-identical to before. Relevant to LTX
+   *  clips, which carry generated sound; Wan clips have no audio to mute. */
+  mute_audio?: true;
   /** Per-shot narration wav (shot-level TTS). When set, the python exporter
    *  lays the wav on the audio track at this shot's video timeline position
    *  instead of the legacy scene-level narration block. `text` is the exact
@@ -484,6 +489,7 @@ export class ExportsService {
         let mediaPath: string;
         let kind: 'image' | undefined;
         let sourceUs: number | undefined;   // native clip length (animated only)
+        let muteAudio = false;              // clip carries sound we don't want
         if ((shot as { renderMode?: string }).renderMode === 'static') {
           // Static shot ships its chosen still PNG — no video, no upscale.
           if (!shot.chosenRender) continue; // gated upstream (no_chosen_render)
@@ -508,6 +514,9 @@ export class ExportsService {
           const fpsP    = params.fps    ?? 16;
           const lengthP = params.length ?? 81;
           sourceUs = Math.round((lengthP / fpsP) * 1_000_000);
+          // The clip's own audio (LTX writes sound with the picture). Muting is
+          // a timeline decision, not a file edit — see setAudioMuted().
+          muteAudio = (video as { audioMuted?: boolean }).audioMuted === true;
         }
 
         // ── Timeline hold duration ──
@@ -538,6 +547,7 @@ export class ExportsService {
           duration_us,
           ...(kind ? { kind } : {}),
           ...(emitSourceUs ? { source_us: sourceUs } : {}),
+          ...(muteAudio ? { mute_audio: true as const } : {}),
           narration: shotNarration,
         });
       }

@@ -52,6 +52,10 @@ interface NodeMap {
   height:   string;   // PrimitiveInt
   duration: string;   // PrimitiveInt — SECONDS, not frames
   fps:      string;   // PrimitiveInt
+  /** EmptyLTXVLatentVideo — the batch the audio latent has to agree with. */
+  videoLatent: string;
+  /** LTXVEmptyLatentAudio — ships with batch_size 25; see patch(). */
+  audioLatent: string;
   seeds:    string[]; // RandomNoise, one per sampler pass
 }
 
@@ -59,6 +63,7 @@ const MAPS: Record<VideoFlow, NodeMap> = {
   i2v: {
     prompt: '376', negative: '373', enhance: '383',
     width: '372', height: '360', duration: '362', fps: '361',
+    videoLatent: '356', audioLatent: '366',
     // Two passes: 339 seeds the base sample, 338 the latent-upscale refinement.
     // Both move with the render's seed so a re-roll actually re-rolls.
     seeds: ['339', '338'],
@@ -66,6 +71,7 @@ const MAPS: Record<VideoFlow, NodeMap> = {
   flf2v: {
     prompt: '252', negative: '217', enhance: '250',
     width: '215', height: '216', duration: '198', fps: '205',
+    videoLatent: '201', audioLatent: '197',
     seeds: ['196'],
   },
 };
@@ -78,6 +84,8 @@ const EXPECTED_CLASS: Record<keyof Omit<NodeMap, 'seeds'>, string> = {
   height:   'PrimitiveInt',
   duration: 'PrimitiveInt',
   fps:      'PrimitiveInt',
+  videoLatent: 'EmptyLTXVLatentVideo',
+  audioLatent: 'LTXVEmptyLatentAudio',
 };
 
 /**
@@ -246,6 +254,24 @@ export class LtxVideoEngine implements VideoEngine {
     set(map.fps,      'value', p.fps);
     set(map.duration, 'value', durationSeconds(p.length, p.fps));
     for (const seedId of map.seeds) set(seedId, 'noise_seed', p.seed);
+
+    // The audio latent's batch MUST equal the video latent's, or nothing renders.
+    //
+    // Both converted templates ship `LTXVEmptyLatentAudio.batch_size: 25` next to
+    // `EmptyLTXVLatentVideo.batch_size: 1` — an upstream demo value that survived
+    // conversion. LTXVConcatAVLatent happily joins the mismatched pair, and the
+    // failure only surfaces deep in the sampler, where comfy packs the AV latent:
+    //
+    //   comfy/utils.py pack_latents → torch.cat(tensors, dim=-1)
+    //   RuntimeError: Expected size 1 but got size 25 for tensor number 1
+    //
+    // Every LTX render died on this, ~40s in, and the queue watchdog then reported
+    // it as «ComfyUI lost the prompt (orphaned)» — which pointed at the queue
+    // rather than at the graph (user 2026-08-21). Forced here rather than patched
+    // into the JSON because the templates are generated: a hand-edit would be
+    // undone by the next _convert_ltx25_template.py run, this survives it.
+    const videoBatch = wf[map.videoLatent].inputs.batch_size;
+    set(map.audioLatent, 'batch_size', typeof videoBatch === 'number' ? videoBatch : 1);
 
     set(SAVE, 'filename_prefix', p.filenamePrefix);
     return wf as WorkflowTemplate;

@@ -51,6 +51,19 @@ export class VideosController {
     return this.videos.delete(videoId);
   }
 
+  @Post('videos/:videoId/audio')
+  @ApiOperation({
+    summary: 'Mute or unmute the audio this clip carries, on export',
+    description:
+      'LTX-2.5 writes sound into the clip (footsteps, a lock, breath) and sometimes invents a '
+      + 'music bed that fights the ACE-Step score of the act. Muting does NOT touch the mp4 — the '
+      + 'CapCut segment is laid with volume=0 — so it is reversible and costs no re-render. '
+      + 'A Wan clip has no audio at all, where this is simply a no-op. Body: { muted: boolean }.',
+  })
+  setAudioMuted(@Param('videoId') videoId: string, @Body() body: { muted?: boolean } = {}) {
+    return this.videos.setAudioMuted(videoId, body?.muted !== false);
+  }
+
   @Post('videos/:videoId/upscale')
   @ApiOperation({
     summary: 'Queue a 4x-UltraSharp upscale → 1920×1080 of a completed video (FPS interpolation auto-queues after)',

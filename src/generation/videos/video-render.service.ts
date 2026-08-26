@@ -15,6 +15,7 @@ import {
   unlinkSync,
 } from 'fs';
 import * as path from 'path';
+import { spawnSync } from 'child_process';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ComfyService } from '../../comfy/comfy.service';
 import { describeWorkflowLookup, readWorkflowJson } from '../../comfy/workflow-path';
@@ -35,6 +36,10 @@ const POLL_MS      = 4000;
 // the ONLY upscale path (the legacy two-step dispatch was removed 2026-07-21);
 // every project must carry this file.
 const COMBINED_WORKFLOW_FILENAME = 'video_upscale_interp_api.json';
+
+// The ffmpeg the TTS workers already ship. Used here only to ask whether a clip
+// has an audio stream — see hasAudioStream().
+const FFMPEG_BIN = process.env.FFMPEG_BIN ?? path.join(APP_ROOT, 'bin', 'ffmpeg.exe');
 // MUST be a model in ComfyUI's NATIVE format (comfy_extras frame interpolation),
 // i.e. from the Comfy-Org/frame_interpolation HF repo (rife_v4.x.safetensors /
 // film_net_fp16.safetensors). Fannovel16 custom-node .pth files are NOT
@@ -893,6 +898,7 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
         : undefined;
       const workflow = this.patchCombined(combined, {
         sourceVideo:  inputBasename,
+        keepAudio:    this.hasAudioStream(inputDest),
         fhdPrefix:    `video_fhd/${v.shot.shotCode}/${v.id}`,
         smoothPrefix: `video_smooth/${v.shot.shotCode}/${v.id}`,
         multiplier:   mult,
@@ -935,6 +941,62 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     return readWorkflowJson(projectSlug, COMBINED_WORKFLOW_FILENAME);
   }
 
+
+  /**
+   * Flip this clip's export-time audio switch.
+   *
+   * Deliberately NOT an ffmpeg re-mux: stripping the track from the file would
+   * be irreversible and would cost a re-render to undo, while the only consumer
+   * of that audio is the CapCut draft, which takes a per-segment volume. The
+   * file keeps its sound, the timeline does not play it.
+   *
+   * Cheap to change one's mind about, so no gate: an exported draft simply has
+   * to be regenerated, which is already true of every prompt edit.
+   */
+  async setAudioMuted(videoId: string, muted: boolean) {
+    const v = await this.prisma.videoRender.findUnique({
+      where:  { id: videoId },
+      select: { id: true, audioMuted: true },
+    });
+    if (!v) throw new NotFoundException(`Video render ${videoId} not found`);
+    if (v.audioMuted === muted) return v;
+    return this.prisma.videoRender.update({
+      where: { id: videoId },
+      data:  { audioMuted: muted },
+      select: { id: true, audioMuted: true },
+    });
+  }
+
+  /**
+   * Does this mp4 carry an audio stream?
+   *
+   * LTX-2.5 writes sound into the clip it generates (`LTXVAudioVAEDecode` →
+   * `CreateVideo.audio`); Wan clips are silent. The upscale→RIFE pass has to
+   * know which it is: wiring `CreateVideo.audio` to a `GetVideoComponents` that
+   * yields nothing would fail the prompt for every Wan render in the queue.
+   *
+   * Probed rather than inferred from `project.videoEngine`, because the engine
+   * is a property of the project TODAY and the clip on disk was rendered
+   * whenever it was rendered — an LTX project's older clips predate its audio.
+   *
+   * `ffmpeg -i` with no output writes the stream table to stderr and exits
+   * non-zero; that is the intended use here (we ship no ffprobe).
+   */
+  private hasAudioStream(filePath: string): boolean {
+    try {
+      const r = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], {
+        encoding: 'utf-8',
+        timeout: 15_000,
+        windowsHide: true,
+      });
+      const out = `${r.stdout ?? ''}${r.stderr ?? ''}`;
+      return /^\s*Stream #\d+:\d+.*: Audio:/m.test(out);
+    } catch (e: any) {
+      this.logger.warn(`hasAudioStream(${path.basename(filePath)}): ${e?.message ?? e} — assuming silent`);
+      return false;
+    }
+  }
+
   private patchCombined(template: Record<string, any>, p: {
     sourceVideo:  string;
     fhdPrefix:    string;
@@ -945,6 +1007,11 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
      *  (1920×1080) — the legacy workflow stays byte-identical. */
     smoothWidth?:  number;
     smoothHeight?: number;
+    /** Carry the source clip's audio into the smooth mp4. LTX-2.5 generates
+     *  sound with the picture; until 2026-08-21 this pass silently dropped it,
+     *  so no film ever had it. Only set for a source that really has an audio
+     *  stream — the same wiring on a silent Wan clip fails the prompt. */
+    keepAudio?:    boolean;
   }): Record<string, any> {
     const wf = structuredClone(template);
     if (wf['1'])  wf['1'].inputs.file             = p.sourceVideo;      // LoadVideo
@@ -956,6 +1023,10 @@ export class VideoRenderService implements OnModuleInit, OnModuleDestroy {
     if (wf['8'])  wf['8'].inputs.model_name       = INTERP_MODEL_NAME;  // FrameInterpolationModelLoader
     if (wf['9'])  wf['9'].inputs.multiplier       = p.multiplier;       // FrameInterpolate
     if (wf['10']) wf['10'].inputs.fps             = p.fps;              // CreateVideo (smooth)
+    // GetVideoComponents outputs [images, audio, fps, bit_depth] — index 1 is
+    // the audio. RIFE raises the frame count AND the fps proportionally, so the
+    // clip's real-time duration is unchanged and the audio needs no retiming.
+    if (p.keepAudio && wf['10']) wf['10'].inputs.audio = ['2', 1];      // ← GetVideoComponents.audio
     if (wf['11']) wf['11'].inputs.filename_prefix = p.smoothPrefix;     // SaveVideo (smooth)
     return wf;
   }

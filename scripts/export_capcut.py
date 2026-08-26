@@ -1086,6 +1086,15 @@ def build_draft(manifest: dict) -> Path:
                     except Exception as e:  # noqa: BLE001
                         _log(f'background_filling(color) failed for {sh["shotCode"]}: {e!r}')
 
+            # Clip-carried audio. LTX-2.5 writes sound with the picture and the
+            # upscale pass now keeps it, so a video segment plays at volume 1.0 by
+            # default — audible under the narration and the ACE-Step score. The
+            # per-clip switch (VideoRender.audioMuted) arrives as mute_audio and is
+            # applied here rather than by stripping the file, so it is reversible.
+            if sh.get("mute_audio"):
+                segment.volume = 0.0
+                _log(f'{sh["shotCode"]}: clip audio muted (volume=0)')
+
             script.add_segment(segment, track_name="main_video")
             all_video_segments.append(segment)
 
