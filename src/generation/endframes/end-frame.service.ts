@@ -10,6 +10,7 @@ import { composeEndFrameInstruction, REALCOMIC_TRIGGER } from '../scenes/qwen/qw
 import { normalizeStyleLora, normalizeSceneSteps } from '../scenes/scene-render.service';
 import { PageTemplateRegistryService } from '../../comic/page-template-registry.service';
 import { resolveShotRenderSize } from '../../comic/render-size';
+import { SHOT_FULL_INCLUDE } from '../../shots/shots.service';
 
 /** 'i2v' = one pinned frame; 'flf2v' = first AND last frame pinned. */
 type VideoFlow = 'i2v' | 'flf2v';
@@ -374,7 +375,23 @@ export class EndFrameService implements OnModuleInit, OnModuleDestroy {
   async list(shotId: string) {
     const shot = await this.prisma.shot.findUnique({ where: { id: shotId } });
     if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);
+    // In-flight jobs and how many candidates they owe. Same reason as
+    // ShotsService.pendingSceneRenders: "queued" has to survive a page reload,
+    // or the gallery looks idle while the GPU is working and the user queues
+    // the batch a second time.
+    const inflight: Array<{ params: unknown }> = await (this.prisma as any).endFrameJob.findMany({
+      where:  { shotId, status: { in: ['pending', 'running'] } },
+      select: { params: true },
+    });
+    const pending = {
+      jobs:     inflight.length,
+      expected: inflight.reduce((n: number, j) => {
+        const b = (j.params as { batchSize?: unknown } | null)?.batchSize;
+        return n + (typeof b === 'number' && b > 0 ? Math.floor(b) : 1);
+      }, 0),
+    };
     return {
+      pending,
       // RESOLVED flow (shot → act → project), not the shot's own column: the UI
       // has to grey the whole page out on a one-frame shot, and the override
       // usually lives a level or two up.
@@ -398,8 +415,9 @@ export class EndFrameService implements OnModuleInit, OnModuleDestroy {
       throw new BadRequestException(`"${filename}" is not one of this shot's end-frame candidates`);
     }
     return this.prisma.shot.update({
-      where: { id: shotId },
-      data:  { chosenEndFrame: filename, endFrameApprovedAt: null } as any,
+      where:   { id: shotId },
+      data:    { chosenEndFrame: filename, endFrameApprovedAt: null } as any,
+      include: SHOT_FULL_INCLUDE,
     });
   }
 
@@ -408,9 +426,13 @@ export class EndFrameService implements OnModuleInit, OnModuleDestroy {
     if (!state.chosen) {
       throw new BadRequestException(`Shot has no chosen end frame to approve`);
     }
+    // Same include as every other shot mutation: the frontend feeds this straight
+    // into its shot context, and a response without scene/project would knock the
+    // flow chain out from under the header the instant the frame is approved.
     return this.prisma.shot.update({
-      where: { id: shotId },
-      data:  { endFrameApprovedAt: new Date() } as any,
+      where:   { id: shotId },
+      data:    { endFrameApprovedAt: new Date() } as any,
+      include: SHOT_FULL_INCLUDE,
     });
   }
 

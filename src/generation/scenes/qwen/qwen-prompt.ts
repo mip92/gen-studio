@@ -98,10 +98,23 @@ export const KEEP_REFERENCE_STYLE =
  *
  * So the clause names every axis that must NOT move, positively (rule 2: the VL
  * encoder has no negation channel, so "do not move the camera" would move it).
+ *
+ * It opens on the HEAD COUNT, and that ordering is the fix for a defect measured
+ * on `bully A3_SH10` (user 2026-08-16, «нарисовалась копия»): the change asks the
+ * one figure in the picture to stand differently, the lock orders her face, hair
+ * and clothing kept exactly as they are, and 2511 satisfied both by keeping the
+ * original girl untouched and DRAWING A SECOND ONE behind her in the new pose.
+ * Same failure family as an owner-less limb in a scene positive (skill §2d): two
+ * descriptions of one body, two bodies instantiated. Stating the count first —
+ * as a count, not as "no duplicate person", which rule 2 forbids — gives the
+ * model somewhere to put the change other than a new person. The motionPrompt
+ * corpus has carried the equivalent Wan guard («the same single figure
+ * throughout the shot») since the start; the end-frame path simply never had one.
  */
 export const END_FRAME_IDENTITY_LOCK =
-  'Keep the same place and everything in it, the same light and its direction, and '
-  + 'each person\'s face, hair and clothing exactly as in the reference picture.';
+  'The same people as in the reference picture and the same number of them, each with '
+  + 'the same face, hair and clothing. Keep the same place and everything in it, and the '
+  + 'same light and its direction.';
 
 /** Added only when the clip's camera is meant to hold still. */
 export const END_FRAME_CAMERA_LOCK =
@@ -120,25 +133,45 @@ export const END_FRAME_CAMERA_LOCK =
  * Qwen-Image-Edit-2511 does novel view synthesis in the base model («generating
  * new viewpoints can now be done directly with the base model» — model card),
  * and its character consistency is what makes that usable here: the edit keeps
- * the same person while moving the viewpoint. Angles are kept SMALL on purpose —
- * Wan has 81 frames to travel the difference, and the further the two frames sit
- * apart the more it invents in between, which is where the warping lives.
+ * the same person while moving the viewpoint.
+ *
+ * ─── CALIBRATION, revised 2026-08-16 ───────────────────────────────────────
+ * The first version of this table said "a little closer", "a short step
+ * sideways", "slightly to the left". The reasoning was sound — Wan invents
+ * between two distant guides, and invention is where the warping lives — but the
+ * measurement contradicted it: on `bully` NOTHING moved. `A1_SH04` was a push_in
+ * and came back at the identical framing; the user walked six end frames in a row
+ * («кадры абсолютно одинаковые, различаются только тени», «камера даже не
+ * посмотрела на него с другой стороны»).
+ *
+ * The reason a timid phrasing loses is structural: this sentence sits between the
+ * change and END_FRAME_IDENTITY_LOCK, which is a long, concrete order to keep the
+ * place, the light and every face exactly as they are. "A little closer" is not a
+ * strong enough competitor, so the lock takes the whole frame. A viewpoint move
+ * has to be stated at a magnitude the model can actually draw — and a visible
+ * dolly across 81 frames is ordinary camera work, not a teleport.
+ *
+ * So the wording is now NOTICEABLE, not small: a real step in, a real step round.
+ * The ceiling is unchanged in spirit — never a new location, never the far side
+ * of the subject, never a cut. If a clip warps after this change, the fix is to
+ * pull THAT shot's cameraMove back to `static`, not to re-soften the table.
  */
 export const END_FRAME_CAMERA_MOVE: Record<string, string> = {
-  push_in:       'The camera has moved a little closer: the same subject seen larger in the frame, from the same direction.',
-  pull_out:      'The camera has moved a little back: the same subject seen smaller with more of the place around it, from the same direction.',
-  track:         'The camera has moved a short step alongside: the same subject and the same place seen from a slightly shifted angle.',
-  track_lateral: 'The camera has moved a short step sideways: the same subject and the same place seen from a slightly shifted angle.',
-  pan_left:      'The camera has turned slightly to the left: the same place seen with the framing shifted a little that way.',
-  pan_right:     'The camera has turned slightly to the right: the same place seen with the framing shifted a little that way.',
-  pan:           'The camera has turned slightly: the same place seen with the framing shifted a little to one side.',
-  tilt_up:       'The camera has tilted a little upward: the same place seen with the framing raised.',
-  tilt_down:     'The camera has tilted a little downward: the same place seen with the framing lowered.',
-  // Small arcs only. The subject stays the same person in the same place — this
-  // is the one edit where 2511's novel-view synthesis is doing the work, and the
-  // further it is pushed the more of the room it has to invent.
-  arc_left:      'The same subject seen from slightly further to the left, turned a little more toward the camera, standing in the same place.',
-  arc_right:     'The same subject seen from slightly further to the right, turned a little more toward the camera, standing in the same place.',
+  push_in:       'The camera has moved in close: the same subject seen noticeably larger and tighter in the frame, from the same direction, with less of the room around them.',
+  pull_out:      'The camera has moved back: the same subject seen noticeably smaller with much more of the place around them, from the same direction.',
+  track:         'The camera has travelled a step along beside them: the same subject and place seen from a clearly shifted angle, with a different part of the background behind them.',
+  track_lateral: 'The camera has travelled a step sideways: the same subject and place seen from a clearly shifted angle, with a different part of the background behind them.',
+  pan_left:      'The camera has turned to the left: the same place seen with the framing carried that way, new space open on the left and the right edge cropped off.',
+  pan_right:     'The camera has turned to the right: the same place seen with the framing carried that way, new space open on the right and the left edge cropped off.',
+  pan:           'The camera has turned to one side: the same place seen with the framing carried that way, new space open on one edge and the other cropped off.',
+  tilt_up:       'The camera has tilted up: the same place seen with the framing raised, more of the ceiling or sky in and the floor cropped off.',
+  tilt_down:     'The camera has tilted down: the same place seen with the framing lowered, more of the floor in and the top of the frame cropped off.',
+  // An arc is the one move where 2511's novel-view synthesis does the real work:
+  // the same person, seen from the other side of where the camera stood. Kept to
+  // a quarter of the way round — past that the model has to invent a room it has
+  // never seen, and Wan has to travel it.
+  arc_left:      'The camera has come round to the left of them: the same subject in the same place seen from that side, more of their far shoulder visible and a different wall behind them.',
+  arc_right:     'The camera has come round to the right of them: the same subject in the same place seen from that side, more of their far shoulder visible and a different wall behind them.',
   // handheld / window_pov / static / locked_off deliberately absent — those clips
   // hold their viewpoint, so their end frame gets END_FRAME_CAMERA_LOCK instead.
 };
@@ -161,16 +194,16 @@ export const END_FRAME_CAMERA_MOVE: Record<string, string> = {
  * frame states one combined viewpoint rather than two separate ones.
  */
 export const END_FRAME_CAMERA_ALSO: Record<string, string> = {
-  push_in:       'and framed a little tighter',
-  pull_out:      'and framed a little wider',
-  track:         'and shifted a step along',
-  track_lateral: 'and shifted a step to the side',
-  pan_left:      'and framed a little further left',
-  pan_right:     'and framed a little further right',
-  tilt_up:       'and framed a little higher',
-  tilt_down:     'and framed a little lower',
-  arc_left:      'and from slightly further to the left',
-  arc_right:     'and from slightly further to the right',
+  push_in:       'and framed noticeably tighter',
+  pull_out:      'and framed noticeably wider',
+  track:         'and carried a step along',
+  track_lateral: 'and carried a step to the side',
+  pan_left:      'and carried left, cropping the right edge',
+  pan_right:     'and carried right, cropping the left edge',
+  tilt_up:       'and framed higher',
+  tilt_down:     'and framed lower',
+  arc_left:      'and from round to their left',
+  arc_right:     'and from round to their right',
 };
 
 /** Resolve one or two `+`-joined moves into a single viewpoint sentence. */
