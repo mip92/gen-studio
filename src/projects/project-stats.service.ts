@@ -194,8 +194,19 @@ export class ProjectStatsService {
       + notQueued.bgmSegments * cost('bgm');
 
     const ownRemainingSeconds = queuedOwnSeconds + notQueuedSeconds;
-    const exclusiveSeconds = ownRemainingSeconds + (runningIsForeign ? runningRemainder : 0);
-    const realisticSeconds = ownRemainingSeconds + queueAheadSeconds + runningRemainder;
+    // A film that owes nothing is DONE, and nothing on the card can change that.
+    // Without this guard a finished project reported however many seconds were
+    // left of whatever job happened to be running — «осталось 2 мин» on a film
+    // with 0 queued, 0 unqueued and every one of its 212 shots rendered, while
+    // every list the number links to was empty (user, irreplaceable, 2026-08-20).
+    // The remainder of someone else's job is a wait, not remaining work, and it
+    // only means anything to a project that still has something to start.
+    const exclusiveSeconds = ownRemainingSeconds === 0
+      ? 0
+      : ownRemainingSeconds + (runningIsForeign ? runningRemainder : 0);
+    const realisticSeconds = ownRemainingSeconds === 0
+      ? 0
+      : ownRemainingSeconds + queueAheadSeconds + runningRemainder;
 
     const throughput = await this.throughput();
     return {

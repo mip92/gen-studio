@@ -202,6 +202,23 @@ export class ActionsService {
       orderBy: { code: 'asc' },
     });
 
+    // A DERIVED profile (baseProfileId set) is rendered as a Qwen edit of its
+    // ancestor's approved anchor, so the render endpoint rejects it outright
+    // while the ancestor is unapproved — and it rejects with a 400, which took
+    // the whole /actions page down the moment the gate offered the button
+    // anyway (user 2026-08-16, safecracker VLAD_OLD ← VLAD_MID). The derived
+    // render queues itself the moment the ancestor is approved
+    // ([[feature-anchor-inheritance]]), so there is never anything to offer here.
+    const baseIds = Array.from(new Set(
+      characters.flatMap((c) => c.profiles.map((p: any) => p.baseProfileId as string | null)),
+    )).filter((id): id is string => typeof id === 'string' && id.length > 0);
+    const baseAnchorApproved = new Map<string, boolean>(
+      baseIds.length === 0 ? [] : (await this.prisma.characterProfile.findMany({
+        where:  { id: { in: baseIds } },
+        select: { id: true, anchorApprovedAt: true },
+      })).map((p) => [p.id, p.anchorApprovedAt !== null] as [string, boolean]),
+    );
+
     for (const character of characters) {
       for (const profile of character.profiles) {
         // ── Cartoon path: one gate "generate_anchor" if anchor PNG missing. ──
@@ -221,6 +238,9 @@ export class ActionsService {
             continue;
           }
           {
+            // Ancestor not approved → the render would 400. Stay silent.
+            const baseId = (profile as any).baseProfileId as string | null;
+            if (baseId && baseAnchorApproved.get(baseId) !== true) continue;
             // Don't queue a duplicate generate_anchor gate if a render job is
             // already pending/running for this profile.
             const inflight = await (this.prisma as any).anchorRenderJob.count({
@@ -446,8 +466,18 @@ export class ActionsService {
       // create_video because the end frame is one of the clip's two inputs:
       // offering the clip first would spend the GPU on a one-frame render of a
       // shot that was configured for two.
+      // An unapproved end frame CLOSES the video gates outright — the in-flight
+      // check only decides whether we still have work to offer here, never
+      // whether the clip may be made. Getting that wrong is what let /actions
+      // offer create_video on a shot whose end frame was still rendering (user
+      // 2026-08-16, «предлагает создать видео, хотя даже второе видео не
+      // утверждено»): the in-flight test used to guard the whole block, so a
+      // queued end-frame job fell straight through to gate 6 and the clip would
+      // have been rendered from one frame on a shot configured for two.
       const endFrame = endFrameState.get(shot.id);
-      if (endFrame && !shot.chosenVideoId && !endFrameInFlight.has(shot.id)) {
+      if (endFrame && !endFrame.approved && !shot.chosenVideoId) {
+        // Work already queued or running — no gate to offer, and no video either.
+        if (endFrameInFlight.has(shot.id)) continue;
         if (!endFrame.hasCandidates) {
           out.push(this.shotItem(6, 'render_end_frame', project, shot, scene, {
             link:   `/projects/${project.id}/shots/${shot.id}/end-frame`,
@@ -455,12 +485,10 @@ export class ActionsService {
           }));
           continue;
         }
-        if (!endFrame.approved) {
-          out.push(this.shotItem(6, 'approve_end_frame', project, shot, scene, {
-            link: `/projects/${project.id}/shots/${shot.id}/end-frame`,
-          }));
-          continue;
-        }
+        out.push(this.shotItem(6, 'approve_end_frame', project, shot, scene, {
+          link: `/projects/${project.id}/shots/${shot.id}/end-frame`,
+        }));
+        continue;
       }
 
       // Gate 6 — create video. No chosenVideoId, no in-flight video render.

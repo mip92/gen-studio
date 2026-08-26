@@ -16,7 +16,7 @@ interface ParticipantInput {
 }
 
 /** Full include shape used by mutations so the response matches `findById`. */
-const SHOT_FULL_INCLUDE = {
+export const SHOT_FULL_INCLUDE = {
   participants: {
     include: {
       character: { include: { profiles: true } },
@@ -27,7 +27,12 @@ const SHOT_FULL_INCLUDE = {
   // visualStyle is REQUIRED by the frontend (ShotDetail) to branch cartoon vs
   // photoreal — without it isCartoon defaults false and cartoon shots wrongly
   // demand a LoRA. Mutation responses must carry it just like findById.
-  project: { select: { id: true, slug: true, name: true, visualStyle: true } },
+  // defaultVideoFlow is the bottom of the `shot → act → project` flow chain the
+  // shot header resolves client-side (VideoFlowToggle, and the gating of the
+  // «Посл. кадр» / «Видео» tabs). Omitting it from a MUTATION response made the
+  // header fall back to i2v the moment you picked a render, greying out the tab
+  // you were standing on — same class of bug as visualStyle above.
+  project: { select: { id: true, slug: true, name: true, visualStyle: true, defaultVideoFlow: true } },
   // Used by the Telegram bot's approval flow and the videos tab — full list
   // of completed/in-flight VideoRender rows for this shot. No `orderBy as
   // const` because Prisma's input-types reject it under TypeScript strict.
@@ -86,6 +91,31 @@ export class ShotsService {
     return shot;
   }
 
+  /**
+   * Renders this shot has in flight, and how many candidate images they will
+   * produce when they land.
+   *
+   * Exists because the render page used to hold "queued" in React state only:
+   * navigate away and back and the page looked idle while a job was running, so
+   * the user re-queued or assumed nothing had happened («после постановки в
+   * очередь должны выделяться заглушки в галерее», 2026-08-16). Queue state has
+   * to survive a page load, which means it has to come from the server.
+   *
+   * `expected` reads the job's own `params.batchSize` — the same number the UI
+   * asked for — and falls back to 1 for a job queued without one.
+   */
+  private async pendingSceneRenders(shotId: string): Promise<{ jobs: number; expected: number }> {
+    const jobs = await this.prisma.sceneRenderJob.findMany({
+      where:  { shotId, status: { in: ['pending', 'running'] } },
+      select: { params: true },
+    });
+    const expected = jobs.reduce((n, j) => {
+      const b = (j.params as { batchSize?: unknown } | null)?.batchSize;
+      return n + (typeof b === 'number' && b > 0 ? Math.floor(b) : 1);
+    }, 0);
+    return { jobs: jobs.length, expected };
+  }
+
   /** Standalone lookup (used by frontend detail page). */
   async findById(shotId: string) {
     const shot = await this.prisma.shot.findUnique({
@@ -99,6 +129,16 @@ export class ShotsService {
         },
         scene:   true,
         project: true,
+        // Enough of each clip row for the shot header to answer «есть ли вообще
+        // что смотреть» — it gates the «Видео» tab on a two-frame shot whose
+        // last frame is not approved yet, and must not hide clips that already
+        // exist. Same projection as SHOT_FULL_INCLUDE so both agree.
+        videoRenders: {
+          select: {
+            id: true, status: true, outputFilename: true,
+            upscaleStatus: true, upscaledFilename: true,
+          },
+        },
         // Image-QC verdicts per candidate file (badges on the render picker).
         imageQcVerdicts: {
           select: {
@@ -110,7 +150,7 @@ export class ShotsService {
       },
     });
     if (!shot) throw new NotFoundException(`Shot ${shotId} not found`);
-    return shot;
+    return { ...shot, pendingRenders: await this.pendingSceneRenders(shotId) };
   }
 
   async create(projectIdOrSlug: string, dto: CreateShotDto) {
@@ -175,7 +215,7 @@ export class ShotsService {
         }
       }
 
-      const updated = await tx.shot.update({
+      await tx.shot.update({
         where: { id: shotId },
         data: {
           shotCode:           dto.shotCode,
@@ -188,7 +228,6 @@ export class ShotsService {
             : undefined,
           renderMode:         dto.renderMode,
         },
-        include: { participants: { include: { character: true } }, scene: true },
       });
       // locationId via raw SQL — Prisma client may not have been regenerated
       // yet since the column was added mid-session.
@@ -215,7 +254,19 @@ export class ShotsService {
                                              THEN NULL ELSE "endFrameApprovedAt" END
            WHERE id = ${shotId}`;
       }
-      return updated;
+      // Read the row back INSIDE the transaction rather than returning the
+      // result of `tx.shot.update()`. Everything below that call is written by
+      // raw SQL (locationId, videoFlow, endFramePrompt) — the updated object
+      // predates those writes, so the PATCH response used to answer with the
+      // OLD videoFlow and the caller's optimistic `setShot(response)` snapped
+      // the control straight back to the previous value. It also carried no
+      // `project` and no participant `profile`, which silently degraded the
+      // shot page's breadcrumb to «…» after any inline edit. Same include shape
+      // as `findById` so one response type serves both.
+      return tx.shot.findUniqueOrThrow({
+        where:   { id: shotId },
+        include: SHOT_FULL_INCLUDE,
+      });
     });
   }
 

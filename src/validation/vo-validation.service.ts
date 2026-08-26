@@ -507,14 +507,19 @@ export class VoValidationService {
     let status = base.status;
     if (status === 'pass' && (prosodyFlags.length > 0 || techFlags.length > 0)) status = 'warn';
 
+    const riskyStressWords = p.riskyStressWords ?? [];
+    const rawScore = base.diff ? this.score(base.diff, [...prosodyFlags, ...techFlags]) : base.score;
     return {
       ...base,
       status,
-      score: base.diff ? this.score(base.diff, [...prosodyFlags, ...techFlags]) : base.score,
-      prosodyFlags, techFlags,
       // Stress risk is CONTEXT, not a flag: shown on the verdict, excluded from
-      // status so «pass = можно не слушать» stays true (user 2026-08-03).
-      riskyStressWords: p.riskyStressWords ?? [],
+      // status (user 2026-08-03). But score 100 means «утверждаю не слушая»
+      // (the bulk approve-100 button), and машина не различает дорога́/доро́га —
+      // so an omograph caps the score at 99 to keep it out of blind auto-approve
+      // (user 2026-08-23).
+      score: riskyStressWords.length > 0 && rawScore === 100 ? 99 : rawScore,
+      prosodyFlags, techFlags,
+      riskyStressWords,
       issues,
     };
   }
