@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { execFileSync, spawn } from 'child_process';
 import { existsSync } from 'fs';
+import { connect } from 'net';
+import { GPU_SERVICES, GpuService } from './queue-entry.types';
 
 const COMFY_HEALTH_URL = process.env.COMFY_BASE_URL
   ? `${process.env.COMFY_BASE_URL}/system_stats`
@@ -26,6 +28,13 @@ const OLLAMA_BIN  = process.env.OLLAMA_BIN ?? 'W:\\Programs\\Ollama\\app\\ollama
 // indirection before it binds the port.
 const OLLAMA_START_TIMEOUT_MS = 60_000;
 const OLLAMA_START_POLL_MS    = 1_000;
+
+// fish-speech S2-pro synthesises on a persistent api_server (scripts/
+// tts_fish_s2.py autostarts it; it self-terminates after FISH_S2_IDLE_TIMEOUT_
+// SEC). Matched by command line, like ComfyUI — the process is a python from the
+// fish venv, so the script name is the only reliable marker.
+const FISH_CMD_FRAGMENT = 'api_server.py';
+const FISH_BASE = process.env.FISH_S2_URL ?? 'http://127.0.0.1:8880';
 
 /**
  * Single point of control for OS-level process lifecycle of GPU consumers:
@@ -200,19 +209,146 @@ export class EngineService {
    * the two GPU consumers are mutually exclusive on a 16 GB card. Best-effort:
    * if Ollama isn't running or the call fails, we just proceed.
    */
-  async unloadOllama(): Promise<void> {
-    const base  = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
-    const model = process.env.OLLAMA_VALIDATION_MODEL ?? 'qwen3-vl:8b';
+  async unloadOllama(): Promise<string[]> {
     try {
-      await fetch(`${base}/api/generate`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ model, keep_alive: 0 }),
-        signal:  AbortSignal.timeout(10_000),
-      });
-      this.logger.log('unloadOllama: requested model unload to free VRAM for ComfyUI');
+      // Ask which models are actually resident instead of guessing a name.
+      // The old version unloaded one hardcoded model (OLLAMA_VALIDATION_MODEL,
+      // the 8B validator) — so the 30B that thumbnail_ideas loads was never
+      // released and kept its VRAM through every following job.
+      const ps = await fetch(`${OLLAMA_BASE}/api/ps`, { signal: AbortSignal.timeout(5_000) });
+      if (!ps.ok) return [];
+      const body = await ps.json() as { models?: Array<{ name?: string; model?: string }> };
+      const names = (body.models ?? []).map((m) => m.model ?? m.name).filter((n): n is string => !!n);
+      if (names.length === 0) return [];
+
+      for (const model of names) {
+        // keep_alive:0 = "unload as soon as this (empty) request is done".
+        await fetch(`${OLLAMA_BASE}/api/generate`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ model, keep_alive: 0 }),
+          signal:  AbortSignal.timeout(10_000),
+        });
+      }
+      this.logger.log(`unloadOllama: released ${names.join(', ')} to free VRAM`);
+      return names;
     } catch (e: any) {
       this.logger.warn(`unloadOllama: ${e?.message ?? e} (proceeding)`);
+      return [];
+    }
+  }
+
+  // ── fish-speech (S2-pro TTS) ───────────────────────────────────────────────
+
+  /** True when the local fish api_server answers. Unreliable as a liveness
+   *  probe on its own: the server loads its models INSIDE the /v1/tts handler,
+   *  which blocks its event loop, so a loading server looks dead here. Use it
+   *  only to decide "is it idle and ready", never "is the process gone". */
+  async isFishAlive(): Promise<boolean> {
+    try {
+      const r = await fetch(`${FISH_BASE}/v1/health`, { signal: AbortSignal.timeout(3_000) });
+      return r.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** True when something is listening on the fish port. Cheap (local TCP) and,
+   *  unlike the health check, it also sees a server wedged in a model load —
+   *  which is exactly the state in which it is holding the most VRAM. */
+  private isFishPortOpen(timeoutMs = 700): Promise<boolean> {
+    const [host, port] = FISH_BASE.split('//', 2)[1].split(':');
+    return new Promise((resolve) => {
+      const sock = connect({ host, port: Number(port || 80) });
+      const done = (open: boolean) => { sock.destroy(); resolve(open); };
+      sock.setTimeout(timeoutMs);
+      sock.once('connect', () => done(true));
+      sock.once('timeout', () => done(false));
+      sock.once('error',   () => done(false));
+    });
+  }
+
+  /** PIDs of fish api_server processes (matched by command line). */
+  findFishPids(): number[] {
+    return findPidsByCommandLine((cmd) =>
+      cmd.includes(FISH_CMD_FRAGMENT) && /python(?:\.exe)?/i.test(cmd),
+    );
+  }
+
+  /**
+   * Stop the fish api_server so its ~9 GB is free before ComfyUI cold-starts.
+   *
+   * The mirror image of `unloadOllama()`, and needed for the same reason: the
+   * card hosts ONE of these at a time. The server frees itself after 15 min of
+   * idling, but the queue moves to the next job in seconds — without this the
+   * ComfyUI that follows a TTS batch starts into a card that is still 9 GB
+   * short. Best-effort: nothing running is the normal case.
+   */
+  async stopFish(maxWaitMs = 20_000): Promise<{ killed: number[] }> {
+    const pids = this.findFishPids();
+    if (pids.length === 0) return { killed: [] };
+    this.logger.log(`stopFish: killing fish api_server PID(s) ${pids.join(', ')} to free VRAM`);
+    for (const pid of pids) killPid(pid);
+
+    const deadline = Date.now() + maxWaitMs;
+    while (Date.now() < deadline) {
+      if (pids.every((p) => !isPidAlive(p))) {
+        this.logger.log('stopFish: confirmed down');
+        return { killed: pids };
+      }
+      await sleep(500);
+    }
+    this.logger.warn(`stopFish: PID(s) still alive after ${maxWaitMs}ms — best-effort done`);
+    return { killed: pids };
+  }
+
+  // ── arbitration ────────────────────────────────────────────────────────────
+
+  /**
+   * Free the card of every resident GPU service except `keep`.
+   *
+   * The system runs ONE heavy thing at a time — that is why the queue has a
+   * single slot — so the rule is simply: whatever the next job does not run on,
+   * switch off. Same service as the job before it (`keep` already up) means no
+   * teardown and no reload, which is what makes a batch of one job type cheap.
+   * Pass `null` for work that brings its own GPU process (whisper, kohya) and
+   * wants the card empty.
+   *
+   * Each service is probed before it is touched, so the common case (nothing
+   * else resident) costs two local HTTP calls and a TCP connect, and the
+   * PowerShell process scans only run when there is really something to kill.
+   *
+   * Best-effort by design: a service we cannot reach is a service that is not
+   * holding the card. Returns what was actually released, for the log line.
+   */
+  async releaseAllExcept(keep: GpuService | null): Promise<GpuService[]> {
+    const freed: GpuService[] = [];
+    for (const svc of GPU_SERVICES) {
+      if (svc === keep) continue;
+      if (await this.releaseService(svc)) freed.push(svc);
+    }
+    return freed;
+  }
+
+  /** Release one service. Returns true when it actually had to be freed. */
+  private async releaseService(svc: GpuService): Promise<boolean> {
+    switch (svc) {
+      case 'comfy': {
+        // Deliberately NOT gated on the health check: a ComfyUI wedged in an
+        // OOM answers nothing while still holding every byte of VRAM. The pid
+        // scan is the authority on whether it is really gone.
+        const { killed } = await this.stopComfy();
+        return killed.length > 0;
+      }
+      case 'ollama': {
+        if (!await this.isOllamaAlive()) return false;
+        return (await this.unloadOllama()).length > 0;
+      }
+      case 'fish': {
+        if (!await this.isFishPortOpen()) return false;
+        const { killed } = await this.stopFish();
+        return killed.length > 0;
+      }
     }
   }
 

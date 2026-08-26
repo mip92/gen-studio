@@ -20,7 +20,7 @@ import { YoutubeCaptionsService } from '../youtube/youtube-captions.service';
 import { EngineService } from './engine.service';
 import { QueueLedgerService, QueueEntryRow } from './queue-ledger.service';
 import { QueueSourceService } from './queue-source.service';
-import { needsComfyStopped } from './queue-entry.types';
+import { engineClassForEntry, gpuServiceFor } from './queue-entry.types';
 
 const POLL_MS = 5_000;
 
@@ -135,62 +135,72 @@ export class PipelineQueueService {
   /**
    * Make the GPU ready for this entry's engine class.
    *
-   * ComfyUI jobs need it alive (cold start ~30-60 s, auto-started); the vision
-   * model, whisper and kohya need it gone — they cannot share the 16 GB card.
-   * One switch on `engineClass` replaces the eight near-identical dispatch
-   * wrappers this service used to carry.
+   * Two steps, in this order: release every resident service the job does NOT
+   * run on, then make sure the one it does run on is up. Nothing shares the
+   * 16 GB card — that is the reason the queue has a single slot in the first
+   * place — and a job that follows one of its own kind pays nothing, because
+   * its service is the one we keep.
+   *
+   * Until 2026-08-20 this only ever asked "must ComfyUI go?", which left the
+   * other pairings to chance: Ollama's model stayed resident through whisper,
+   * kohya and fish jobs, and the fish api_server (~9 GB, 15 min idle timeout)
+   * stayed up through everything but a ComfyUI cold start.
    *
    * Returns false when the engine could not be prepared, having already failed
    * the job in both its own table and the ledger — the slot is freed and the
    * queue moves on next tick.
    */
   private async prepareEngine(e: QueueEntryRow): Promise<boolean> {
-    const cls = e.engineClass as any;
+    // Derived, not read straight off the row: a tts entry's real class depends
+    // on its engine, and rows enqueued before the 'fish' class existed still
+    // carry 'standalone'. See engineClassForEntry().
+    const cls  = engineClassForEntry(e);
+    if (cls === 'standalone') return true;   // small TTS subprocess: no arbitration
 
-    if (cls === 'standalone') return true;   // TTS subprocess: no arbitration
-
-    if (needsComfyStopped(cls)) {
-      this.logger.log(`Dispatching ${e.jobType} ${e.jobId} (${e.label}) — stopping ComfyUI to free the GPU`);
-      try { await this.engine.stopComfy(); }
-      catch (err: any) { this.logger.warn(`stopComfy failed (proceeding anyway): ${err.message}`); }
-
-      // An ollama-class job needs the server actually running, not merely the
-      // card free. Nothing used to start it, so a down Ollama meant the job
-      // reached its `fetch` and died instantly — the whole point of arbitrating
-      // engines is defeated if we free the GPU for a service that isn't there.
-      // Started here (not at boot) so a run with no vision work never pays for
-      // it. Consecutive ollama jobs cost nothing: this is a no-op once alive.
-      if (cls === 'ollama') {
-        try {
-          const { alreadyAlive } = await this.engine.startOllama();
-          if (!alreadyAlive) this.logger.log('Ollama was down — started it for this job');
-        } catch (err: any) {
-          const msg = `Ollama could not be started: ${err.message}`;
-          this.logger.error(`${e.jobType} ${e.jobId}: ${msg}`);
-          await this.source.fail(e.jobType, e.jobId, msg);
-          await this.ledger.close(e.jobType, e.jobId, { status: 'failed', errorMessage: msg });
-          return false;
-        }
-      }
-      return true;
+    // One heavy thing at a time: everything the next job does NOT run on gets
+    // switched off. When it runs on the same service as the job before it, that
+    // service is `keep` and nothing is torn down or reloaded.
+    const keep = gpuServiceFor(cls);
+    let freed: string[] = [];
+    try { freed = await this.engine.releaseAllExcept(keep); }
+    catch (err: any) { this.logger.warn(`releasing the GPU failed (proceeding anyway): ${err.message}`); }
+    if (freed.length > 0) {
+      this.logger.log(`${e.jobType} ${e.jobId} (${e.label}) runs on ${keep ?? 'its own process'} — freed ${freed.join(', ')}`);
     }
 
-    // engineClass === 'comfy'
-    if (await this.engine.isComfyAlive()) return true;
-    this.logger.log(`${e.jobType} ${e.jobId} needs ComfyUI — auto-starting…`);
-    // Free the vision model's VRAM first; ComfyUI and Ollama can't both hold the
-    // card. Best-effort, no-op when nothing is loaded.
-    await this.engine.unloadOllama();
+    // Now bring up what it needs. A service that isn't there is the same bug
+    // twice over: we have just emptied the card for it, and the job would die
+    // on its first call — which is exactly how six thumbnail-idea jobs went in
+    // one minute on 2026-08-10, before anything started Ollama.
     try {
-      await this.engine.startComfy();
-      return true;
+      switch (keep) {
+        case 'comfy':
+          if (!await this.engine.isComfyAlive()) {
+            this.logger.log(`${e.jobType} ${e.jobId} needs ComfyUI — auto-starting…`);
+            await this.engine.startComfy();
+          }
+          break;
+        case 'ollama': {
+          const { alreadyAlive } = await this.engine.startOllama();
+          if (!alreadyAlive) this.logger.log('Ollama was down — started it for this job');
+          break;
+        }
+        // The fish api_server is started by the TTS worker itself (scripts/
+        // tts_fish_s2.py autostarts and health-checks it) — and now it starts
+        // into a free card instead of fighting ComfyUI for it.
+        case 'fish':
+        // whisper / kohya spawn their own GPU process.
+        case null:
+          break;
+      }
     } catch (err: any) {
-      const msg = `ComfyUI auto-start failed: ${err.message}`;
-      this.logger.error(`startComfy failed for ${e.jobType} ${e.jobId}: ${err.message}`);
+      const msg = `${keep} could not be started: ${err.message}`;
+      this.logger.error(`${e.jobType} ${e.jobId}: ${msg}`);
       await this.source.fail(e.jobType, e.jobId, msg);
       await this.ledger.close(e.jobType, e.jobId, { status: 'failed', errorMessage: msg });
       return false;
     }
+    return true;
   }
 
   /**

@@ -32,6 +32,8 @@ Env (all optional):
     FISH_S2_CHECKPOINT         default <repo>\\checkpoints\\s2-pro-full
     FISH_S2_AUTOSTART          default 1
     FISH_S2_STARTUP_TIMEOUT_SEC default 720 (model load takes ~5 min cold)
+    FISH_S2_BIND_TIMEOUT_SEC   default 240 (how long a spawned server may take
+                               to BIND its port; the model loads after that)
     FISH_S2_IDLE_TIMEOUT_SEC   default 900 (server self-terminates, frees VRAM)
 
 Outputs: `OK <wav-path>` on stdout + exit 0; message to stderr + exit 1/2/3.
@@ -41,6 +43,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -57,6 +60,7 @@ FISH_CKPT    = Path(os.environ.get('FISH_S2_CHECKPOINT', str(FISH_REPO / 'checkp
 AUTOSTART    = os.environ.get('FISH_S2_AUTOSTART', '1') != '0'
 STARTUP_SEC  = int(os.environ.get('FISH_S2_STARTUP_TIMEOUT_SEC', '720'))
 IDLE_SEC     = int(os.environ.get('FISH_S2_IDLE_TIMEOUT_SEC', '900'))
+BIND_SEC     = int(os.environ.get('FISH_S2_BIND_TIMEOUT_SEC', '240'))
 
 # First request after server (re)start pays the ~5 min model load; later
 # requests take seconds. One generous timeout covers both.
@@ -77,10 +81,57 @@ def _health_ok(timeout: float = 2.0) -> bool:
         return False
 
 
+def _port_busy(timeout: float = 1.0) -> bool:
+    """True when SOMETHING is listening on the fish port.
+
+    Health and liveness are different questions here: api_server.py loads its
+    models inside the `/v1/tts` handler (`--lazy-load` + `ensure_loaded()`),
+    and that load blocks its event loop, so a server busy with a cold load
+    leaves `/v1/health` unanswered for the whole load. The socket still accepts.
+    """
+    host, _, port = FISH_URL.split('//', 1)[-1].partition(':')
+    try:
+        with socket.create_connection((host, int(port or '80')), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_loading_server() -> bool | None:
+    """Wait out a server that owns the port but is not answering yet.
+
+    Returns True when it came back, False when the wait ran out, and None when
+    the occupant went away (caller should spawn a fresh one).
+
+    Spawning a second server in this state — what this worker did until
+    2026-08-20 — cannot possibly help: the newcomer dies on
+    `[Errno 10048] address already in use`, our 120s window expires, the job
+    fails with "did not come up within 120s", and the orphan is left competing
+    for the same 16 GB card. That accounts for most of the 47 failed fish jobs.
+    """
+    _log(f'fish port is taken but not answering (server loading?) — waiting up to {STARTUP_SEC}s')
+    deadline = time.time() + STARTUP_SEC
+    while time.time() < deadline:
+        time.sleep(5)
+        if _health_ok():
+            _log('fish server answered — reusing it')
+            return True
+        if not _port_busy():
+            _log('the process holding the port is gone — starting a fresh server')
+            return None
+    _log(f'fish server on {FISH_URL} stayed unresponsive for {STARTUP_SEC}s '
+         f'— see server_autostart.log (is ComfyUI holding the GPU?)')
+    return False
+
+
 def _ensure_server() -> bool:
     """Health-check the fish api_server; spawn it detached when down."""
     if _health_ok():
         return True
+    if _port_busy():
+        waited = _wait_for_loading_server()
+        if waited is not None:
+            return waited
     if not AUTOSTART:
         _log(f'fish server is down at {FISH_URL} and FISH_S2_AUTOSTART=0')
         return False
@@ -109,13 +160,16 @@ def _ensure_server() -> bool:
             cwd=str(FISH_REPO), env=env, creationflags=creation,
             stdout=log_f, stderr=log_f, stdin=subprocess.DEVNULL,
         )
-    deadline = time.time() + 120  # HTTP comes up fast; the MODEL loads lazily on first request
+    # The HTTP layer comes up as soon as torch is imported; the MODEL loads
+    # lazily on the first request. Generous by default anyway: importing torch
+    # on a card that another process is pegging is not a 2-second affair.
+    deadline = time.time() + BIND_SEC
     while time.time() < deadline:
         if _health_ok():
             _log('fish server is up (model loads lazily on first request)')
             return True
         time.sleep(2)
-    _log('fish server did not come up within 120s — see server_autostart.log')
+    _log(f'fish server did not come up within {BIND_SEC}s — see server_autostart.log')
     return False
 
 

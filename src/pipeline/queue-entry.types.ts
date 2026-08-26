@@ -83,9 +83,10 @@ export function isTerminal(status: string): boolean {
  *   ollama     → ComfyUI must be STOPPED (vision model needs the whole card)
  *   whisper    → ComfyUI must be STOPPED (faster-whisper on GPU)
  *   kohya      → ComfyUI must be STOPPED (LoRA training)
- *   standalone → no arbitration at all (TTS python subprocess)
+ *   fish       → ComfyUI must be STOPPED (fish-speech api_server, ~9 GB)
+ *   standalone → no arbitration at all (small TTS python subprocess)
  */
-export type EngineClass = 'comfy' | 'ollama' | 'whisper' | 'kohya' | 'standalone';
+export type EngineClass = 'comfy' | 'ollama' | 'whisper' | 'kohya' | 'fish' | 'standalone';
 
 export const ENGINE_CLASS: Record<JobType, EngineClass> = {
   scene:             'comfy',
@@ -108,12 +109,88 @@ export const ENGINE_CLASS: Record<JobType, EngineClass> = {
   // Same shape: torch-GPU scanner subprocess, then Ollama for flagged moments.
   video_qc:          'ollama',
   training:          'kohya',
+  // Per-JOB in practice: silero/xtts2/f5/qwen3 are modest subprocesses that can
+  // share the card with ComfyUI, but fish_s2 cannot — see engineClassFor().
   tts:               'standalone',
 };
 
-/** True when starting this job requires tearing ComfyUI down first. */
-export function needsComfyStopped(engineClass: EngineClass): boolean {
-  return engineClass === 'ollama' || engineClass === 'whisper' || engineClass === 'kohya';
+/**
+ * The engine class ONE unit of work needs.
+ *
+ * Only TTS is polymorphic, and only for fish_s2: that engine does not load a
+ * model in-process like the other four — it drives a persistent fish-speech
+ * api_server that holds ~9 GB of the 16 GB card. Leaving it in 'standalone'
+ * (2026-08-17 → 2026-08-20) meant dispatch never freed the GPU for it, so the
+ * model load ran against a ComfyUI that already owned ~10.7 GB: a ~5 min load
+ * became 18-110 min, generation crawled at 0.74 tok/s, and every job died on
+ * the worker's socket timeout ("inference failed: TimeoutError") or on the
+ * health check of a server still stuck loading ("did not come up within 120s").
+ * 47 fish jobs failed that way.
+ */
+export function engineClassFor(
+  jobType: JobType,
+  opts: { ttsEngine?: string | null } = {},
+): EngineClass {
+  if (jobType === 'tts' && opts.ttsEngine === 'fish_s2') return 'fish';
+  return ENGINE_CLASS[jobType];
+}
+
+/**
+ * Same decision, made from a stored row instead of the job record.
+ *
+ * The TTS engine is already in `groupKey` (`tts:<engine>`), so this also
+ * upgrades entries written BEFORE the 'fish' class existed — the 447 pending
+ * fish rows keep their stale `engineClass: 'standalone'` in the DB, and
+ * re-deriving here is what makes them arbitrate correctly anyway.
+ */
+export function engineClassForEntry(
+  row: { jobType: JobType; engineClass: string; groupKey: string },
+): EngineClass {
+  if (row.jobType === 'tts') {
+    return engineClassFor('tts', { ttsEngine: row.groupKey.split(':')[1] ?? null });
+  }
+  return row.engineClass as EngineClass;
+}
+
+/**
+ * The RESIDENT GPU services — the ones that keep holding VRAM after the job
+ * that needed them is over, so somebody has to switch them off:
+ *
+ *   comfy  → ComfyUI server (port 8188), stays up between renders by design
+ *   ollama → the vision/text model stays resident until unloaded (keep_alive)
+ *   fish   → fish-speech api_server, frees itself only after 15 min of idling
+ *
+ * whisper and kohya are NOT here: they are subprocesses that exit with the job
+ * and take their VRAM with them, so there is nothing to release afterwards.
+ */
+export type GpuService = 'comfy' | 'ollama' | 'fish';
+
+export const GPU_SERVICES: readonly GpuService[] = ['comfy', 'ollama', 'fish'] as const;
+
+/**
+ * Which resident service this job class runs ON — the one that must be UP, and
+ * the only one allowed to keep the card while the job runs.
+ *
+ * This is the whole arbitration rule in one function: the system runs exactly
+ * one heavy thing at a time, so dispatch releases every service except this
+ * one. `null` means the job brings its own process (whisper, kohya) and wants
+ * the card empty. It replaces `needsComfyStopped()`, which only ever answered
+ * half the question — "must ComfyUI go?" — and so left the other pairings
+ * unhandled: an Ollama model stayed resident through a whisper, kohya or fish
+ * job, and the fish server stayed resident through everything except a ComfyUI
+ * cold start.
+ */
+export function gpuServiceFor(engineClass: EngineClass): GpuService | null {
+  switch (engineClass) {
+    case 'comfy':  return 'comfy';
+    case 'ollama': return 'ollama';
+    case 'fish':   return 'fish';
+    // Bring their own GPU process; it exits with the job.
+    case 'whisper':
+    case 'kohya':  return null;
+    // Not a GPU tenant at all — see ENGINE_CLASS.tts.
+    case 'standalone': return null;
+  }
 }
 
 /**
