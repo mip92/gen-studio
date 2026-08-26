@@ -12,6 +12,7 @@ import { VideoRenderService } from './videos/video-render.service';
 import { EndFramesController } from './endframes/endframes.controller';
 import { EndFrameService } from './endframes/end-frame.service';
 import { VideoEngineFactory } from './videos/engines/video-engine.factory';
+import { ImageEngineFactory } from './images/image-engine.factory';
 import { TrainingModule } from '../training/training.module';
 import { ValidationModule } from '../validation/validation.module';
 import { ComicModule } from '../comic/comic.module';
@@ -34,7 +35,8 @@ import { ComicModule } from '../comic/comic.module';
     VideoRenderService,
     EndFrameService,
     VideoEngineFactory,
+    ImageEngineFactory,
   ],
-  exports: [DatasetQueueService, SceneRenderService, VideoRenderService, EndFrameService],
+  exports: [DatasetQueueService, SceneRenderService, VideoRenderService, EndFrameService, ImageEngineFactory],
 })
 export class GenerationModule {}
