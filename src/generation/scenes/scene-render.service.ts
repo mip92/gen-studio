@@ -755,8 +755,30 @@ export class SceneRenderService {
 
       if (isCartoon) {
         // Cartoon path — no LoRA required, identity via anchor reference + text.
-        const profile = sp.profile ?? sp.character.profiles[0];
-        if (!profile || !profile.triggerToken) {
+        //
+        // The profile is a STATE of the character, not an age bucket: a black eye
+        // given mid-act means every following shot points at a new state derived
+        // from the clean one (anchor-render.service dispatchDerived — «the target
+        // identity IS the change — older, bruised, richer»), and a twenty-year
+        // jump points at whichever ancestor is visually right. So the shot must
+        // name its own profile; there is nothing sane to fall back to.
+        //
+        // The old fallback `sp.profile ?? sp.character.profiles[0]` was a lottery:
+        // `profiles` is loaded without orderBy, so a character with four states
+        // rendered whichever row Postgres returned first — a ten-year-old could
+        // appear in an adult act, silently. Audit 2026-08-26: of 7865 participants
+        // exactly ONE relied on it (last_shift A5_SH20, single-state character,
+        // since backfilled), so removing it is behaviour-neutral today and the
+        // guard the state model needs going forward.
+        const profile = sp.profile;
+        if (!profile) {
+          const states = sp.character.profiles.map((p) => p.profileCode).sort().join(', ');
+          throw new BadRequestException(
+            `Shot ${shot.shotCode}: participant "${sp.label}" (${sp.character.code}) has no profile. `
+            + `A shot must name the character's state explicitly — pick one of: ${states || '(none defined)'}.`,
+          );
+        }
+        if (!profile.triggerToken) {
           throw new BadRequestException(
             `Character "${sp.character.code}" has no profile or trigger token. Cartoon projects still need a CharacterProfile row for promptBase + triggerToken.`,
           );
