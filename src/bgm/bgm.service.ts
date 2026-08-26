@@ -10,6 +10,11 @@ import {
   TILE_SECONDS,
   SPARE_TRACK_COUNT,
   normaliseMusicMetas,
+  captionErrors,
+  captionIssues,
+  captionIdeas,
+  captionInstruments,
+  lyricsIssues,
 } from './bgm.types';
 import { shotHoldUs, narrationUsFromTts, narrationUsFromText } from '../exports/shot-timing';
 
@@ -31,6 +36,37 @@ export class BgmService {
   constructor(private readonly prisma: PrismaService) {}
 
   /**
+   * Refuse a caption that breaks the ACE-Step rules, at the API boundary.
+   *
+   * A gate and not a warning because the alternative was tried: the linter has
+   * existed since 2026-07 as `captionMetaConflicts` and was wired to NOTHING,
+   * so 51 blocks kept a key in their caption long after the sweep that was
+   * supposed to remove them, and the corpus drifted to a median of two named
+   * instruments. Advice nobody is forced to read is not a rule.
+   *
+   * Only fires when the caption is actually being written — editing a block's
+   * sortOrder must not be blocked by a legacy caption it does not touch.
+   * See Skill(gen-studio-acestep) §3.
+   */
+  private assertCaption(prompt: string | null | undefined, where: string, allowThin?: boolean): void {
+    const errors = captionErrors(prompt, { allowThin });
+    if (errors.length === 0) return;
+    throw new BadRequestException(
+      `${where}: caption rejected by the ACE-Step rules — `
+      + errors.map((e) => `[${e.code}] ${e.message}`).join(' · '),
+    );
+  }
+
+  /** Same, for a hand-authored lyrics section arc. */
+  private assertLyrics(structure: string | null | undefined, caption: string | null | undefined, where: string): void {
+    const errors = lyricsIssues(structure, caption).filter((i) => i.severity === 'error');
+    if (errors.length === 0) return;
+    throw new BadRequestException(
+      `${where}: lyrics structure rejected — ` + errors.map((e) => `[${e.code}] ${e.message}`).join(' · '),
+    );
+  }
+
+  /**
    * Validate ACE-Step metas at the API boundary and surface the failure as a
    * 400 instead of letting an invalid `keyscale` reach ComfyUI — there it is a
    * prompt-validation error that only shows up once the job reaches the head of
@@ -42,6 +78,122 @@ export class BgmService {
     } catch (e: any) {
       throw new BadRequestException(e?.message ?? String(e));
     }
+  }
+
+  // ── Lint ──────────────────────────────────────────────────────────────────
+
+  /**
+   * Review a caption without saving it — the editor's live feedback.
+   *
+   * Same `captionIssues` / `lyricsIssues` as the write gate and the audit, which
+   * is the entire point: the UI carried its own transcription of three of these
+   * rules, so the moment the backend learned eight more, the editor started
+   * telling the author their caption was fine and the save started refusing it.
+   * One rule set, one implementation, three consumers.
+   */
+  lintCaption(body: { caption?: string; lyrics?: string; allowThin?: boolean }) {
+    const caption = body.caption ?? '';
+    const issues  = captionIssues(caption, { allowThin: body.allowThin });
+    const lyrics  = lyricsIssues(body.lyrics, caption);
+    return {
+      ok:      [...issues, ...lyrics].every((i) => i.severity !== 'error'),
+      caption: {
+        chars:       caption.trim().length,
+        ideas:       caption.trim() ? captionIdeas(caption).length : 0,
+        instruments: caption.trim() ? captionInstruments(caption) : [],
+        issues,
+      },
+      lyrics: { issues: lyrics },
+    };
+  }
+
+  // ── Audit ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Corpus audit: every act caption and tile override against the ACE-Step
+   * rules, using the SAME function the write gate uses.
+   *
+   * Shares `captionIssues` deliberately. A report that drifts from the gate is
+   * worse than no report — the 2026-07 sweep left 51 keys in captions precisely
+   * because the check that found them and the check that should have refused
+   * them were not the same code path (the latter did not exist).
+   *
+   * `released` is reported per project but nothing is filtered on it: a film
+   * already on YouTube is frozen (feedback-dont-touch-published-videos), and
+   * the caller decides. Read-only — this endpoint never writes or re-renders.
+   */
+  async auditCaptions(opts: { projectId?: string; includeClean?: boolean } = {}) {
+    const blocks = await this.prisma.narrativeBlock.findMany({
+      where:   opts.projectId ? { projectId: opts.projectId } : {},
+      orderBy: [{ projectId: 'asc' }, { sortOrder: 'asc' }],
+      include: {
+        project:  { select: { slug: true, youtubeUrl: true } },
+        segments: { select: { id: true, sortOrder: true, prompt: true, lyricsStructure: true, durationSec: true } },
+      },
+    });
+
+    const byCode: Record<string, number> = {};
+    const projects = new Map<string, {
+      slug: string; released: boolean;
+      blocks: any[]; errorBlocks: number; warnBlocks: number;
+    }>();
+
+    for (const b of blocks) {
+      const key = b.project.slug;
+      const proj = projects.get(key) ?? {
+        slug: key, released: !!b.project.youtubeUrl, blocks: [], errorBlocks: 0, warnBlocks: 0,
+      };
+      projects.set(key, proj);
+
+      const issues = [
+        ...captionIssues(b.moodPrompt),
+        ...lyricsIssues(b.lyricsStructure, b.moodPrompt),
+      ];
+      // A tile override is its own caption and gets its own verdict.
+      const segmentIssues = b.segments.flatMap((s) => {
+        const si = [
+          ...(s.prompt ? captionIssues(s.prompt) : []),
+          ...lyricsIssues(s.lyricsStructure, s.prompt ?? b.moodPrompt),
+        ];
+        return si.length ? [{ segmentId: s.id, sortOrder: s.sortOrder, issues: si }] : [];
+      });
+
+      for (const i of [...issues, ...segmentIssues.flatMap((s) => s.issues)]) {
+        byCode[i.code] = (byCode[i.code] ?? 0) + 1;
+      }
+      const errors = issues.filter((i) => i.severity === 'error').length
+                   + segmentIssues.reduce((n, s) => n + s.issues.filter((i) => i.severity === 'error').length, 0);
+      if (errors > 0) proj.errorBlocks += 1;
+      else if (issues.length + segmentIssues.length > 0) proj.warnBlocks += 1;
+
+      if (issues.length === 0 && segmentIssues.length === 0 && !opts.includeClean) continue;
+      proj.blocks.push({
+        blockId:     b.id,
+        slug:        b.slug,
+        chars:       (b.moodPrompt ?? '').trim().length,
+        ideas:       b.moodPrompt ? captionIdeas(b.moodPrompt).length : 0,
+        instruments: b.moodPrompt ? captionInstruments(b.moodPrompt) : [],
+        metas:       { bpm: b.bpm, keyscale: b.keyscale, timesignature: b.timesignature },
+        hasLyricsArc: !!b.lyricsStructure,
+        issues,
+        segmentIssues,
+      });
+    }
+
+    const list = [...projects.values()]
+      .filter((p) => opts.includeClean || p.blocks.length > 0)
+      .sort((a, b) => b.errorBlocks - a.errorBlocks || a.slug.localeCompare(b.slug));
+
+    return {
+      totals: {
+        projects:       projects.size,
+        blocks:         blocks.length,
+        blocksWithErrors: list.reduce((n, p) => n + p.errorBlocks, 0),
+        blocksWithWarnings: list.reduce((n, p) => n + p.warnBlocks, 0),
+        byCode,
+      },
+      projects: list,
+    };
   }
 
   // ── Blocks ────────────────────────────────────────────────────────────────
@@ -58,6 +210,9 @@ export class BgmService {
     const project = await this.prisma.project.findUnique({ where: { id: input.projectId } });
     if (!project) throw new NotFoundException(`Project ${input.projectId} not found`);
 
+    this.assertCaption(input.moodPrompt, `block ${input.slug}`, input.allowThin);
+    this.assertLyrics(input.lyricsStructure, input.moodPrompt, `block ${input.slug}`);
+
     const exportTiming  = project.exportTiming === 'narration' ? 'narration' : 'clip';
     const targetSeconds = await this.computeTargetSeconds(input.shotIds, exportTiming);
     return this.prisma.narrativeBlock.create({
@@ -67,6 +222,7 @@ export class BgmService {
         title:      input.title ?? null,
         sortOrder:  input.sortOrder ?? 0,
         moodPrompt: input.moodPrompt ?? null,
+        lyricsStructure: input.lyricsStructure ?? null,
         shotIds:    input.shotIds as any,
         targetSeconds,
         status:     'filling',
@@ -116,11 +272,23 @@ export class BgmService {
     const block = await this.prisma.narrativeBlock.findUnique({ where: { id: blockId } });
     if (!block) throw new NotFoundException(`Block ${blockId} not found`);
 
+    // Gate only what this request actually writes: a block whose caption is
+    // legacy must still accept a sortOrder edit.
+    if (body.moodPrompt !== undefined) {
+      this.assertCaption(body.moodPrompt, `block ${block.slug}`, body.allowThin);
+    }
+    if (body.lyricsStructure !== undefined) {
+      this.assertLyrics(body.lyricsStructure,
+        body.moodPrompt !== undefined ? body.moodPrompt : block.moodPrompt,
+        `block ${block.slug}`);
+    }
+
     const data: Record<string, unknown> = { ...this.metas(body) };
     if (body.title      !== undefined) data.title      = body.title;
     if (body.sortOrder  !== undefined) data.sortOrder  = body.sortOrder;
     if (body.moodPrompt !== undefined) data.moodPrompt = body.moodPrompt;
     if (body.status     !== undefined) data.status     = body.status;
+    if (body.lyricsStructure !== undefined) data.lyricsStructure = body.lyricsStructure;
     if (body.shotIds    !== undefined) {
       if (!Array.isArray(body.shotIds) || body.shotIds.length === 0) {
         throw new BadRequestException(`Block must cover at least one shot`);
@@ -167,11 +335,16 @@ export class BgmService {
     if (durationSec < 10 || durationSec > 240) {
       throw new BadRequestException(`durationSec must be in [10, 240] (got: ${durationSec})`);
     }
+    // A null prompt inherits the block's caption, which was itself gated.
+    if (input.prompt) this.assertCaption(input.prompt, 'segment', input.allowThin);
+    this.assertLyrics(input.lyricsStructure, input.prompt ?? block.moodPrompt, 'segment');
+
     const sortOrder = input.sortOrder ?? await this.nextSegmentSortOrder(input.blockId);
     return this.prisma.musicSegment.create({
       data: {
         blockId:     input.blockId,
         prompt:      input.prompt ?? null,
+        lyricsStructure: input.lyricsStructure ?? null,
         durationSec,
         sortOrder,
         ...this.metas(input),
@@ -196,10 +369,17 @@ export class BgmService {
     const seg = await this.prisma.musicSegment.findUnique({ where: { id: segmentId } });
     if (!seg) throw new NotFoundException(`Segment ${segmentId} not found`);
 
+    if (body.prompt) this.assertCaption(body.prompt, 'segment', body.allowThin);
+    if (body.lyricsStructure !== undefined) {
+      this.assertLyrics(body.lyricsStructure,
+        body.prompt !== undefined ? body.prompt : seg.prompt, 'segment');
+    }
+
     const data: Record<string, unknown> = { ...this.metas(body) };
     if (body.prompt    !== undefined) data.prompt    = body.prompt;
     if (body.sortOrder !== undefined) data.sortOrder = body.sortOrder;
     if (body.spare     !== undefined) data.spare     = body.spare;
+    if (body.lyricsStructure !== undefined) data.lyricsStructure = body.lyricsStructure;
     if (body.durationSec !== undefined) {
       if (body.durationSec < 10 || body.durationSec > 240) {
         throw new BadRequestException(`durationSec must be in [10, 240] (got: ${body.durationSec})`);

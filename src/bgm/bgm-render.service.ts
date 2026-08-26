@@ -27,6 +27,7 @@ import {
   OVERGEN_SECONDS,
   RENDER_MAX_SECONDS,
   INSTRUMENTAL_LYRICS,
+  resolveLyrics,
   normaliseMusicMetas,
   pulseTemperature,
 } from './bgm.types';
@@ -136,6 +137,15 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         keyscale,
         timesignature,
         temperature: pulseTemperature(promptResolved),
+        // The temporal script for this tile: an authored arc (tile override →
+        // act) or one generated from the caption. Resolved HERE, at enqueue, so
+        // the take's params record what it was actually asked to play — the same
+        // contract the metas follow.
+        lyrics:      resolveLyrics(
+          segment.lyricsStructure ?? segment.block.lyricsStructure,
+          promptResolved,
+          renderSec,
+        ),
         durationSec,
         renderSec,
         seed,
@@ -183,6 +193,8 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
         keyscale:       params.keyscale ?? null,
         timesignature:  params.timesignature ?? null,
         temperature:    params.temperature ?? null,
+        // Older rows have no lyrics key — they were rendered on the bare marker.
+        lyrics:         params.lyrics ?? INSTRUMENTAL_LYRICS,
         // ACE-Step renders renderSec; CapCut trims to durationSec on export.
         // Older job rows without renderSec fall back to durationSec.
         renderSec:      params.renderSec ?? params.durationSec,
@@ -324,6 +336,8 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
    */
   private patch(template: Record<string, any>, p: {
     prompt:         string;
+    /** Contents of node 3's `lyrics` input — section arc or bare marker. */
+    lyrics:         string;
     bpm:            number | null;
     keyscale:       string | null;
     timesignature:  string | null;
@@ -344,10 +358,10 @@ export class BgmRenderService implements OnModuleInit, OnModuleDestroy {
     };
     set('2', 'seconds',         p.renderSec);
     set('3', 'tags',             p.prompt);
-    // ACE-Step was trained with section markers in the lyrics channel;
-    // "[instrumental]" is the canonical no-vocals form and beats the empty
-    // string the template ships. All our music is instrumental by policy.
-    set('3', 'lyrics',           INSTRUMENTAL_LYRICS);
+    // The temporal script. Was the hardcoded "[instrumental]" for every render
+    // ever made until 2026-08-20 — see the INSTRUMENTAL_LYRICS doc comment for
+    // what that cost. Resolved at enqueue and carried in the job params.
+    set('3', 'lyrics',           p.lyrics);
     set('3', 'duration',         p.renderSec);
     set('3', 'seed',             p.seed);
     if (p.bpm           !== null) set('3', 'bpm',           p.bpm);

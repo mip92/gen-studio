@@ -54,6 +54,38 @@ export class BgmController {
     };
   }
 
+  @Post('lint')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Review a caption (and an optional lyrics arc) without saving it',
+    description:
+      'The editor calls this while you type, so the warning you see and the 400 you get on save '
+      + 'come from the SAME function. The UI used to carry a hand-written twin of the rules that '
+      + 'knew 3 of them; two independent copies of a rule set is the drift this endpoint removes. '
+      + 'Pure function — nothing is written.',
+  })
+  lint(@Body() body: { caption?: string; lyrics?: string; allowThin?: boolean }) {
+    return this.bgm.lintCaption(body ?? {});
+  }
+
+  @Get('audit')
+  @ApiOperation({
+    summary: 'Audit every act caption / tile override against the ACE-Step rules',
+    description:
+      'Same function as the write gate (captionIssues), so the report and the refusal can never '
+      + 'disagree. Read-only. `projectId` narrows the scan; `includeClean=1` also lists blocks with '
+      + 'no findings. `released` marks films already on YouTube — those are frozen, do not edit them.',
+  })
+  auditCaptions(
+    @Query('projectId')    projectId?: string,
+    @Query('includeClean') includeClean?: string,
+  ) {
+    return this.bgm.auditCaptions({
+      ...(projectId ? { projectId } : {}),
+      includeClean: includeClean === '1' || includeClean === 'true',
+    });
+  }
+
   // ── Blocks ────────────────────────────────────────────────────────────────
 
   @Post('projects/:projectId/blocks')
