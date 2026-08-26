@@ -98,6 +98,26 @@ model Project {
   /// Default photoreal_cinematic for backwards compatibility with last_shift /
   /// night_courier. See docs/VISUAL_STYLE_ARCHITECTURE.md.
   visualStyle               String    @default("photoreal_cinematic")
+  /// Какая МОДЕЛЬ рисует кадры этого проекта: "qwen2511" (Qwen-Image-Edit-2511,
+  /// дефолт де-факто), "flux2_klein" (FLUX.2 [klein] 9B), "sdxl_photoreal",
+  /// "sdxl_comic", "flux1_comic". Ось, отдельная от `visualStyle`, — ровно как
+  /// `videoEngine` отдельно от всего остального у клипов.
+  ///
+  /// Зачем разделение: `visualStyle` означал сразу три вещи — кто рисует, как
+  /// выглядит и чем держится личность, — поэтому добавить модель было нельзя,
+  /// не соврав каждому условию вида `visualStyle === 'realcomic_qwen'`.
+  ///
+  /// NULL = «вывести из visualStyle», то есть ровно текущее поведение через
+  /// `SceneFactory`. Именно поэтому колонка НЕ имеет default: новый проект,
+  /// созданный без явного выбора, ведёт себя как вёл, а не заявляет модель,
+  /// которая может не соответствовать его стилю. Существующие строки заполнены
+  /// миграцией 20260826120000_project_image_engine.
+  ///
+  /// ⚠️ Соответствие «стиль → модель» НЕ один-к-одному, и это намеренно:
+  /// photoreal рисует окружение Flux'ом, а людей SDXL; graphic_novel_* на
+  /// дуэтах уходит в Qwen-оверлей. Легаси-движки обязаны сохранить эту развилку
+  /// внутри себя — см. deriveImageEngineId() и комментарий ImageEngineFactory.
+  imageEngine               String?
   /// How shot durations are timed on the CapCut export timeline.
   /// "clip"      = (legacy, default) each animated shot occupies exactly its
   ///               rendered clip length (length/fps); static shots fall back to
