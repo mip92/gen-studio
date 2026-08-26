@@ -855,6 +855,12 @@ model VideoRender {
   interpFilename     String?
   interpPromptId     String?
   /// Frame multiplier used (2 = double FPS). Snapshot at enqueue time.
+  /// Drop this clip's own audio on export. LTX-2.5 writes sound into the clip
+  /// (footsteps, a lock, breath) and sometimes invents a music bed that fights
+  /// the act's ACE-Step score — this is the per-clip off switch. The file keeps
+  /// its audio; the CapCut segment is laid with volume=0, so it is reversible.
+  /// Meaningless for Wan clips, which carry no audio at all.
+  audioMuted         Boolean  @default(false)
   interpMultiplier   Int?
   /// When this row's interpolation lifecycle entered `pending` — FIFO key,
   /// distinct from queuedAt/upscaleQueuedAt for the same reason upscale needs its own.
@@ -1389,6 +1395,13 @@ model NarrativeBlock {
   keyscale      String?
   /// Bare digit, one of '2' '3' '4' '6'. NOT "4/4".
   timesignature String?
+  /// ACE-Step section markers for the `lyrics` input — the act's temporal
+  /// script, e.g. "[intro - ambient]" / "[main theme - felt piano]" /
+  /// "[outro - fade out]", one marker per line. Null = generate the arc from
+  /// moodPrompt per tile (buildLyricsArc). Markers only: free lyric text
+  /// against a "no vocals" caption produces wordless vocalisations.
+  /// See Skill(gen-studio-acestep) §4.
+  lyricsStructure String?
   /// Ordered array of Shot.id strings this block covers. Source of truth for
   /// `targetSeconds` — kept as JSON instead of a join table because order matters
   /// and the block's "shape" is rarely edited (set once during script breakdown).
@@ -1423,6 +1436,9 @@ model MusicSegment {
   bpm           Int?
   keyscale      String?
   timesignature String?
+  /// Per-tile override of the block's lyrics section arc. Null = inherit the
+  /// block's, which in turn null = generated from the caption.
+  lyricsStructure String?
   /// Target seconds for this segment. Final flac length is decided by ACE-Step
   /// (driven by node `EmptyAceStep1.5LatentAudio.seconds`); this is the request.
   durationSec   Int      @default(60)
